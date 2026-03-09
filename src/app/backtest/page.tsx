@@ -23,6 +23,7 @@ import {
 } from 'recharts';
 import {
   Activity,
+  AlertTriangle,
   CalendarRange,
   Loader2,
   Play,
@@ -407,6 +408,24 @@ export default function BacktestPage() {
             </div>
           )}
         </section>
+
+        {run && run.summary.signalCount === 0 && run.summary.snapshotCount < 5 && (
+          <section className="rounded-xl border border-warning/40 bg-warning/10 px-5 py-4 flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-warning shrink-0 mt-0.5" />
+            <div className="space-y-1 text-sm">
+              <p className="font-semibold text-warning">Insufficient snapshot history</p>
+              <p className="text-foreground/80">
+                The backtest found only {run.summary.snapshotCount} snapshot{run.summary.snapshotCount === 1 ? '' : 's'} in
+                the selected date range. Signals are detected by comparing successive nightly snapshots, so the backtest
+                needs data accumulated over several weeks to produce meaningful results.
+              </p>
+              <p className="text-foreground/80">
+                Snapshots are created automatically each time the nightly task runs. After a week or two of nightly runs,
+                the backtest will have enough historical data to generate signals and replay trades.
+              </p>
+            </div>
+          </section>
+        )}
 
         {run && (
           <>
