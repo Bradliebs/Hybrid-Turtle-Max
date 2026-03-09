@@ -1,0 +1,79 @@
+MSTR
+IREN
+RKLB
+ASTS
+JOBY
+ACHR
+LUNR
+OKLO
+QBTS
+IONQ
+RUN
+OPEN
+UPST
+LCID
+HYMC
+UUUU
+UEC
+DNN
+RXRX
+CRSP
+BEAM
+TMDX
+SOUN
+BBAI
+RZLV
+APLD
+CRWV
+
+# ========== QUANTUM COMPUTING (additions) ==========
+RGTI
+QUBT
+
+# ========== AI / DATA CENTRE INFRASTRUCTURE ==========
+NBIS
+SMTC
+
+# ========== SPACE ==========
+RDW
+
+# ========== BIOTECH SPECULATIVE ==========
+NVAX
+EDIT
+
+# ========== CRYPTO-ADJACENT ==========
+RIOT
+CLSK
+WULF
+
+# ========== ENERGY TRANSITION ==========
+PLUG
+CHPT
+BLNK
+
+# ========== HIGH RISK / TURNAROUND (Feb 2026) ==========
+# WOLF: Wolfspeed — Chapter 11 bankruptcy filed Feb 2026. Watch only.
+WOLF
+# PTON: Peloton — business model under structural pressure.
+PTON
+
+# ========== AI / HIGH BETA TECH (Feb 2026) ==========
+ALAB
+AI
+
+# ========== SEMIS HIGH BETA (Feb 2026) ==========
+GFS
+
+# ========== METALS / COMMODITY VOLATILITY (Feb 2026) ==========
+AG
+PAAS
+CLF
+AA
+
+# ========== BIOTECH VOLATILITY (Feb 2026) ==========
+SRPT
+
+# ========== RETAIL / NARRATIVE BETA (Feb 2026) ==========
+CVNA
+ROKU
+RIVN

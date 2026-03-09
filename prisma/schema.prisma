@@ -1,0 +1,1446 @@
+/// DEPENDENCIES
+/// Consumed by: scripts/verify-phase1.ts, packages/broker/src/*, packages/workflow/src/*
+/// Consumes: .env DATABASE_URL, Prisma client generation
+/// Risk-sensitive: NO
+/// Last modified: 2026-03-08
+/// Notes: Adds the build-order Phase 1 persistence models as an additive compatibility layer.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                  String           @id @default(cuid())
+  email               String           @unique
+  name                String?
+  password            String
+  riskProfile         String           @default("BALANCED")
+  equity              Float            @default(10000)
+  t212ApiKey          String?
+  t212ApiSecret       String?
+  t212Environment     String           @default("demo")
+  t212Connected       Boolean          @default(false)
+  t212LastSync        DateTime?
+  t212AccountId       String?
+  t212Currency        String?
+  t212Cash            Float?
+  t212Invested        Float?
+  t212UnrealisedPL    Float?
+  t212TotalValue      Float?
+  t212IsaApiKey       String?
+  t212IsaApiSecret    String?
+  t212IsaConnected    Boolean          @default(false)
+  t212IsaLastSync     DateTime?
+  t212IsaAccountId    String?
+  t212IsaCurrency     String?
+  t212IsaCash         Float?
+  t212IsaInvested     Float?
+  t212IsaUnrealisedPL Float?
+  t212IsaTotalValue   Float?
+  marketDataProvider  String           @default("yahoo")
+  eodhApiKey          String?
+  gapGuardMode        String           @default("ALL")
+  gapGuardWeekendATR  Float            @default(0.75)
+  gapGuardWeekendPct  Float            @default(3.0)
+  gapGuardDailyATR    Float            @default(1.0)
+  gapGuardDailyPct    Float            @default(4.0)
+  startingEquityOverride Float?
+  onboardingDismissed Boolean          @default(false)
+  dismissedEquityThresholds String?    // JSON array of equity thresholds already acknowledged
+  // Telegram credentials (env vars take priority; DB is fallback for portability)
+  telegramBotToken    String?
+  telegramChatId      String?
+  // Prediction engine settings
+  showIntradayNCS     Boolean          @default(true)   // LiveNCSTracker visibility
+  applyKellyMultiplier Boolean         @default(false)  // Kelly criterion sizing (default OFF)
+  rlShadowMode        Boolean          @default(true)   // RL advisor: advisory only (default ON)
+  modelLayerEnabled   Boolean          @default(false)  // Phase 12 model-assisted ranking overlay (default OFF)
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+  equitySnapshots     EquitySnapshot[]
+  plans               ExecutionPlan[]
+  healthChecks        HealthCheck[]
+  positions           Position[]
+  scans               Scan[]
+  tradeLogs           TradeLog[]
+}
+
+model Stock {
+  id           String       @id @default(cuid())
+  ticker       String       @unique
+  name         String
+  sleeve       String
+  sector       String?
+  cluster      String?
+  superCluster String?
+  region       String?
+  currency     String?
+  t212Ticker   String?
+  active       Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  yahooTicker  String?
+  isaEligible  Boolean?
+  positions    Position[]
+  scanResults  ScanResult[]
+}
+
+model Position {
+  id                        String        @id @default(cuid())
+  userId                    String
+  stockId                   String
+  status                    String        @default("OPEN")
+  source                    String        @default("manual")
+  t212Ticker                String?
+  entryPrice                Float
+  entryDate                 DateTime
+  shares                    Float
+  stopLoss                  Float
+  initialRisk               Float
+  currentStop               Float
+  protectionLevel           String        @default("INITIAL")
+  exitPrice                 Float?
+  exitDate                  DateTime?
+  exitReason                String?
+  exitProfitR               Float?
+  realisedPnlGbp            Float?
+  realisedPnlR              Float?
+  closedBy                  String?
+  whipsawCount              Int           @default(0)
+  notes                     String?
+  createdAt                 DateTime      @default(now())
+  updatedAt                 DateTime      @updatedAt
+  atr_at_entry              Float?
+  entry_price               Float?
+  entry_type                String?       @default("BREAKOUT")
+  initial_R                 Float?
+  initial_stop              Float?
+  profile_used              String?
+  accountType               String?       @default("invest")
+  breakoutFailureDetectedAt DateTime?
+  entryTrigger              Float?
+  stock                     Stock          @relation(fields: [stockId], references: [id])
+  user                      User           @relation(fields: [userId], references: [id])
+  stopHistory               StopHistory[]
+  tradeLogs                 TradeLog[]
+  tradeJournal              TradeJournal?
+
+  @@index([userId])
+  @@index([stockId])
+  @@index([status])
+}
+
+model StopHistory {
+  id         String   @id @default(cuid())
+  positionId String
+  oldStop    Float
+  newStop    Float
+  level      String
+  reason     String
+  createdAt  DateTime @default(now())
+  position   Position @relation(fields: [positionId], references: [id], onDelete: Cascade)
+
+  @@index([positionId])
+}
+
+model Scan {
+  id      String       @id @default(cuid())
+  userId  String
+  runDate DateTime     @default(now())
+  regime  String
+  user    User         @relation(fields: [userId], references: [id])
+  results ScanResult[]
+
+  @@index([userId])
+}
+
+model ScanResult {
+  id               String   @id @default(cuid())
+  scanId           String
+  stockId          String
+  price            Float
+  ma200            Float
+  adx              Float
+  plusDI           Float
+  minusDI          Float
+  atrPercent       Float
+  efficiency       Float
+  twentyDayHigh    Float
+  entryTrigger     Float
+  stopPrice        Float
+  distancePercent  Float
+  status           String
+  entryMode        String?
+  stage6Reason     String?
+  rankScore        Float
+  passesAllFilters Boolean
+  passesRiskGates  Boolean?
+  passesAntiChase  Boolean?
+  shares           Float?
+  riskDollars      Float?
+  mode             String   @default("FULL")  // FULL or BENCHMARK
+  stock            Stock    @relation(fields: [stockId], references: [id])
+  scan             Scan     @relation(fields: [scanId], references: [id])
+
+  @@index([scanId])
+  @@index([stockId])
+}
+
+model ExecutionPlan {
+  id         String   @id @default(cuid())
+  userId     String
+  weekOf     DateTime
+  phase      String
+  candidates String
+  notes      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  user       User     @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+model HealthCheck {
+  id      String   @id @default(cuid())
+  userId  String
+  runDate DateTime @default(now())
+  overall String
+  checks  String
+  details String
+  user    User     @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+model Heartbeat {
+  id        String   @id @default(cuid())
+  timestamp DateTime @default(now())
+  status    String
+  details   String?
+
+  @@index([timestamp])
+}
+
+model TradeLog {
+  id                 String    @id @default(cuid())
+  userId             String
+  positionId         String?
+  ticker             String
+  tradeDate          DateTime
+  tradeType          String
+  scanStatus         String?
+  bqsScore           Float?
+  fwsScore           Float?
+  ncsScore           Float?
+  dualScoreAction    String?
+  rankScore          Float?
+  entryPrice         Float?
+  initialStop        Float?
+  initialR           Float?
+  shares             Float?
+  positionSizeGbp    Float?
+  atrAtEntry         Float?
+  adxAtEntry         Float?
+  regime             String?
+  decision           String
+  decisionReason     String?
+  hesitationLevel    Int?
+  plannedEntry       Float?
+  actualFill         Float?
+  slippagePct        Float?
+  fillTime           DateTime?
+  exitPrice          Float?
+  exitReason         String?
+  finalRMultiple     Float?
+  gainLossGbp        Float?
+  daysHeld           Int?
+  whatWentWell       String?
+  whatWentWrong      String?
+  lessonsLearned     String?
+  wouldTakeAgain     Boolean?
+  climaxDetected     Boolean   @default(false)
+  whipsawBlocked     Boolean   @default(false)
+  breadthRestricted  Boolean   @default(false)
+  antiChaseTriggered Boolean   @default(false)
+  tags               String?
+  // T212 import fields
+  t212OrderId        String?   @unique
+  t212Ticker         String?
+  fillPrice          Float?
+  fillQuantity       Float?
+  fillTimestamp      DateTime?
+  fxRateAtFill       Float?
+  netValueGbp        Float?
+  realisedPnlT212    Float?
+  initiatedFrom      String?
+  importedFromT212   Boolean   @default(false)
+  importedAt         DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  position           Position? @relation(fields: [positionId], references: [id], onDelete: SetNull)
+  user               User      @relation(fields: [userId], references: [id])
+
+  @@index([userId, tradeDate(sort: Desc)])
+  @@index([positionId])
+  @@index([ticker])
+  @@index([decision])
+}
+
+model TradeTag {
+  tag         String @id
+  category    String
+  description String
+}
+
+model EquitySnapshot {
+  id              String   @id @default(cuid())
+  userId          String
+  equity          Float
+  openRiskPercent Float?
+  capturedAt      DateTime @default(now())
+  user            User     @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+  @@index([capturedAt])
+}
+
+model RegimeHistory {
+  id          String   @id @default(cuid())
+  date        DateTime @default(now())
+  benchmark   String   @default("SPY")
+  regime      String
+  spyPrice    Float?
+  spyMa200    Float?
+  vwrlPrice   Float?
+  vwrlMa200   Float?
+  breadthPct  Float?
+  adx         Float?
+  consecutive Int      @default(1)
+
+  @@index([date])
+  @@index([benchmark])
+}
+
+model SnapshotTicker {
+  id                      String   @id @default(cuid())
+  snapshotId              String
+  ticker                  String
+  name                    String?
+  sleeve                  String?
+  status                  String?
+  currency                String?
+  close                   Float    @default(0)
+  atr14                   Float    @default(0)
+  atrPct                  Float    @default(0)
+  adx14                   Float    @default(0)
+  plusDi                  Float    @default(0)
+  minusDi                 Float    @default(0)
+  weeklyAdx               Float    @default(0)
+  volRatio                Float    @default(1)
+  dollarVol20             Float    @default(0)
+  liquidityOk             Boolean  @default(true)
+  bisScore                Float    @default(0)
+  marketRegime            String   @default("NEUTRAL")
+  marketRegimeStable      Boolean  @default(true)
+  volRegime               String?  @default("NORMAL_VOL")
+  dualRegimeAligned       Boolean  @default(true)
+  high20                  Float    @default(0)
+  high55                  Float    @default(0)
+  distanceTo20dHighPct    Float    @default(0)
+  distanceTo55dHighPct    Float    @default(0)
+  entryTrigger            Float    @default(0)
+  stopLevel               Float    @default(0)
+  chasing20Last5          Boolean  @default(false)
+  chasing55Last5          Boolean  @default(false)
+  atrSpiking              Boolean  @default(false)
+  atrCollapsing           Boolean  @default(false)
+  rsVsBenchmarkPct        Float    @default(0)
+  daysToEarnings          Int?
+  earningsInNext5d        Boolean  @default(false)
+  clusterName             String?
+  superClusterName        String?
+  clusterExposurePct      Float    @default(0)
+  superClusterExposurePct Float    @default(0)
+  maxClusterPct           Float    @default(0)
+  maxSuperClusterPct      Float    @default(0)
+  rawJson                 String?
+  createdAt               DateTime @default(now())
+  atrCompressionRatio     Float?
+  snapshot                Snapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
+
+  @@index([snapshotId])
+  @@index([ticker])
+  @@index([snapshotId, ticker])
+}
+
+model Snapshot {
+  id        String           @id @default(cuid())
+  source    String           @default("upload")
+  filename  String?
+  rowCount  Int              @default(0)
+  createdAt DateTime         @default(now())
+  tickers   SnapshotTicker[]
+}
+
+model EvRecord {
+  id        String   @id @default(cuid())
+  tradeId   String
+  regime    String
+  atrBucket String
+  cluster   String?
+  sleeve    String
+  entryNCS  Float?
+  outcome   String
+  rMultiple Float
+  closedAt  DateTime
+
+  @@index([regime])
+  @@index([sleeve])
+  @@index([atrBucket])
+  @@index([closedAt])
+}
+
+model CorrelationFlag {
+  id          String   @id @default(cuid())
+  tickerA     String
+  tickerB     String
+  correlation Float
+  flag        String
+  computedAt  DateTime @default(now())
+
+  @@unique([tickerA, tickerB])
+  @@index([tickerA])
+  @@index([tickerB])
+  @@index([computedAt])
+}
+
+model ExecutionLog {
+  id             Int      @id @default(autoincrement())
+  createdAt      DateTime @default(now())
+  ticker         String
+  phase          String
+  orderId        String?
+  requestBody    String
+  responseStatus Int?
+  responseBody   String?
+  stopPrice      Float?
+  quantity       Float?
+  accountType    String
+  error          String?
+
+  @@index([ticker])
+  @@index([createdAt])
+  @@index([phase])
+}
+
+model Notification {
+  id        Int       @id @default(autoincrement())
+  createdAt DateTime  @default(now())
+  readAt    DateTime?
+  type      String
+  title     String
+  message   String
+  data      String?
+  priority  String    @default("INFO")
+
+  @@index([readAt])
+  @@index([createdAt])
+  @@index([type])
+}
+
+model BacktestRun {
+  id                String       @id @default(cuid())
+  mode              String       @default("FULL")
+  startDate         DateTime
+  endDate           DateTime
+  replayDate        DateTime?
+  status            JobRunStatus @default(RUNNING)
+  initialCapital    Float
+  riskPerTradePct   Float
+  signalCount       Int          @default(0)
+  completedTrades   Int          @default(0)
+  winRate           Float?
+  averageR          Float?
+  totalReturnPct    Float?
+  maxDrawdownPct    Float?
+  filtersJson       Json?
+  summaryJson       Json?
+  tradesJson        Json?
+  equityCurveJson   Json?
+  drawdownCurveJson Json?
+  errorMessage      String?
+  requestedAt       DateTime     @default(now())
+  finishedAt        DateTime?
+
+  @@index([requestedAt])
+  @@index([status])
+}
+
+model EarningsCache {
+  id               Int       @id @default(autoincrement())
+  ticker           String    @unique
+  nextEarningsDate DateTime?
+  confidence       String    @default("NONE")
+  fetchedAt        DateTime  @default(now())
+  source           String    @default("YAHOO")
+
+  @@index([ticker])
+  @@index([fetchedAt])
+}
+
+model TradeJournal {
+  id              Int       @id @default(autoincrement())
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  positionId      String    @unique
+  position        Position  @relation(fields: [positionId], references: [id], onDelete: Cascade)
+  entryNote       String?
+  entryConfidence Int?
+  closeNote       String?
+  learnedNote     String?
+  entryNoteAt     DateTime?
+  closeNoteAt     DateTime?
+}
+
+// ── Analytics: Filter Attribution ──
+// One row per scan-candidate. Records pass/fail + numeric value for every
+// filter in the pipeline, enabling after-the-fact analysis of which filters
+// add predictive value vs. which are redundant.
+model FilterAttribution {
+  id                    String   @id @default(cuid())
+  scanId                String
+  ticker                String
+  scanDate              DateTime @default(now())
+  regime                String
+  sleeve                String
+  status                String   // final candidate status after all stages
+  // Stage 2: Technical filters
+  priceAboveMa200       Boolean
+  ma200Value            Float    @default(0)
+  adxAbove20            Boolean
+  adxValue              Float    @default(0)
+  plusDIAboveMinusDI    Boolean
+  plusDIValue           Float    @default(0)
+  minusDIValue         Float    @default(0)
+  atrPctBelow8          Boolean
+  atrPctValue           Float    @default(0)
+  dataQuality           Boolean
+  efficiencyAbove30     Boolean
+  efficiencyValue       Float    @default(0)
+  hurstExponent         Float?
+  hurstWarn             Boolean  @default(false)
+  atrSpiking            Boolean  @default(false)
+  atrSpikeAction        String?  // NONE / SOFT_CAP / HARD_BLOCK
+  // Stage 3: Classification
+  distancePct           Float    @default(0)
+  // Stage 5: Risk gates summary
+  passesRiskGates       Boolean  @default(true)
+  riskGatesFailed       String?  // CSV of failed gate names, null if all pass
+  // Stage 6: Anti-chase
+  passesAntiChase       Boolean  @default(true)
+  antiChaseReason       String?
+  // Earnings
+  earningsAction        String?  // AUTO_NO / DEMOTE_WATCH / null
+  daysToEarnings        Int?
+  // Composite outcome
+  passesAllFilters      Boolean
+  rankScore             Float    @default(0)
+  // Eventual trade outcome (backfilled when trade closes)
+  tradeLogId            String?  // link to TradeLog if this candidate was traded
+  outcomeR              Float?   // final R-multiple if traded
+
+  @@index([scanId])
+  @@index([ticker])
+  @@index([scanDate])
+  @@index([regime])
+  // Compound index for outcome backfill: WHERE ticker + scanDate ±2 days + tradeLogId IS NULL
+  @@index([ticker, scanDate])
+}
+
+// ── Analytics: Score Breakdown ──
+// Full BQS/FWS/NCS component decomposition per snapshot ticker.
+// Enables correlation analysis between individual score components
+// and eventual trade outcomes.
+model ScoreBreakdown {
+  id                    String   @id @default(cuid())
+  snapshotId            String
+  ticker                String
+  scoredAt              DateTime @default(now())
+  regime                String
+  sleeve                String?
+  // BQS components (10)
+  bqsTrend              Float    @default(0)
+  bqsDirection          Float    @default(0)
+  bqsVolatility         Float    @default(0)
+  bqsProximity          Float    @default(0)
+  bqsTailwind           Float    @default(0)
+  bqsRs                 Float    @default(0)
+  bqsVolBonus           Float    @default(0)
+  bqsWeeklyAdx          Float    @default(0)
+  bqsBis                Float    @default(0)
+  bqsHurst              Float    @default(0)
+  bqsTotal              Float    @default(0)
+  // FWS components (5)
+  fwsVolume             Float    @default(0)
+  fwsExtension          Float    @default(0)
+  fwsMarginalTrend      Float    @default(0)
+  fwsVolShock           Float    @default(0)
+  fwsRegimeInstability  Float    @default(0)
+  fwsTotal              Float    @default(0)
+  // Penalties (3)
+  penaltyEarnings       Float    @default(0)
+  penaltyCluster        Float    @default(0)
+  penaltySuperCluster   Float    @default(0)
+  // NCS
+  baseNcs               Float    @default(0)
+  ncsTotal              Float    @default(0)
+  actionNote            String?
+  // Eventual trade outcome (backfilled when trade closes)
+  tradeLogId            String?
+  outcomeR              Float?
+
+  @@index([snapshotId])
+  @@index([ticker])
+  @@index([scoredAt])
+  // Compound index for outcome backfill + score-backfill join: WHERE ticker + scoredAt ±2 days
+  @@index([ticker, scoredAt])
+}
+
+// ── Research: Candidate Outcome Dataset ──
+// One row per ticker per scan run. Captures the full pipeline journey
+// (filters, scores, gates, sizing) and later enriched with forward
+// price returns for measuring whether each rule adds predictive value.
+// Idempotent via @@unique([scanId, ticker]).
+model CandidateOutcome {
+  id                  String   @id @default(cuid())
+  scanId              String
+  scanDate            DateTime @default(now())
+  ticker              String
+  name                String?
+  sleeve              String
+  sector              String?
+  cluster             String?
+
+  // ── Pipeline result ──
+  status              String   // READY / WATCH / WAIT_PULLBACK / COOLDOWN / EARNINGS_BLOCK / FAR
+  stageReached        String   // UNIVERSE / TECH_FILTER / CLASSIFIED / RANKED / RISK_GATED / ANTI_CHASE / SIZED
+  passedTechFilter    Boolean  @default(false)
+  passedRiskGates     Boolean  @default(false)
+  passedAntiChase     Boolean  @default(false)
+  blockedByRegime     Boolean  @default(false)
+  blockedReasons      String?  // comma-separated list of reasons
+
+  // ── Regime state ──
+  regime              String   // BULLISH / SIDEWAYS / BEARISH / NEUTRAL
+
+  // ── Technical data at scan time ──
+  price               Float    @default(0)
+  ma200               Float    @default(0)
+  adx                 Float    @default(0)
+  plusDI              Float    @default(0)
+  minusDI             Float    @default(0)
+  atrPct              Float    @default(0)
+  atr                 Float    @default(0)
+  efficiency          Float    @default(0)
+  volumeRatio         Float    @default(0)
+  relativeStrength    Float    @default(0)
+  hurstExponent       Float?
+  hurstWarn           Boolean  @default(false)
+  atrSpiking          Boolean  @default(false)
+  atrSpikeAction      String?  // NONE / SOFT_CAP / HARD_BLOCK
+
+  // ── Score pipeline ──
+  bqs                 Float?
+  fws                 Float?
+  ncs                 Float?
+  rankScore           Float    @default(0)
+  dualScoreAction     String?  // Auto-Yes / Auto-No (fragile) / Conditional
+
+  // ── Entry / Stop ──
+  entryTrigger        Float    @default(0)
+  stopPrice           Float    @default(0)
+  distancePct         Float    @default(0)
+  entryMode           String?  // BREAKOUT / PULLBACK_CONTINUATION
+
+  // ── Position sizing (suggested) ──
+  suggestedShares     Float?
+  suggestedRiskGbp    Float?
+  suggestedRiskPct    Float?
+  suggestedCostGbp    Float?
+
+  // ── Anti-chase detail ──
+  antiChaseReason     String?
+  earningsAction      String?  // AUTO_NO / DEMOTE_WATCH / null
+  daysToEarnings      Int?
+
+  // ── Risk gate detail ──
+  riskGatesFailed     String?  // comma-separated gate names
+
+  // ── Data quality ──
+  dataFreshness       String?  // LIVE / CACHE / STALE_CACHE
+
+  // ── Trade linkage (populated when trade is placed) ──
+  tradePlaced         Boolean  @default(false)
+  tradeLogId          String?
+  actualFill          Float?
+
+  // ── Forward outcome enrichment (populated by batch job after N days) ──
+  priceAtScan         Float?   // close at scan time (same as price, explicit for enrichment clarity)
+  fwdReturn5d         Float?   // % return after 5 trading days
+  fwdReturn10d        Float?   // % return after 10 trading days
+  fwdReturn20d        Float?   // % return after 20 trading days
+  mfeR                Float?   // maximum favourable excursion in R-multiples
+  maeR                Float?   // maximum adverse excursion in R-multiples
+  reached1R           Boolean?
+  reached2R           Boolean?
+  reached3R           Boolean?
+  stopHit             Boolean?
+  enrichedAt          DateTime?  // timestamp of last enrichment run
+
+  @@unique([scanId, ticker])
+  @@index([scanId])
+  @@index([ticker])
+  @@index([scanDate])
+  @@index([status])
+  @@index([regime])
+  // Compound indexes for frequent query patterns:
+  @@index([enrichedAt, scanDate])      // enrichment pipeline: WHERE enrichedAt=null ORDER scanDate ASC
+  @@index([ticker, tradePlaced])       // execution audit: WHERE ticker IN (...) AND tradePlaced=true
+  @@index([ticker, scanDate])          // trade link backfill: WHERE ticker + scanDate ±2 days
+  @@index([sleeve])                    // scorecard/validation filtering by sleeve
+}
+
+// ── Prediction Engine: Conformal Calibration ──
+// Stores calibrated quantile thresholds for NCS prediction intervals.
+// Recalibrated nightly (if sample size grew by ≥20 or last calibration >30 days).
+// Source transitions from "bootstrap" to "live_trades" as real outcomes accumulate.
+model ConformalCalibration {
+  id            Int      @id @default(autoincrement())
+  calibratedAt  DateTime @default(now())
+  coverageLevel Float    // e.g. 0.90
+  qHat          Float    // symmetric quantile
+  qHatUp        Float    // asymmetric upside quantile
+  qHatDown      Float    // asymmetric downside quantile
+  sampleSize    Int
+  regime        String?  // null = all regimes, or "BULLISH"/"SIDEWAYS"/"BEARISH"
+  source        String   // "bootstrap" | "live_trades"
+
+  @@index([regime])
+  @@index([calibratedAt])
+}
+
+// ── Prediction Engine: Failure Mode Scores ──
+// Stores per-ticker failure mode score breakdowns at scan time.
+// Used for audit trails and backtesting FM predictive value.
+model FailureModeScore {
+  id            Int      @id @default(autoincrement())
+  scoredAt      DateTime @default(now())
+  ticker        String
+  regime        String?
+  fm1           Float    // Breakout Failure Risk (0–100)
+  fm2           Float    // Liquidity Trap Risk (0–100)
+  fm3           Float    // Correlation Cascade Risk (0–100)
+  fm4           Float    // Regime Flip Risk (0–100)
+  fm5           Float    // Event Gap Risk (0–100)
+  gatePass      Boolean  // true if all FMs below thresholds
+  blockedBy     String?  // comma-separated FM IDs that blocked, null if passed
+  reasons       String?  // JSON: per-FM reason strings
+
+  @@index([ticker])
+  @@index([scoredAt])
+  @@index([ticker, scoredAt])
+}
+
+// ── Prediction Engine: Signal Weight Records ──
+// Stores dynamic signal weight snapshots computed by the meta-model.
+// Used for audit, comparison vs static weights, and future learning.
+model SignalWeightRecord {
+  id           Int      @id @default(autoincrement())
+  computedAt   DateTime @default(now())
+  regime       String   // TRENDING / RANGING / VOLATILE / TRANSITION
+  vixLevel     Float    // raw VIX value at computation time
+  vixPercentile Float   // 0–100 percentile
+  source       String   // "rule_based" | "learned"
+  wAdx         Float    // weight for ADX / trend signal
+  wDi          Float    // weight for DI / direction signal
+  wHurst       Float    // weight for Hurst / persistence signal
+  wBis         Float    // weight for BIS / breakout integrity
+  wDrs         Float    // weight for DRS / dual regime score
+  wWeeklyAdx   Float    // weight for weekly ADX
+  wBps         Float    // weight for BPS / breakout probability
+
+  @@index([computedAt])
+  @@index([regime])
+}
+
+// ── Prediction Engine: Stress Test Results ──
+// Caches adversarial Monte Carlo stress test results per ticker.
+// Results are cached for 4 hours to avoid re-running simulations.
+model StressTestResult {
+  id                 Int      @id @default(autoincrement())
+  testedAt           DateTime @default(now())
+  ticker             String
+  entryPrice         Float
+  stopPrice          Float
+  atr                Float
+  regime             String
+  nPaths             Int
+  horizonDays        Int
+  adversarialBias    Float
+  stopHitProbability Float    // 0–1: fraction of paths hitting stop
+  gate               String   // "PASS" | "FAIL"
+  percentileP5       Float    // 5th percentile final price
+  percentileP50      Float    // median final price
+  percentileP95      Float    // 95th percentile final price
+  avgDaysToStopHit   Float?   // null if no paths hit stop
+
+  @@index([ticker])
+  @@index([testedAt])
+  @@index([ticker, testedAt])
+}
+
+// ── Prediction Engine: Signal Audit Results ──
+// Stores mutual information analysis results for signal pruning.
+// One row per audit run — contains the full MI matrix and recommendations as JSON.
+model SignalAuditResult {
+  id               Int      @id @default(autoincrement())
+  computedAt       DateTime @default(now())
+  sampleSize       Int
+  hasOutcomes      Boolean  @default(false)  // true if MI computed against real R outcomes
+  miMatrix         String   // JSON: full pairwise MI matrix
+  conditionalMI    String   // JSON: per-signal conditional MI + recommendations
+  highCorrPairs    String?  // JSON: pairs with MI > 0.7
+  summary          String?  // human-readable summary
+
+  @@index([computedAt])
+}
+
+// ── Prediction Engine: Threat Library ──
+// Stores dangerous market environment fingerprints.
+// Pre-populated with known crises, expanded with real losses.
+model ThreatLibraryEntry {
+  id        Int      @id @default(autoincrement())
+  createdAt DateTime @default(now())
+  label     String   // human-readable description
+  vector    String   // JSON: normalised environment feature vector
+  severity  Int      // 0–100: how severe the associated drawdown/loss was
+  source    String   // "bootstrap_historical" | "bootstrap_pattern" | "live_loss"
+
+  @@index([severity])
+  @@index([source])
+}
+
+// ── Prediction Engine: Lead-Lag Edges ──
+// Stores statistically significant lead-lag relationships between assets.
+// Recomputed weekly (Sunday). Leader moves before follower by `lag` days.
+model LeadLagEdge {
+  id          Int      @id @default(autoincrement())
+  computedAt  DateTime @default(now())
+  leader      String   // ticker of the leading asset
+  follower    String   // ticker of the following asset
+  lag         Int      // lead time in days (1–5)
+  correlation Float    // lagged cross-correlation value
+  pValue      Float    // statistical significance
+  direction   String   // "POSITIVE" | "NEGATIVE"
+
+  @@index([follower])
+  @@index([leader])
+  @@index([follower, leader])
+}
+
+// ── Prediction Engine: Lead-Lag Signal Snapshots ──
+// Records each weekly lead-lag graph computation for audit.
+model LeadLagSignal {
+  id               Int      @id @default(autoincrement())
+  computedAt       DateTime @default(now())
+  edgeCount        Int
+  tickersProcessed Int
+  topLeader        String?
+  topFollower      String?
+  topCorrelation   Float?
+
+  @@index([computedAt])
+}
+
+// ── Prediction Engine: GNN Model Weights ──
+// Stores trained GraphSAGE weight snapshots (~200 params serialised as JSON).
+// Latest row is the active model. Older rows kept for version history.
+model GNNModelWeights {
+  id           Int      @id @default(autoincrement())
+  trainedAt    DateTime @default(now())
+  weightsJson  String   // JSON: serialised W1, b1, W2, b2, Wout, bout
+  trainingLoss Float
+  sampleSize   Int
+  epochs       Int
+
+  @@index([trainedAt])
+}
+
+// ── Prediction Engine: GNN Inference Log ──
+// One row per ticker per inference run. For audit and backtesting.
+model GNNInferenceLog {
+  id            Int      @id @default(autoincrement())
+  inferredAt    DateTime @default(now())
+  ticker        String
+  gnnScore      Float    // 0–1 raw output
+  ncsAdjustment Float    // NCS points adjustment
+  modelId       Int?     // FK to GNNModelWeights (null if untrained fallback)
+  graphNodes    Int      // number of nodes in graph at inference time
+
+  @@index([ticker])
+  @@index([inferredAt])
+}
+
+// ── Prediction Engine: Signal Belief States ──
+// Beta(α, β) distributions per (signal, regime) pair.
+// 7 signals × 4 regimes = 28 rows. Updated after each trade closes.
+model SignalBeliefState {
+  id        Int      @id @default(autoincrement())
+  signal    String   // 'adx' | 'di' | 'hurst' | 'bis' | 'drs' | 'weeklyAdx' | 'bps'
+  regime    String   // 'TRENDING' | 'RANGING' | 'VOLATILE' | 'TRANSITION'
+  alpha     Float    @default(2)  // success pseudo-count (prior = 2)
+  beta      Float    @default(2)  // failure pseudo-count (prior = 2)
+  updatedAt DateTime @default(now())
+
+  @@unique([signal, regime])
+  @@index([signal])
+  @@index([regime])
+}
+
+// ── Prediction Engine: Trade Episodes (Meta-RL) ──
+// Stores (observation, action, reward) sequences for MAML training.
+model TradeEpisode {
+  id             Int      @id @default(autoincrement())
+  createdAt      DateTime @default(now())
+  ticker         String
+  regime         String
+  stepsJson      String   // JSON: array of { observation, action, reward }
+  stepCount      Int
+  totalReward    Float
+  finalRMultiple Float
+  daysHeld       Int
+
+  @@index([ticker])
+  @@index([createdAt])
+}
+
+// ── Prediction Engine: Policy Versions (Meta-RL) ──
+// Stores trained MAML policy weight snapshots.
+model PolicyVersion {
+  id           Int      @id @default(autoincrement())
+  trainedAt    DateTime @default(now())
+  weightsJson  String   // JSON: serialised W1–W3, b1–b3
+  metaLoss     Float
+  episodeCount Int
+
+  @@index([trainedAt])
+}
+
+// ── Signals: VPIN History ──
+// Caches VPIN/DOFI computations per ticker per day.
+// Computed nightly during pre-cache phase.
+model VPINHistory {
+  id             Int      @id @default(autoincrement())
+  computedAt     DateTime @default(now())
+  ticker         String
+  vpin           Float    // 0–1: magnitude of order flow imbalance
+  dofi           Float    // -1 to +1: directional order flow imbalance
+  signal         String   // STRONG_BUY / BUY / NEUTRAL / SELL / STRONG_SELL
+  ncsAdjustment  Float    // NCS points adjustment from DOFI
+  barsUsed       Int
+
+  @@index([ticker])
+  @@index([computedAt])
+  @@index([ticker, computedAt])
+}
+
+// ── Signals: Sentiment History ──
+// Caches Sentiment Composite Score per ticker.
+model SentimentHistory {
+  id                  Int      @id @default(autoincrement())
+  computedAt          DateTime @default(now())
+  ticker              String
+  scs                 Float    // 0–100 Sentiment Composite Score (50 = neutral)
+  signal              String   // VERY_BULLISH / BULLISH / NEUTRAL / BEARISH / VERY_BEARISH
+  ncsAdjustment       Float
+  newsScore           Float    // 0–100 normalised news sentiment
+  revisionScore       Float    // 0–100 normalised revision proxy
+  shortScore          Float    // 0–100 normalised short interest proxy
+  divergenceDetected  Boolean  @default(false)
+
+  @@index([ticker])
+  @@index([computedAt])
+  @@index([ticker, computedAt])
+}
+
+// ── Prediction Engine: Invariance Audit Results ──
+// Stores IRM analysis results showing which signals are causally stable.
+model InvarianceAuditResult {
+  id               Int      @id @default(autoincrement())
+  computedAt       DateTime @default(now())
+  sampleSize       Int
+  environmentCount Int
+  environmentsUsed String   // JSON: list of environments used
+  scoresJson       String   // JSON: per-signal invariance scores + β values
+  summary          String?
+
+  @@index([computedAt])
+}
+
+enum AssetType {
+  STOCK
+  ETF
+  FUND
+  INDEX
+  FOREX
+  CRYPTO
+  OTHER
+}
+
+enum DataFetchStatus {
+  SUCCEEDED
+  FAILED
+}
+
+enum TradeSide {
+  BUY
+  SELL
+}
+
+enum PlannedEntryType {
+  MARKET
+  LIMIT
+  STOP
+}
+
+enum PlannedTradeStatus {
+  DRAFT
+  APPROVED
+  READY
+  SUBMITTED
+  FILLED
+  CANCELLED
+  REJECTED
+}
+
+enum BrokerOrderStatus {
+  PENDING
+  SUBMITTED
+  FILLED
+  CANCELLED
+  REJECTED
+}
+
+enum BrokerOrderType {
+  MARKET
+  LIMIT
+  STOP
+}
+
+enum ProtectiveStopStatus {
+  PLANNED
+  SUBMITTED
+  PENDING
+  ACTIVE
+  MISMATCH
+  MISSING
+  CANCELLED
+  TRIGGERED
+}
+
+enum ProtectiveStopSource {
+  LOCAL
+  BROKER
+  BROKER_NATIVE
+  SOFTWARE_ONLY
+  UNKNOWN
+  IMPORTED
+}
+
+enum StopAlertState {
+  CLEAR
+  WARNING
+  ALERT
+  CRITICAL
+}
+
+enum JobRunStatus {
+  RUNNING
+  SUCCEEDED
+  PARTIAL
+  FAILED
+}
+
+model Instrument {
+  id                 String           @id @default(cuid())
+  symbol             String           @unique
+  name               String
+  assetType          AssetType
+  exchange           String
+  currency           String
+  isActive           Boolean          @default(true)
+  dataSource         String           @default("YAHOO")
+  isPriceDataStale   Boolean          @default(true)
+  staleReason        String?
+  staleAsOf          DateTime?
+  lastPriceBarDate   DateTime?
+  lastSuccessfulDataFetchAt DateTime?
+  lastFailedDataFetchAt DateTime?
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+  brokerOrders       BrokerOrder[]
+  brokerPositions    BrokerPosition[]
+  dataRefreshResults DataRefreshResult[]
+  dailyBars          DailyBar[]
+  plannedTrades      PlannedTrade[]
+  signalCandidates   SignalCandidate[]
+
+  @@index([isActive])
+}
+
+model DailyBar {
+  id            String     @id @default(cuid())
+  instrumentId  String
+  date          DateTime
+  open          Float
+  high          Float
+  low           Float
+  close         Float
+  volume        BigInt
+  adjustedClose Float?
+  source        String
+  fetchedAt     DateTime   @default(now())
+  createdAt     DateTime   @default(now())
+  instrument    Instrument @relation(fields: [instrumentId], references: [id], onDelete: Cascade)
+
+  @@unique([instrumentId, date, source])
+  @@index([date])
+}
+
+model DataRefreshRun {
+  id                String            @id @default(cuid())
+  source            String
+  requestedRange    String
+  requestedInterval String
+  requestedSymbols  Int
+  succeededSymbols  Int               @default(0)
+  failedSymbols     Int               @default(0)
+  staleSymbols      Int               @default(0)
+  forced            Boolean           @default(false)
+  startedAt         DateTime
+  finishedAt        DateTime?
+  status            JobRunStatus
+  summaryJson       Json?
+  errorSummary      String?
+  createdAt         DateTime          @default(now())
+  results           DataRefreshResult[]
+
+  @@index([startedAt])
+  @@index([status])
+}
+
+model DataRefreshResult {
+  id                String          @id @default(cuid())
+  dataRefreshRunId  String
+  instrumentId      String?
+  symbol            String
+  status            DataFetchStatus
+  requestedRange    String
+  requestedInterval String
+  barsFetched       Int             @default(0)
+  lastBarDate       DateTime?
+  startedAt         DateTime
+  finishedAt        DateTime?
+  retryCount        Int             @default(0)
+  staleAfterRun     Boolean         @default(false)
+  errorMessage      String?
+  rawMetaJson       Json?
+  rawEventsJson     Json?
+  createdAt         DateTime        @default(now())
+  dataRefreshRun    DataRefreshRun  @relation(fields: [dataRefreshRunId], references: [id], onDelete: Cascade)
+  instrument        Instrument?     @relation(fields: [instrumentId], references: [id], onDelete: SetNull)
+
+  @@index([symbol])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model PortfolioSnapshot {
+  id               String         @id @default(cuid())
+  brokerSyncRunId  String?
+  snapshotAt       DateTime       @default(now())
+  accountId        String?
+  accountType      String?
+  source           String         @default("BROKER")
+  currency         String
+  cashBalance      Decimal
+  equity           Decimal
+  buyingPower      Decimal?
+  totalMarketValue Decimal?
+  dailyPnl         Decimal?
+  rawPayloadJson   Json?
+  createdAt        DateTime       @default(now())
+  brokerSyncRun    BrokerSyncRun? @relation(fields: [brokerSyncRunId], references: [id], onDelete: SetNull)
+
+  @@index([snapshotAt])
+}
+
+model BrokerPosition {
+  id               String           @id @default(cuid())
+  brokerPositionId String           @unique
+  instrumentId     String?
+  accountId        String?
+  accountType      String?
+  symbol           String
+  quantity         Decimal
+  averagePrice     Decimal
+  marketPrice      Decimal
+  marketValue      Decimal
+  unrealizedPnl    Decimal
+  currency         String?
+  isOpen           Boolean          @default(true)
+  closedAt         DateTime?
+  lastSyncedAt     DateTime?
+  updatedAt        DateTime
+  createdAt        DateTime         @default(now())
+  instrument       Instrument?      @relation(fields: [instrumentId], references: [id], onDelete: SetNull)
+  protectiveStops  ProtectiveStop[]
+
+  @@index([symbol])
+  @@index([updatedAt])
+}
+
+model BrokerOrder {
+  id               String            @id @default(cuid())
+  brokerOrderId    String            @unique
+  instrumentId     String?
+  plannedTradeId   String?
+  accountId        String?
+  accountType      String?
+  symbol           String
+  side             TradeSide
+  orderType        BrokerOrderType
+  status           BrokerOrderStatus
+  quantity         Decimal
+  filledQuantity   Decimal?
+  limitPrice       Decimal?
+  stopPrice        Decimal?
+  averageFillPrice Decimal?
+  submittedAt      DateTime?
+  lastSyncedAt     DateTime?
+  updatedAt        DateTime
+  rawPayloadJson   Json?
+  createdAt        DateTime          @default(now())
+  instrument       Instrument?       @relation(fields: [instrumentId], references: [id], onDelete: SetNull)
+  plannedTrade     PlannedTrade?     @relation(fields: [plannedTradeId], references: [id], onDelete: SetNull)
+
+  @@index([symbol])
+  @@index([status])
+}
+
+model PlannedTrade {
+  id                   String             @id @default(cuid())
+  instrumentId         String?
+  symbol               String
+  side                 TradeSide
+  plannedQuantity      Decimal
+  plannedEntryType     PlannedEntryType
+  plannedEntryPrice    Decimal
+  plannedStopPrice     Decimal
+  rationale            String
+  status               PlannedTradeStatus @default(DRAFT)
+  createdAt            DateTime           @default(now())
+  updatedAt            DateTime           @updatedAt
+  executionSessionDate DateTime
+  notes                String?
+  riskPerTrade         Float?
+  riskApproved         Boolean?
+  riskRationale        String?
+  riskViolationsJson   Json?
+  brokerOrders         BrokerOrder[]
+  instrument           Instrument?        @relation(fields: [instrumentId], references: [id], onDelete: SetNull)
+
+  @@index([symbol])
+  @@index([status])
+  @@index([executionSessionDate])
+}
+
+model ProtectiveStop {
+  id               String               @id @default(cuid())
+  symbol           String
+  linkedPositionId String?
+  stopPrice        Decimal
+  status           ProtectiveStopStatus @default(PENDING)
+  source           ProtectiveStopSource @default(LOCAL)
+  brokerReference  String?
+  lastVerifiedAt   DateTime?
+  alertState       StopAlertState       @default(CLEAR)
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+  linkedPosition   BrokerPosition?      @relation(fields: [linkedPositionId], references: [id], onDelete: SetNull)
+
+  @@index([symbol])
+  @@index([status])
+}
+
+model SignalRun {
+  id               String            @id @default(cuid())
+  startedAt        DateTime          @default(now())
+  completedAt      DateTime?
+  status           JobRunStatus      @default(RUNNING)
+  runType          String            @default("EVENING_SCAN")
+  strategyName     String            @default("phase1")
+  regime           String?
+  source           String?
+  universeSize     Int?
+  staleSymbolCount Int?
+  notes            String?
+  parametersJson   Json?
+  candidates       SignalCandidate[]
+
+  @@index([startedAt])
+  @@index([status])
+}
+
+model SignalCandidate {
+  id                  String      @id @default(cuid())
+  signalRunId         String
+  instrumentId        String?
+  symbol              String
+  currentPrice        Float
+  triggerPrice        Float
+  initialStop         Float
+  stopDistancePercent Float
+  riskPerShare        Float
+  setupStatus         String
+  rankScore           Float?
+  reasonsJson         Json?
+  warningsJson        Json?
+  createdAt           DateTime    @default(now())
+  instrument          Instrument? @relation(fields: [instrumentId], references: [id], onDelete: SetNull)
+  signalRun           SignalRun   @relation(fields: [signalRunId], references: [id], onDelete: Cascade)
+
+  @@index([signalRunId])
+  @@index([symbol])
+}
+
+model RiskSnapshot {
+  id                  String   @id @default(cuid())
+  snapshotAt          DateTime @default(now())
+  openRisk            Decimal?
+  accountEquity       Decimal?
+  cashBalance         Decimal?
+  concentrationJson   Json?
+  ruleViolationsJson  Json?
+  riskLevel           String?
+  totalOpenRiskPct    Float?
+  maxOpenRiskPct      Float?
+  openPositionCount   Int?
+  maxPositionCount    Int?
+  portfolioValue      Float?
+  availableCash       Float?
+  payloadJson         Json?
+  createdAt           DateTime @default(now())
+
+  @@index([snapshotAt])
+}
+
+model JobRun {
+  id          String       @id @default(cuid())
+  jobName     String
+  status      JobRunStatus @default(RUNNING)
+  startedAt   DateTime     @default(now())
+  finishedAt  DateTime?
+  completedAt DateTime?
+  durationMs  Int?
+  detailsJson Json?
+  errorMessage String?
+  summary     String?
+  payloadJson Json?
+  createdAt   DateTime     @default(now())
+
+  @@index([jobName, startedAt])
+  @@index([status])
+}
+
+model BrokerSyncRun {
+  id               String       @id @default(cuid())
+  adapter          String
+  source           String
+  startedAt        DateTime
+  finishedAt       DateTime?
+  positionsCount   Int          @default(0)
+  ordersCount      Int          @default(0)
+  discrepancyCount Int          @default(0)
+  status           JobRunStatus
+  summaryJson      Json?
+  diffJson         Json?
+  errorSummary     String?
+  createdAt        DateTime     @default(now())
+  snapshots        PortfolioSnapshot[]
+
+  @@index([startedAt])
+  @@index([status])
+}
+
+model EveningWorkflowRun {
+  id           String                   @id @default(cuid())
+  sessionDate  DateTime
+  startedAt    DateTime
+  finishedAt   DateTime?
+  status       JobRunStatus
+  summaryJson  Json?
+  errorSummary String?
+  createdAt    DateTime                 @default(now())
+  steps        EveningWorkflowStepRun[]
+
+  @@index([sessionDate])
+  @@index([startedAt])
+  @@index([status])
+}
+
+model EveningWorkflowStepRun {
+  id                   String             @id @default(cuid())
+  eveningWorkflowRunId String
+  stepKey              String
+  label                String
+  startedAt            DateTime
+  finishedAt           DateTime?
+  status               JobRunStatus
+  detailsJson          Json?
+  errorMessage         String?
+  createdAt            DateTime           @default(now())
+  eveningWorkflowRun   EveningWorkflowRun @relation(fields: [eveningWorkflowRunId], references: [id], onDelete: Cascade)
+
+  @@index([eveningWorkflowRunId, stepKey])
+  @@index([startedAt])
+  @@index([status])
+}
+
+model AuditEvent {
+  id         String   @id @default(cuid())
+  eventType  String
+  entityType String
+  entityId   String
+  payloadJson Json?
+  createdAt  DateTime @default(now())
+
+  @@index([eventType])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+model AppSetting {
+  id          String   @id @default(cuid())
+  key         String   @unique
+  value       String
+  valueText   String?
+  valueJson   Json?
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}

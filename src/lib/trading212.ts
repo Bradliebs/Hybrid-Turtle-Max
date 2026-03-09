@@ -1,0 +1,835 @@
+/**
+ * DEPENDENCIES
+ * Consumed by: /api/stops/t212/route.ts, /api/trading212/*, T212SyncPanel.tsx, /api/positions/execute/route.ts
+ * Consumes: fetch (T212 REST API)
+ * Risk-sensitive: YES
+ * Last modified: 2026-02-28
+ * Notes: isStopTooFar() pre-validates stop distance before T212 API call (instrument-specific, ~50% heuristic)
+ */
+// ============================================================
+// Trading 212 API Client — HybridTurtle Integration
+// ============================================================
+
+export type Trading212Environment = 'demo' | 'live';
+
+/** Which T212 account a position belongs to — re-exported from trading212-dual.ts */
+export type T212AccountType = 'invest' | 'isa';
+
+const BASE_URLS: Record<Trading212Environment, string> = {
+  demo: 'https://demo.trading212.com/api/v0',
+  live: 'https://live.trading212.com/api/v0',
+};
+
+// ---- Response Types ----
+
+export interface T212Position {
+  averagePricePaid: number;
+  createdAt: string; // ISO 8601
+  currentPrice: number;
+  instrument: {
+    isin: string;
+    currencyCode: string;
+    name: string;
+    ticker: string;
+  };
+  quantity: number;
+  quantityAvailableForTrading: number;
+  quantityInPies: number;
+  walletImpact: {
+    investedValue: number;
+    result: number;
+    resultCoef: number;
+    value: number;
+    valueInAccountCurrency: number;
+  };
+}
+
+export interface T212AccountSummary {
+  cash: {
+    availableToTrade: number;
+    inPies: number;
+    reservedForOrders: number;
+  };
+  currency: string;
+  id: number;
+  investments: {
+    currentValue: number;
+    realizedProfitLoss: number;
+    totalCost: number;
+    unrealizedProfitLoss: number;
+  };
+  totalValue: number;
+}
+
+export interface T212Instrument {
+  ticker: string;
+  isin: string;
+  currencyCode: string;
+  name: string;
+  type: string;
+  exchange: string;
+  minTradeQuantity: number;
+  maxOpenQuantity: number;
+  addedOn: string;
+}
+
+export interface T212HistoricalOrderFill {
+  price: number;
+  quantity: number;
+  filledAt: string;
+  walletImpact?: {
+    fxRate?: number;
+    netValue?: number;
+    realisedProfitLoss?: number;
+  };
+}
+
+/** Raw T212 API response shape for each history item: { order, fill } */
+interface T212RawHistoryItem {
+  order: {
+    id: number;
+    ticker: string;
+    type: string;
+    strategy?: string;
+    side?: 'BUY' | 'SELL';
+    status: string;
+    limitPrice?: number;
+    stopPrice?: number;
+    quantity?: number;
+    filledQuantity?: number;
+    value?: number;
+    filledValue?: number;
+    currency?: string;
+    extendedHours?: boolean;
+    initiatedFrom?: string;
+    createdAt: string;
+    instrument?: {
+      ticker: string;
+      name: string;
+      isin: string;
+      currency: string;
+    };
+  };
+  fill?: {
+    id: number;
+    quantity: number;
+    price: number;
+    type: string;
+    tradingMethod?: string;
+    filledAt: string;
+    walletImpact?: {
+      currency?: string;
+      netValue?: number;
+      realisedProfitLoss?: number;
+      fxRate?: number;
+    };
+  };
+}
+
+/**
+ * Flattened historical order — produced by getOrderHistory() from T212 raw response.
+ * This is the format consumed by the importer.
+ */
+export interface T212HistoricalOrder {
+  id: number;
+  ticker: string;
+  type: string;
+  side?: 'BUY' | 'SELL';
+  status: string;
+  limitPrice?: number;
+  stopPrice?: number;
+  quantity: number;
+  filledQuantity: number;
+  filledValue: number;
+  dateCreated: string;
+  dateExecuted?: string;
+  initiatedFrom?: string;
+  fills?: T212HistoricalOrderFill[];
+}
+
+export interface T212PendingOrder {
+  id: number;
+  createdAt: string;
+  currency: string;
+  extendedHours: boolean;
+  filledQuantity: number;
+  filledValue: number;
+  initiatedFrom: string;
+  instrument: {
+    currency: string;
+    isin: string;
+    name: string;
+    ticker: string;
+  };
+  limitPrice?: number;
+  quantity: number;
+  side: 'BUY' | 'SELL';
+  status: string;
+  stopPrice?: number;
+  strategy: string;
+  ticker: string;
+  timeInForce: 'DAY' | 'GOOD_TILL_CANCEL';
+  type: 'LIMIT' | 'STOP' | 'MARKET' | 'STOP_LIMIT';
+  value: number;
+}
+
+export interface T212PlaceStopOrderRequest {
+  quantity: number;       // Negative for sell (stop-loss)
+  stopPrice: number;
+  ticker: string;         // T212 format: AAPL_US_EQ
+  timeValidity: 'DAY' | 'GOOD_TILL_CANCEL';
+}
+
+export interface T212PlaceMarketOrderRequest {
+  quantity: number;       // Positive = buy, Negative = sell
+  ticker: string;         // T212 format: AAPL_US_EQ
+}
+
+export interface T212PaginatedResponse<T> {
+  items: T[];
+  nextPagePath: string | null;
+}
+
+// ---- API Client ----
+
+export class Trading212Client {
+  private baseUrl: string;
+  private authHeader: string;
+
+  constructor(apiKey: string, apiSecret: string, environment: Trading212Environment = 'live') {
+    this.baseUrl = BASE_URLS[environment];
+    // HTTP Basic Auth: base64(API_KEY:API_SECRET)
+    const credentials = Buffer.from(`${apiKey}:${apiSecret}`).toString('base64');
+    this.authHeader = `Basic ${credentials}`;
+  }
+
+  private async request<T>(path: string, options?: { method?: string; body?: unknown }): Promise<T> {
+    const url = path.startsWith('http') ? path : `${this.baseUrl}${path}`;
+    const method = options?.method ?? 'GET';
+    const maxRetries = 2; // Retry up to 2 times on rate limit (429)
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const response = await fetch(url, {
+        method,
+        headers: {
+          'Authorization': this.authHeader,
+          'Content-Type': 'application/json',
+        },
+        ...(options?.body ? { body: JSON.stringify(options.body) } : {}),
+      });
+
+      if (!response.ok) {
+        const rateLimitReset = response.headers.get('x-ratelimit-reset');
+
+        if (response.status === 429) {
+          // Auto-retry after waiting for the rate limit window to reset
+          if (attempt < maxRetries) {
+            const waitMs = rateLimitReset
+              ? Math.max(1000, (parseInt(rateLimitReset) * 1000) - Date.now() + 500)
+              : 6000; // Default 6s wait (covers the 5s getPendingOrders limit)
+            const clampedWait = Math.min(waitMs, 15000); // Cap at 15s
+            console.warn(`T212 rate limited on ${method} ${path}, retrying in ${clampedWait}ms (attempt ${attempt + 1}/${maxRetries})`);
+            await new Promise((r) => setTimeout(r, clampedWait));
+            continue;
+          }
+          throw new Trading212Error(
+            `Rate limited. Resets at ${rateLimitReset}`,
+            429,
+            rateLimitReset ? parseInt(rateLimitReset) : undefined
+          );
+        }
+
+        if (response.status === 401) {
+          throw new Trading212Error('Invalid API credentials', 401);
+        }
+
+        if (response.status === 403) {
+          throw new Trading212Error('Access forbidden — check API key permissions', 403);
+        }
+
+        // Read the response body for the actual T212 error detail
+        let errorDetail = '';
+        try {
+          const errorBody = await response.text();
+          // T212 returns JSON with varying field names: message, code, type, title
+          try {
+            const parsed = JSON.parse(errorBody);
+            errorDetail = parsed.message || parsed.code || parsed.errorMessage
+              || (parsed.title ? `${parsed.title}${parsed.type ? ` (${parsed.type})` : ''}` : '')
+              || errorBody;
+          } catch {
+            errorDetail = errorBody;
+          }
+        } catch {
+          errorDetail = response.statusText;
+        }
+
+        // Add diagnostic hints for known T212 error types
+        if (errorDetail.includes('price-too-far')) {
+          errorDetail += '. T212 rejected this stop because it is outside the instrument\'s acceptable price range (typically ~50% from the current market price, but varies per instrument). For UK stocks (.L), also check that your stop is in pence (GBX), not pounds (GBP) — e.g. 1350 not 13.50. Consider using a tighter stop or setting it manually in the T212 app.';
+        }
+        if (errorDetail.includes('selling-equity-not-owned')) {
+          errorDetail += '. T212 says you don\'t own this equity on this account. This usually means the position is in a different account (ISA vs Invest) — check the accountType on the position matches where the shares are actually held.';
+        }
+
+        throw new Trading212Error(
+          `Trading 212 API error ${response.status}: ${errorDetail}`,
+          response.status
+        );
+      }
+
+      return response.json();
+    }
+
+    // Should never reach here, but TypeScript needs a return
+    throw new Trading212Error('Max retries exceeded', 429);
+  }
+
+  // ---- Positions ----
+
+  /** Fetch all open positions. Rate limit: 1 req / 1s */
+  async getPositions(): Promise<T212Position[]> {
+    return this.request<T212Position[]>('/equity/positions');
+  }
+
+  /** Fetch a single position by ticker. Rate limit: 1 req / 1s */
+  async getPosition(ticker: string): Promise<T212Position[]> {
+    return this.request<T212Position[]>(`/equity/positions?ticker=${encodeURIComponent(ticker)}`);
+  }
+
+  // ---- Account ----
+
+  /** Get account summary with cash and investment metrics. Rate limit: 1 req / 5s */
+  async getAccountSummary(): Promise<T212AccountSummary> {
+    return this.request<T212AccountSummary>('/equity/account/summary');
+  }
+
+  // ---- Instruments ----
+
+  /** Get list of tradable instruments */
+  async getInstruments(): Promise<T212Instrument[]> {
+    return this.request<T212Instrument[]>('/equity/metadata/instruments');
+  }
+
+  // ---- Historical Orders (paginated) ----
+
+  /**
+   * Fetch all historical orders with automatic pagination.
+   * T212 API returns { order, fill } pairs — we flatten them into T212HistoricalOrder
+   * for the importer to consume.
+   */
+  async getOrderHistory(limit: number = 50): Promise<T212HistoricalOrder[]> {
+    const allOrders: T212HistoricalOrder[] = [];
+    let nextPath: string | null = `/equity/history/orders?limit=${limit}`;
+
+    while (nextPath) {
+      const page: T212PaginatedResponse<T212RawHistoryItem> = await this.request(nextPath);
+
+      for (const item of page.items) {
+        const o = item.order;
+        const f = item.fill;
+
+        // Flatten the { order, fill } pair into a single T212HistoricalOrder
+        const filledQty = f
+          ? Math.abs(f.quantity)
+          : Math.abs(o.filledQuantity ?? 0);
+        const filledVal = f
+          ? Math.abs(f.quantity) * f.price
+          : (o.filledValue ?? 0);
+
+        const flat: T212HistoricalOrder = {
+          id: o.id,
+          ticker: o.ticker,
+          type: o.type,
+          side: o.side,
+          status: o.status,
+          limitPrice: o.limitPrice,
+          stopPrice: o.stopPrice,
+          quantity: Math.abs(o.quantity ?? filledQty),
+          filledQuantity: filledQty,
+          filledValue: filledVal,
+          dateCreated: o.createdAt,
+          dateExecuted: f?.filledAt,
+          initiatedFrom: o.initiatedFrom,
+        };
+
+        // Attach fill data in the fills[] format the importer expects
+        if (f) {
+          flat.fills = [{
+            price: f.price,
+            quantity: Math.abs(f.quantity),
+            filledAt: f.filledAt,
+            walletImpact: f.walletImpact ? {
+              fxRate: f.walletImpact.fxRate,
+              netValue: f.walletImpact.netValue,
+              realisedProfitLoss: f.walletImpact.realisedProfitLoss,
+            } : undefined,
+          }];
+        }
+
+        allOrders.push(flat);
+      }
+
+      // T212 nextPagePath includes /api/v0/ prefix — strip it to avoid doubling
+      // since baseUrl already contains /api/v0
+      const raw = page.nextPagePath;
+      if (raw) {
+        nextPath = raw.startsWith('/api/v0') ? raw.replace('/api/v0', '') : raw;
+      } else {
+        nextPath = null;
+      }
+    }
+
+    return allOrders;
+  }
+
+  // ---- Orders ----
+
+  /** Get all pending (active) orders. Rate limit: 1 req / 5s */
+  async getPendingOrders(): Promise<T212PendingOrder[]> {
+    return this.request<T212PendingOrder[]>('/equity/orders');
+  }
+
+  /** Get a single pending order by ID. Rate limit: 1 req / 1s */
+  async getOrder(orderId: number): Promise<T212PendingOrder> {
+    return this.request<T212PendingOrder>(`/equity/orders/${orderId}`);
+  }
+
+  /**
+   * Place a Market order (buy or sell at current market price).
+   * Positive quantity = buy, negative = sell.
+   * Rate limit: 1 req / 2s
+   */
+  async placeMarketOrder(order: T212PlaceMarketOrderRequest): Promise<T212PendingOrder> {
+    return this.request<T212PendingOrder>('/equity/orders/market', {
+      method: 'POST',
+      body: order,
+    });
+  }
+
+  /**
+   * Place a Stop order (sell stop-loss).
+   * Quantity must be NEGATIVE for a sell-side stop-loss.
+   * Rate limit: 1 req / 2s
+   */
+  async placeStopOrder(order: T212PlaceStopOrderRequest): Promise<T212PendingOrder> {
+    return this.request<T212PendingOrder>('/equity/orders/stop', {
+      method: 'POST',
+      body: order,
+    });
+  }
+
+  /**
+   * Cancel a pending order by ID.
+   * Rate limit: 50 req / 1m
+   * Includes 429 retry logic (up to 2 retries with backoff).
+   */
+  async cancelOrder(orderId: number): Promise<void> {
+    const url = `${this.baseUrl}/equity/orders/${orderId}`;
+    const maxRetries = 2;
+
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      const response = await fetch(url, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': this.authHeader,
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (response.ok) return;
+
+      if (response.status === 429) {
+        if (attempt < maxRetries) {
+          const rateLimitReset = response.headers.get('x-ratelimit-reset');
+          const waitMs = rateLimitReset
+            ? Math.max(1000, (parseInt(rateLimitReset) * 1000) - Date.now() + 500)
+            : 3000;
+          const clampedWait = Math.min(waitMs, 10000);
+          console.warn(`T212 rate limited on DELETE order ${orderId}, retrying in ${clampedWait}ms (attempt ${attempt + 1}/${maxRetries})`);
+          await new Promise((r) => setTimeout(r, clampedWait));
+          continue;
+        }
+        throw new Trading212Error(`Rate limited cancelling order ${orderId}`, 429);
+      }
+
+      if (response.status === 404) {
+        // Already cancelled/filled — not an error in batch context
+        return;
+      }
+      throw new Trading212Error(`Failed to cancel order: ${response.status}`, response.status);
+    }
+  }
+
+  /**
+   * Place or replace a stop-loss for a position.
+   * MONOTONIC RULE: the new stop must be >= any existing T212 stop.
+   * 1. Finds any existing STOP sell orders for this ticker
+   * 2. Enforces monotonic rule (stops only go UP)
+   * 3. Cancels old stops
+   * 4. Places a new stop order at the given price
+   * Returns the new order, or null if shares is 0.
+   * Throws Trading212Error if the new stop would lower an existing one.
+   */
+  async setStopLoss(
+    t212Ticker: string,
+    shares: number,
+    stopPrice: number,
+    /** Optional current price for pre-validation; if not supplied, fetched from T212 positions */
+    currentPrice?: number
+  ): Promise<T212PendingOrder | null> {
+    if (shares <= 0) return null;
+
+    // Pre-validate ownership and stop distance against T212 positions
+    let livePrice = currentPrice;
+    if (!livePrice) {
+      try {
+        const prices = await this.getPositionPrices();
+        livePrice = prices.get(t212Ticker);
+        // If we successfully fetched positions but this ticker isn't there,
+        // the position doesn't exist on this T212 account
+        if (!livePrice && prices.size > 0) {
+          throw new Trading212Error(
+            `Ticker ${t212Ticker} not found in T212 positions for this account. ` +
+            `The position may be in a different account (ISA vs Invest) or was already sold on T212. ` +
+            `Check the position's account type in the portfolio page.`,
+            400
+          );
+        }
+      } catch (e) {
+        // Re-throw our ownership check error; swallow network errors
+        if (e instanceof Trading212Error && e.statusCode === 400) throw e;
+        /* proceed without validation on network errors */
+      }
+    }
+    if (livePrice && livePrice > 0) {
+      const { tooFar, distancePct } = Trading212Client.isStopTooFar(stopPrice, livePrice);
+      if (tooFar) {
+        throw new Trading212Error(
+          `Stop price ${stopPrice.toFixed(2)} is ${distancePct.toFixed(1)}% from current price ${livePrice.toFixed(2)} — T212 will reject this (instrument-specific limit, typically ~50%). Consider a tighter stop or set it manually in the T212 app.`,
+          400
+        );
+      }
+    }
+
+    // 1. Find existing stop orders for this ticker
+    const pending = await this.getPendingOrders();
+    const existingStops = pending.filter(
+      (o) => o.ticker === t212Ticker && o.type === 'STOP' && o.side === 'SELL'
+    );
+
+    // 2. MONOTONIC ENFORCEMENT — never lower an existing stop
+    const highestExisting = existingStops.reduce(
+      (max, o) => Math.max(max, o.stopPrice ?? 0),
+      0
+    );
+    if (highestExisting > 0 && stopPrice < highestExisting) {
+      throw new Trading212Error(
+        `Monotonic rule: cannot lower stop from ${highestExisting.toFixed(2)} to ${stopPrice.toFixed(2)}. Stops can only move UP.`,
+        400
+      );
+    }
+
+    // If the stop price is the same as what's already on T212, skip
+    if (
+      existingStops.length === 1 &&
+      Math.abs((existingStops[0].stopPrice ?? 0) - stopPrice) < 0.005
+    ) {
+      return existingStops[0]; // Already set — no change needed
+    }
+
+    // 3. Cancel existing stop orders
+    for (const old of existingStops) {
+      try {
+        await this.cancelOrder(old.id);
+        await new Promise((r) => setTimeout(r, 250));
+      } catch {
+        // Ignore if already cancelled/filled
+      }
+    }
+
+    // 4. Wait a moment after cancellations
+    if (existingStops.length > 0) {
+      await new Promise((r) => setTimeout(r, 500));
+    }
+
+    // 5. Place new stop order (negative quantity = sell)
+    return this.placeStopOrder({
+      quantity: -shares,
+      stopPrice,
+      ticker: t212Ticker,
+      timeValidity: 'GOOD_TILL_CANCEL',
+    });
+  }
+
+  /**
+   * Remove all stop-loss orders for a ticker.
+   */
+  async removeStopLoss(t212Ticker: string): Promise<number> {
+    const pending = await this.getPendingOrders();
+    const stops = pending.filter(
+      (o) => o.ticker === t212Ticker && o.type === 'STOP' && o.side === 'SELL'
+    );
+    let cancelled = 0;
+    for (const order of stops) {
+      try {
+        await this.cancelOrder(order.id);
+        cancelled++;
+        await new Promise((r) => setTimeout(r, 250));
+      } catch {
+        // Ignore
+      }
+    }
+    return cancelled;
+  }
+
+  // ---- Bulk Stop Management ----
+
+  /**
+   * Bulk push stop-losses for multiple positions.
+   * Fetches pending orders ONCE, then processes each position sequentially.
+   * Rate limit: ~2s between cancel/place operations (T212: 1 req/1s for orders, 50/min for cancels).
+   *
+   * @param stops Array of { t212Ticker, shares, stopPrice } to set
+   * @returns Per-position results
+   */
+  async setStopLossBatch(
+    stops: Array<{ t212Ticker: string; shares: number; stopPrice: number }>
+  ): Promise<Array<{ t212Ticker: string; stopPrice: number; action: string; orderId?: number; error?: string }>> {
+    // 1. Fetch ALL pending orders once
+    const pending = await this.getPendingOrders();
+    const allStopOrders = pending.filter(
+      (o) => o.type === 'STOP' && o.side === 'SELL'
+    );
+
+    // Pre-fetch current prices for stop distance validation
+    let livePrices = new Map<string, number>();
+    try {
+      livePrices = await this.getPositionPrices();
+    } catch {
+      console.warn('[T212] Could not fetch live prices for stop range validation — proceeding without pre-check');
+    }
+
+    // Index by ticker for O(1) lookup
+    const stopsByTicker = new Map<string, T212PendingOrder[]>();
+    for (const order of allStopOrders) {
+      const existing = stopsByTicker.get(order.ticker) ?? [];
+      existing.push(order);
+      stopsByTicker.set(order.ticker, existing);
+    }
+
+    const results: Array<{ t212Ticker: string; stopPrice: number; action: string; orderId?: number; error?: string }> = [];
+
+    for (const { t212Ticker, shares, stopPrice } of stops) {
+      if (shares <= 0) {
+        results.push({ t212Ticker, stopPrice, action: 'SKIPPED_NO_SHARES' });
+        continue;
+      }
+
+      const existingStops = stopsByTicker.get(t212Ticker) ?? [];
+
+      // Pre-validate ownership: if we fetched prices successfully but this ticker isn't there,
+      // the position doesn't exist on this T212 account (wrong account type or already sold)
+      const livePrice = livePrices.get(t212Ticker);
+      if (livePrices.size > 0 && !livePrice) {
+        results.push({
+          t212Ticker, stopPrice, action: 'SKIPPED_NOT_OWNED',
+          error: `Ticker ${t212Ticker} not found in T212 positions — may be in wrong account (ISA vs Invest) or already sold`,
+        });
+        continue;
+      }
+
+      // Pre-validate stop distance against current market price
+      if (livePrice && livePrice > 0) {
+        const { tooFar, distancePct } = Trading212Client.isStopTooFar(stopPrice, livePrice);
+        if (tooFar) {
+          results.push({
+            t212Ticker, stopPrice, action: 'SKIPPED_PRICE_TOO_FAR',
+            error: `Stop ${stopPrice.toFixed(2)} is ${distancePct.toFixed(1)}% from live price ${livePrice.toFixed(2)} — exceeds T212 acceptable range`,
+          });
+          continue;
+        }
+      }
+
+      // Monotonic enforcement
+      const highestExisting = existingStops.reduce(
+        (max, o) => Math.max(max, o.stopPrice ?? 0), 0
+      );
+      if (highestExisting > 0 && stopPrice < highestExisting) {
+        results.push({
+          t212Ticker, stopPrice,
+          action: 'FAILED',
+          error: `Monotonic rule: cannot lower stop from ${highestExisting.toFixed(2)} to ${stopPrice.toFixed(2)}`,
+        });
+        continue;
+      }
+
+      // Skip if already set to same price
+      if (
+        existingStops.length === 1 &&
+        Math.abs((existingStops[0].stopPrice ?? 0) - stopPrice) < 0.005
+      ) {
+        results.push({ t212Ticker, stopPrice, action: 'SKIPPED_SAME', orderId: existingStops[0].id });
+        continue;
+      }
+
+      try {
+        // Cancel existing stops for this ticker
+        for (const old of existingStops) {
+          try {
+            await this.cancelOrder(old.id);
+            await new Promise((r) => setTimeout(r, 300));
+          } catch { /* already cancelled/filled */ }
+        }
+
+        // Brief pause after cancels before placing new order
+        if (existingStops.length > 0) {
+          await new Promise((r) => setTimeout(r, 500));
+        }
+
+        // Place new stop
+        const order = await this.placeStopOrder({
+          quantity: -shares,
+          stopPrice,
+          ticker: t212Ticker,
+          timeValidity: 'GOOD_TILL_CANCEL',
+        });
+
+        results.push({ t212Ticker, stopPrice, action: 'PLACED', orderId: order?.id });
+
+        // Rate limit: 2.5s between positions (place order limit is 1 req/2s, extra buffer for safety)
+        await new Promise((r) => setTimeout(r, 2500));
+      } catch (error) {
+        const errMsg = (error as Error).message;
+        // Distinguish price-too-far rejections from other failures
+        const action = errMsg.includes('price-too-far') ? 'FAILED_PRICE_TOO_FAR' : 'FAILED';
+        results.push({
+          t212Ticker, stopPrice, action,
+          error: errMsg,
+        });
+        // Still wait even on failure to avoid burning rate limit
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    }
+
+    return results;
+  }
+
+  // ---- Stop Price Range Validation ----
+
+  /**
+   * Check if a stop price is likely too far from the current market price for T212 to accept.
+   * T212 enforces instrument-specific acceptable ranges (~50% from live price is a common ceiling,
+   * but individual instruments may have tighter limits).
+   * Returns { tooFar, distancePct } so callers can decide whether to skip or warn.
+   */
+  static isStopTooFar(
+    stopPrice: number,
+    currentPrice: number,
+    /** Conservative max distance — default 50%. Some instruments reject at ~20-30%. */
+    maxDistancePct: number = 50
+  ): { tooFar: boolean; distancePct: number } {
+    if (currentPrice <= 0 || stopPrice <= 0) return { tooFar: false, distancePct: 0 };
+    const distancePct = Math.abs((currentPrice - stopPrice) / currentPrice) * 100;
+    return { tooFar: distancePct > maxDistancePct, distancePct };
+  }
+
+  /**
+   * Fetch current prices for all T212 positions, keyed by T212 ticker.
+   * Useful for pre-validating stop distances before placing orders.
+   */
+  async getPositionPrices(): Promise<Map<string, number>> {
+    const positions = await this.getPositions();
+    const prices = new Map<string, number>();
+    for (const pos of positions) {
+      if (pos.currentPrice > 0) {
+        prices.set(pos.instrument.ticker, pos.currentPrice);
+      }
+    }
+    return prices;
+  }
+
+  // ---- Connection Test ----
+
+  /** Test the API connection by fetching account summary */
+  async testConnection(): Promise<{ ok: boolean; accountId?: number; currency?: string; error?: string }> {
+    try {
+      const summary = await this.getAccountSummary();
+      return {
+        ok: true,
+        accountId: summary.id,
+        currency: summary.currency,
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: error instanceof Trading212Error ? error.message : 'Unknown error',
+      };
+    }
+  }
+}
+
+// ---- Error Class ----
+
+export class Trading212Error extends Error {
+  constructor(
+    message: string,
+    public readonly statusCode: number,
+    public readonly rateLimitReset?: number
+  ) {
+    super(message);
+    this.name = 'Trading212Error';
+  }
+}
+
+// ---- Position Mapper ----
+
+/**
+ * Maps a Trading 212 position to HybridTurtle's internal format.
+ * @param accountType — which T212 account this position came from (invest or isa).
+ *                      Defaults to 'invest' for backward compatibility.
+ */
+export function mapT212Position(t212Pos: T212Position, accountType?: T212AccountType) {
+  const ticker = t212Pos.instrument.ticker
+    // Trading 212 uses format like "AAPL_US_EQ" — extract the base ticker
+    .replace(/_US_EQ$/, '')
+    .replace(/_UK_EQ$/, '')
+    .replace(/_EQ$/, '')
+    .replace(/_ETF$/, '');
+
+  return {
+    ticker,
+    fullTicker: t212Pos.instrument.ticker,
+    name: t212Pos.instrument.name,
+    isin: t212Pos.instrument.isin,
+    currency: t212Pos.instrument.currencyCode,
+    shares: t212Pos.quantity,
+    entryPrice: t212Pos.averagePricePaid,
+    currentPrice: t212Pos.currentPrice,
+    entryDate: t212Pos.createdAt,
+    investedValue: t212Pos.walletImpact?.investedValue || 0,
+    currentValue: t212Pos.walletImpact?.value || 0,
+    profitLoss: t212Pos.walletImpact?.result || 0,
+    profitLossPercent: (t212Pos.walletImpact?.resultCoef || 0) * 100,
+    valueInAccountCurrency: t212Pos.walletImpact?.valueInAccountCurrency || 0,
+    source: 'trading212' as const,
+    accountType: accountType ?? 'invest',
+  };
+}
+
+/** Maps a Trading 212 account summary to HybridTurtle metrics */
+export function mapT212AccountSummary(summary: T212AccountSummary) {
+  return {
+    accountId: summary.id,
+    currency: summary.currency,
+    cash: summary.cash.availableToTrade,
+    cashInPies: summary.cash.inPies,
+    cashReservedForOrders: summary.cash.reservedForOrders,
+    totalCash: summary.cash.availableToTrade + summary.cash.inPies + summary.cash.reservedForOrders,
+    investmentsValue: summary.investments.currentValue,
+    investmentsCost: summary.investments.totalCost,
+    realizedPL: summary.investments.realizedProfitLoss,
+    unrealizedPL: summary.investments.unrealizedProfitLoss,
+    totalValue: summary.totalValue,
+  };
+}

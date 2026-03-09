@@ -1,0 +1,136 @@
+{
+  "portfolio": {
+    "accountId": "demo-invest-001",
+    "accountType": "DEMO",
+    "currency": "USD",
+    "cashBalance": 24500,
+    "equity": 60310,
+    "buyingPower": 24500,
+    "totalMarketValue": 35810,
+    "dailyPnl": 420
+  },
+  "positions": [
+    {
+      "brokerPositionId": "demo-pos-aapl",
+      "accountId": "demo-invest-001",
+      "accountType": "DEMO",
+      "symbol": "AAPL",
+      "quantity": 40,
+      "averagePrice": 182.45,
+      "marketPrice": 189.12,
+      "marketValue": 7564.8,
+      "unrealizedPnl": 266.8,
+      "currency": "USD",
+      "updatedAt": "2026-03-08T22:00:00.000Z"
+    },
+    {
+      "brokerPositionId": "demo-pos-msft",
+      "accountId": "demo-invest-001",
+      "accountType": "DEMO",
+      "symbol": "MSFT",
+      "quantity": 25,
+      "averagePrice": 407.2,
+      "marketPrice": 414.18,
+      "marketValue": 10354.5,
+      "unrealizedPnl": 174.5,
+      "currency": "USD",
+      "updatedAt": "2026-03-08T22:00:00.000Z"
+    },
+    {
+      "brokerPositionId": "demo-pos-spy",
+      "accountId": "demo-invest-001",
+      "accountType": "DEMO",
+      "symbol": "SPY",
+      "quantity": 30,
+      "averagePrice": 506.9,
+      "marketPrice": 512.73,
+      "marketValue": 15381.9,
+      "unrealizedPnl": 174.9,
+      "currency": "USD",
+      "updatedAt": "2026-03-08T22:00:00.000Z"
+    }
+  ],
+  "orders": [
+    {
+      "brokerOrderId": "demo-order-aapl-fill",
+      "accountId": "demo-invest-001",
+      "accountType": "DEMO",
+      "symbol": "AAPL",
+      "side": "BUY",
+      "orderType": "LIMIT",
+      "status": "FILLED",
+      "quantity": 10,
+      "filledQuantity": 10,
+      "limitPrice": 181.5,
+      "averageFillPrice": 181.4,
+      "submittedAt": "2026-03-07T14:31:00.000Z",
+      "updatedAt": "2026-03-07T14:32:00.000Z"
+    },
+    {
+      "brokerOrderId": "demo-order-msft-open",
+      "accountId": "demo-invest-001",
+      "accountType": "DEMO",
+      "symbol": "MSFT",
+      "side": "BUY",
+      "orderType": "LIMIT",
+      "status": "PENDING",
+      "quantity": 5,
+      "filledQuantity": 0,
+      "limitPrice": 410,
+      "submittedAt": "2026-03-08T20:15:00.000Z",
+      "updatedAt": "2026-03-08T20:15:00.000Z"
+    },
+    {
+      "brokerOrderId": "demo-order-nvda-fill",
+      "accountId": "demo-invest-001",
+      "accountType": "DEMO",
+      "symbol": "NVDA",
+      "side": "BUY",
+      "orderType": "MARKET",
+      "status": "FILLED",
+      "quantity": 3,
+      "filledQuantity": 3,
+      "averageFillPrice": 905.15,
+      "submittedAt": "2026-03-07T15:02:00.000Z",
+      "updatedAt": "2026-03-07T15:02:20.000Z"
+    }
+  ],
+  "instrumentMeta": [
+    {
+      "symbol": "AAPL",
+      "brokerInstrumentId": "instr-aapl",
+      "name": "Apple Inc.",
+      "exchange": "NASDAQ",
+      "currency": "USD",
+      "assetType": "STOCK",
+      "tradable": true
+    },
+    {
+      "symbol": "MSFT",
+      "brokerInstrumentId": "instr-msft",
+      "name": "Microsoft Corporation",
+      "exchange": "NASDAQ",
+      "currency": "USD",
+      "assetType": "STOCK",
+      "tradable": true
+    },
+    {
+      "symbol": "SPY",
+      "brokerInstrumentId": "instr-spy",
+      "name": "SPDR S&P 500 ETF Trust",
+      "exchange": "NYSEARCA",
+      "currency": "USD",
+      "assetType": "ETF",
+      "tradable": true
+    },
+    {
+      "symbol": "NVDA",
+      "brokerInstrumentId": "instr-nvda",
+      "name": "NVIDIA Corporation",
+      "exchange": "NASDAQ",
+      "currency": "USD",
+      "assetType": "STOCK",
+      "tradable": true
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+﻿'use client';
+
+/**
+ * DEPENDENCIES
+ * Consumed by: navigation
+ * Consumes: src/components/settings/*, src/components/shared/Navbar.tsx
+ * Risk-sensitive: YES — hosts live broker credentials and Phase 10 safety controls
+ * Last modified: 2026-03-09
+ * Notes: Main settings page including notifications and safety toggle panels.
+ */
+
+import Navbar from '@/components/shared/Navbar';
+import AccountPanel from '@/components/settings/AccountPanel';
+import BrokerPanel from '@/components/settings/BrokerPanel';
+import NotificationsPanel from '@/components/settings/NotificationsPanel';
+import SafetyControlsPanel from '@/components/settings/SafetyControlsPanel';
+import DataPanel from '@/components/settings/DataPanel';
+import SystemPanel from '@/components/settings/SystemPanel';
+import PredictionPanel from '@/components/settings/PredictionPanel';
+import { Settings as SettingsIcon, Link } from 'lucide-react';
+
+export default function SettingsPage() {
+  return (
+    <div className="min-h-screen bg-background">
+      <Navbar />
+      <main className="max-w-4xl mx-auto px-4 sm:px-6 py-6 space-y-6 animate-fade-in">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-foreground flex items-center gap-3">
+              <SettingsIcon className="w-6 h-6 text-primary-400" />
+              Settings
+            </h1>
+            <p className="text-sm text-muted-foreground mt-1">
+              Configure your HybridTurtle trading system
+            </p>
+          </div>
+          <a
+            href="/user-guide.md"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="px-3 py-2 rounded-lg border border-white/10 text-sm text-muted-foreground hover:text-foreground hover:bg-surface-2 transition-colors flex items-center gap-2"
+          >
+            <Link className="w-4 h-4" />
+            Open User Guide
+          </a>
+        </div>
+        <AccountPanel />
+        <BrokerPanel />
+        <NotificationsPanel />
+        <SafetyControlsPanel />
+        <DataPanel />
+        <SystemPanel />
+        <PredictionPanel />
+      </main>
+    </div>
+  );
+}

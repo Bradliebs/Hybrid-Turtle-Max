@@ -1,0 +1,63 @@
+# DEPENDENCIES
+# Consumed by: docs/DEPLOYMENT.md
+# Consumes: Dockerfile, .env, services/model-service/Dockerfile
+# Risk-sensitive: NO
+# Last modified: 2026-03-09
+# Notes: Stable local runtime uses the existing SQLite-backed app container.
+#        The Postgres service is provided as a scaffold for future provider migration work.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      NEXTAUTH_URL: http://localhost:3000
+      DATABASE_URL: ${DATABASE_URL:-file:./dev.db}
+      MODEL_SERVICE_URL: ${MODEL_SERVICE_URL:-http://model-service:8000}
+      BROKER_ADAPTER: ${BROKER_ADAPTER:-mock}
+    ports:
+      - '3000:3000'
+    volumes:
+      - ./prisma:/app/prisma
+      - ./reports:/app/reports
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD', 'node', '-e', "fetch('http://127.0.0.1:3000/api/heartbeat').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  model-service:
+    build:
+      context: ./services/model-service
+      dockerfile: Dockerfile
+    profiles: ['model']
+    ports:
+      - '8000:8000'
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: ['postgres']
+    environment:
+      POSTGRES_DB: hybridturtle
+      POSTGRES_USER: trader
+      POSTGRES_PASSWORD: trader
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U trader -d hybridturtle']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres-data:

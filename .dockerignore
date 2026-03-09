@@ -1,0 +1,11 @@
+node_modules
+.next
+npm-debug.log
+vitest-report
+coverage
+reports
+prisma/backups
+prisma/*.backup-*
+prisma/dev.db.backup-*
+*.local
+*.log
