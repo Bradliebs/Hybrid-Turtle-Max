@@ -9,7 +9,7 @@
  * Notes: Phase 11 backtesting and replay page with date-range runner, replay-date inspection, stored run fetch, equity curve, drawdown, and trade log views.
  */
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import {
   Area,
   AreaChart,
@@ -220,10 +220,6 @@ export default function BacktestPage() {
       setLoading(false);
     }
   }, [endDate, initialCapital, loadRun, mode, replayDate, regime, riskPerTradePct, sleeve, startDate, useReplayDate]);
-
-  useEffect(() => {
-    void runBacktest();
-  }, [runBacktest]);
 
   const filteredTrades = useMemo(() => {
     if (!run) {
