@@ -6,6 +6,13 @@
 :: the HybridTurtle dashboard on a fresh Windows machine.
 :: ============================================================
 
+:: Keep window open even if the script crashes unexpectedly
+if not defined _INSTALL_RUNNING (
+    set "_INSTALL_RUNNING=1"
+    cmd /k "%~f0" %*
+    exit /b
+)
+
 title HybridTurtle Installer v6.0
 color 0A
 setlocal EnableExtensions EnableDelayedExpansion
