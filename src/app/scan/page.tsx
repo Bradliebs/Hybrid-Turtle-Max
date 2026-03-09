@@ -17,7 +17,7 @@ const CrossRefTab = lazy(() => import('@/components/scan/CrossRefTab'));
 import StatusBadge from '@/components/shared/StatusBadge';
 import RegimeBadge from '@/components/shared/RegimeBadge';
 import { cn, formatPrice } from '@/lib/utils';
-import { apiRequest } from '@/lib/api-client';
+import { apiRequest, ApiClientError } from '@/lib/api-client';
 import { useStore } from '@/store/useStore';
 import { Search, Play, Filter, Check, X, AlertTriangle, BarChart3, GitMerge, RefreshCw, XCircle } from 'lucide-react';
 
@@ -121,6 +121,8 @@ function ScanPageInner() {
   const [isLoadingLive, setIsLoadingLive] = useState(false);
   const { marketRegime, riskProfile, equity } = useStore();
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [isStaleError, setIsStaleError] = useState(false);
+  const [isFixingStale, setIsFixingStale] = useState(false);
 
   const stages = [
     { num: 1, label: 'Universe' },
@@ -293,7 +295,11 @@ function ScanPageInner() {
       try { sessionStorage.setItem('scanResult', JSON.stringify(data)); } catch {}
       setFetchError(null);
     } catch (err) {
-      setFetchError(err instanceof Error ? err.message : 'Scan failed. Check your connection and try again.');
+      const isStale = err instanceof ApiClientError && err.code === 'SCANS_DISABLED_STALE_DATA';
+      setIsStaleError(isStale);
+      setFetchError(isStale
+        ? 'Market data needs to be downloaded before your first scan.'
+        : err instanceof Error ? err.message : 'Scan failed. Check your connection and try again.');
     } finally {
       clearInterval(pollInterval);
       setScanProgress(null);
@@ -380,7 +386,42 @@ function ScanPageInner() {
 
         {/* Tab Bar */}
         {/* Fetch Error Banner */}
-        {fetchError && (
+        {fetchError && isStaleError && (
+          <div className="rounded-xl border border-warning/40 bg-warning/10 p-5 space-y-3">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="w-5 h-5 text-warning shrink-0 mt-0.5" />
+              <div className="space-y-1 flex-1">
+                <p className="font-semibold text-warning">First-time setup: Market data needed</p>
+                <p className="text-sm text-foreground/80">
+                  Before the scan engine can run, it needs to download price data from Yahoo Finance.
+                  This is a one-time step that takes 1–2 minutes. After this, the nightly task keeps data fresh automatically.
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={async () => {
+                setIsFixingStale(true);
+                try {
+                  await apiRequest('/api/market-data/refresh-stale', { method: 'POST' });
+                  setFetchError(null);
+                  setIsStaleError(false);
+                  runScan();
+                } catch (fixErr) {
+                  setFetchError(fixErr instanceof Error ? fixErr.message : 'Refresh failed. Try again or check your internet connection.');
+                  setIsStaleError(false);
+                } finally {
+                  setIsFixingStale(false);
+                }
+              }}
+              disabled={isFixingStale}
+              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-warning text-navy-950 font-semibold disabled:opacity-60 hover:bg-warning/90 transition-colors"
+            >
+              <RefreshCw className={cn('w-4 h-4', isFixingStale && 'animate-spin')} />
+              {isFixingStale ? 'Downloading data...' : 'Download Market Data'}
+            </button>
+          </div>
+        )}
+        {fetchError && !isStaleError && (
           <div className="flex items-center gap-3 p-4 rounded-lg bg-red-500/10 border border-red-500/30">
             <XCircle className="w-5 h-5 text-red-400 flex-shrink-0" />
             <p className="text-sm text-red-300 flex-1">{fetchError}</p>
