@@ -109,27 +109,28 @@ if %errorlevel% neq 0 (
 
 :: ── Step 3: Create .env if missing ──
 echo  [3/7] Setting up environment...
-if not exist ".env" (
-    :: Generate a cryptographically random secret (32 bytes, base64)
-    for /f "tokens=*" %%i in ('powershell -NoProfile -Command "$b = New-Object byte[] 32; [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); [Convert]::ToBase64String($b)"') do set NEXTAUTH_SECRET=%%i
-    for /f "tokens=*" %%i in ('powershell -NoProfile -Command "$b = New-Object byte[] 32; [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); [Convert]::ToBase64String($b)"') do set CRON_SECRET=%%i
-    > ".env" echo DATABASE_URL=file:./dev.db
-    >> ".env" echo NEXTAUTH_URL=http://localhost:3000
-    >> ".env" echo NEXTAUTH_SECRET=!NEXTAUTH_SECRET!
-    >> ".env" echo CRON_SECRET=!CRON_SECRET!
-    >> ".env" echo.
-    >> ".env" echo # Broker adapter: disabled (safe default), mock (demo data), trading212 (live)
-    >> ".env" echo BROKER_ADAPTER=disabled
-    >> ".env" echo.
-    >> ".env" echo # Telegram nightly reports - fill these in during Step 7 or later
-    >> ".env" echo # TELEGRAM_BOT_TOKEN=your-bot-token-here
-    >> ".env" echo # TELEGRAM_CHAT_ID=your-chat-id-here
-    echo         Created .env with SQLite database
-    >> "%LOG%" echo [%date% %time%] Created .env
-) else (
+if exist ".env" (
     echo         .env already exists - keeping existing config
     >> "%LOG%" echo [%date% %time%] .env already exists - skipped
+    goto :env_done
 )
+:: Generate a cryptographically random secret (32 bytes, base64)
+for /f "tokens=*" %%i in ('powershell -NoProfile -Command "$b = New-Object byte[] 32; [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); [Convert]::ToBase64String($b)"') do set NEXTAUTH_SECRET=%%i
+for /f "tokens=*" %%i in ('powershell -NoProfile -Command "$b = New-Object byte[] 32; [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); [Convert]::ToBase64String($b)"') do set CRON_SECRET=%%i
+> ".env" echo DATABASE_URL=file:./dev.db
+>> ".env" echo NEXTAUTH_URL=http://localhost:3000
+>> ".env" echo NEXTAUTH_SECRET=!NEXTAUTH_SECRET!
+>> ".env" echo CRON_SECRET=!CRON_SECRET!
+>> ".env" echo.
+>> ".env" echo # Broker adapter: disabled, mock, or trading212
+>> ".env" echo BROKER_ADAPTER=disabled
+>> ".env" echo.
+>> ".env" echo # Telegram nightly reports - fill these in during Step 7 or later
+>> ".env" echo # TELEGRAM_BOT_TOKEN=your-bot-token-here
+>> ".env" echo # TELEGRAM_CHAT_ID=your-chat-id-here
+echo         Created .env with SQLite database
+>> "%LOG%" echo [%date% %time%] Created .env
+:env_done
 
 :: ── Step 4: Install dependencies ──
 echo  [4/7] Installing dependencies (this may take 2-5 minutes)...
