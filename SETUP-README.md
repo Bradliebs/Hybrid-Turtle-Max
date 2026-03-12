@@ -113,6 +113,9 @@ The `start.bat` script handles this automatically. If it persists:
 ### Need to reset the database
 Delete the file `prisma/dev.db` and run `install.bat` again.
 
+### Trading 212 connection fails immediately / auth error
+Trading 212 uses Basic Auth with base64 encoding, not a bearer token. Verify your API key and secret are correct and that you are using the right environment (Demo vs Live).
+
 ---
 
 ## For Developers

@@ -92,15 +92,15 @@ export default function CandidateTable({ candidates, showSizing = false }: Candi
       <table className={cn('data-table', hasModelOverlay ? 'min-w-[1400px]' : showSizing ? 'min-w-[1200px]' : 'min-w-[900px]')}>
         <thead>
           <tr>
-            <th className="whitespace-nowrap">#</th>
+            <th className="whitespace-nowrap w-10">#</th>
             <th className="whitespace-nowrap">Ticker</th>
-            <th className="whitespace-nowrap">Sleeve</th>
-            <th className="whitespace-nowrap">Status</th>
-            <th className="text-right whitespace-nowrap">Price</th>
-            <th className="text-right whitespace-nowrap">Entry Trigger</th>
-            <th className="text-right whitespace-nowrap">Stop Price</th>
-            <th className="text-right whitespace-nowrap">Distance%</th>
-            <th className="text-right whitespace-nowrap">Base</th>
+            <th className="whitespace-nowrap w-20">Sleeve</th>
+            <th className="whitespace-nowrap w-24">Status</th>
+            <th className="text-right whitespace-nowrap w-28">Price</th>
+            <th className="text-right whitespace-nowrap w-28">Entry Trigger</th>
+            <th className="text-right whitespace-nowrap w-28">Stop Price</th>
+            <th className="text-right whitespace-nowrap w-20">Distance%</th>
+            <th className="text-right whitespace-nowrap w-16">Base</th>
             {hasModelOverlay && <th className="text-right whitespace-nowrap">Model</th>}
             {hasModelOverlay && <th className="text-right whitespace-nowrap">Blended</th>}
             {hasModelOverlay && <th className="text-right whitespace-nowrap">Conf</th>}
@@ -108,9 +108,9 @@ export default function CandidateTable({ candidates, showSizing = false }: Candi
             <th className="text-center whitespace-nowrap w-8"></th>
             {showSizing && (
               <>
-                <th className="text-right whitespace-nowrap">Shares</th>
-                <th className="text-right whitespace-nowrap">Total Cost</th>
-                <th className="text-right whitespace-nowrap">Risk $</th>
+                <th className="text-right whitespace-nowrap w-20">Shares</th>
+                <th className="text-right whitespace-nowrap w-28">Total Cost</th>
+                <th className="text-right whitespace-nowrap w-24">Risk $</th>
               </>
             )}
           </tr>
@@ -172,6 +172,15 @@ export default function CandidateTable({ candidates, showSizing = false }: Candi
                         className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30"
                       >
                         MODE B
+                      </span>
+                    )}
+                    {/* Breakout badge: shown when price is at/above 20-day high (advisory context) */}
+                    {c.distancePercent <= 0 && !isTriggered && (
+                      <span
+                        title="Price at or above 20-day high — breakout in progress"
+                        className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30"
+                      >
+                        BO
                       </span>
                     )}
                   </div>

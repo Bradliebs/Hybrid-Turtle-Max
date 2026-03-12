@@ -135,7 +135,7 @@ Yahoo Finance is free and requires no API key. EODHD is optional and offered as 
 |-------|---------|
 | Alpha Vantage API Key | Optional backup data source. Get a free key at [alphavantage.co](https://www.alphavantage.co/support/#api-key) |
 
-### 2.4 Telegram Notifications
+### 2.5 Telegram Notifications
 
 | Field | Purpose |
 |-------|---------|
@@ -145,11 +145,11 @@ Yahoo Finance is free and requires no API key. EODHD is optional and offered as 
 
 The nightly cron sends summaries via Telegram including: health status, regime, open positions, stop updates, and alerts.
 
-### 2.5 Ticker Universe Management
+### 2.6 Ticker Universe Management
 
 This is where you manage which stocks the system scans and monitors. See Section 3 for full details.
 
-### 2.6 Immutable Rules
+### 2.7 Immutable Rules
 
 Read-only list of 10 rules the system enforces. These cannot be changed:
 
@@ -445,7 +445,7 @@ URL: `/risk`
 
 ### Top Banner — Immutable Rules
 
-8 core safety rules displayed in a red panel. These are not configurable — they are hardcoded system constraints.
+10 core safety rules displayed in a red panel. These are not configurable — they are hardcoded system constraints.
 
 ### Left Column
 
@@ -618,7 +618,9 @@ These are shown as guidance badges on the dashboard card. You decide whether to 
 
 The nightly cron executes at **9:30 PM UK time**, Monday–Friday.
 
-### The 10-Step Nightly Process (+ Sub-Steps)
+### The 10-Step Nightly Process (Steps 0–9)
+
+> **Note:** SYSTEM-BREAKDOWN.md refers to this as a "9-step" process, counting steps 1–9 only. Step 0 (pre-cache) is a preparatory step that runs before the main pipeline.
 
 | Step | What Happens |
 |------|-------------|
@@ -714,6 +716,8 @@ Or call the API directly: `POST /api/nightly` with `{"userId": "default-user"}`.
    - Click **Update Stop** → use the recommended level
 4. Review the Plan page stop-update queue
 5. Risk page → check budget utilisation
+
+> **Mid-week entries:** Opportunistic entries are permitted Wed–Fri under stricter conditions: Auto-Yes only (NCS ≥ 70 AND FWS ≤ 30), BULLISH regime confirmed, maximum one new position per day. Monday remains a hard block with no exceptions.
 
 ### Every Night (Automated)
 
@@ -838,16 +842,18 @@ These are hardcoded into the system and cannot be overridden:
 | 5 | **Total open risk ≤ profile cap** — risk gate rejects if exceeded |
 | 6 | **Position sizing rounds DOWN** — fractional to 0.01 (T212), zero-size = skip |
 | 7 | **No buying on Monday** — Observation phase, anti-chasing guard active |
-| 8 | **Anti-chasing: gap > 0.75 ATR or > 3% blocks entry** — Monday guard |
+| 8 | **Anti-chasing: gap > 0.75 ATR or > 3% blocks entry** — applies every day; Monday uses tighter thresholds |
 | 9 | **Super-cluster cap at 50%** — concentration limit per super-cluster |
 | 10 | **Heartbeat must be fresh** — data > 2 days = warn, > 5 days = fail |
 
 ---
 
-## 18. Module System — 21 Risk & Analysis Checks + 14-Phase Prediction Engine
+## 18. Module System — 16 Active Risk & Analysis Modules + Prediction Engine
 
 All modules run via `GET /api/modules?userId=X` and report to the Dashboard's Module Status Panel.
-The 14-phase prediction engine runs as a separate post-processing layer — see section 19 below.
+The prediction engine runs as a separate post-processing layer — see section 19 below.
+
+> **Note:** Module numbering has intentional gaps — modules 1, 4, and 6 are retired/removed. The 16 active modules are listed below.
 
 | # | Module | Status Meaning |
 |---|--------|---------------|
@@ -874,7 +880,7 @@ The 14-phase prediction engine runs as a separate post-processing layer — see 
 
 ---
 
-## 19. Prediction Engine — 14 Post-Processing Phases
+## 19. Prediction Engine — 17 Post-Processing Phases + Phase 6 ML
 
 The prediction engine adds confidence intervals, failure detection, and advanced scoring on top of the core scan/NCS pipeline. All phases are **post-processing only** — they never modify sacred files.
 
@@ -894,6 +900,9 @@ The prediction engine adds confidence intervals, failure detection, and advanced
 | 12 | VPIN Order Flow | Directional order flow imbalance indicator |
 | 13 | Sentiment | News + analyst revision + short interest composite |
 | 14 | Causal Invariance | `/causal-audit` page — identifies regime-stable vs spurious signals |
+| 15 | TDA Regime | Topological Data Analysis regime stability badge — divergence warning vs primary detector |
+| 16 | Execution Quality | Slippage analysis, timing recommendations, worst fills — `/execution-quality` page |
+| P6 | Phase 6 Ridge Regression | ML model predicting R-multiple from 16 signal features — advisory ranking on `/prediction-status` |
 
 **New pages:**
 - `/signal-audit` — Run mutual information analysis on signal layers

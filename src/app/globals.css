@@ -97,6 +97,7 @@
 
   .data-table {
     @apply w-full text-sm;
+    font-variant-numeric: tabular-nums;
   }
 
   .data-table th {

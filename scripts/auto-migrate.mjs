@@ -43,20 +43,19 @@ function logError(msg) {
 
 // ── Prisma CLI wrappers ──────────────────────────────────────
 
-/** Run prisma migrate deploy and return { success, output, timedOut } */
+/** Run prisma migrate deploy and return { success, output } */
 function runMigrateDeploy() {
   try {
     const output = execSync('npx prisma migrate deploy', {
       cwd: ROOT,
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 180_000,
+      timeout: 60_000,
     });
-    return { success: true, output, timedOut: false };
+    return { success: true, output };
   } catch (err) {
-    const timedOut = err.killed === true || err.signal === 'SIGTERM';
     const output = (err.stdout || '') + '\n' + (err.stderr || '');
-    return { success: false, output, timedOut };
+    return { success: false, output };
   }
 }
 
@@ -112,10 +111,6 @@ function isDatabaseLocked(output) {
   return output.includes('database is locked');
 }
 
-function isTimeout(result) {
-  return result.timedOut === true;
-}
-
 /** Extract migration name from Prisma error output */
 function extractMigrationName(output) {
   // "Migration name: 0_baseline"
@@ -151,20 +146,6 @@ function runSchemaVerify() {
 
 // ── Main ────────────────────────────────────────────────────
 
-/** Warm up Prisma engine so the first migrate deploy isn't slow */
-function warmUpPrisma() {
-  try {
-    execSync('npx prisma generate --no-hints', {
-      cwd: ROOT,
-      encoding: 'utf-8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 120_000,
-    });
-  } catch {
-    // Non-fatal — generate may already be up to date
-  }
-}
-
 async function main() {
   log('Checking database migrations...');
 
@@ -179,9 +160,6 @@ async function main() {
     log('No migrations found — nothing to do.');
     process.exit(0);
   }
-
-  // Warm up Prisma engine before first migrate attempt (avoids cold-start timeouts)
-  warmUpPrisma();
 
   // Attempt 1: try normal deploy
   let result = runMigrateDeploy();
@@ -256,13 +234,7 @@ async function main() {
       log(`Database is locked by another process — waiting ${delaySec}s before retry...`);
       await new Promise(resolve => setTimeout(resolve, delaySec * 1000));
     }
-    // Case 4: Timeout — cold Windows start can be slow (Defender scanning, etc.)
-    else if (isTimeout(result)) {
-      const delaySec = attempt * 5;
-      log(`Command timed out (cold start?) — waiting ${delaySec}s before retry...`);
-      await new Promise(resolve => setTimeout(resolve, delaySec * 1000));
-    }
-    // Case 5: Unknown error — can't auto-resolve
+    // Case 4: Unknown error — can't auto-resolve
     else {
       logError('Unrecoverable migration error:');
       console.error(output.trim());

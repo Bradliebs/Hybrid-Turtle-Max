@@ -122,6 +122,7 @@ model Position {
   profile_used              String?
   accountType               String?       @default("invest")
   breakoutFailureDetectedAt DateTime?
+  nearStopAlertSentAt       DateTime?   // prevents duplicate near-stop alerts — reset when stop moves
   entryTrigger              Float?
   stock                     Stock          @relation(fields: [stockId], references: [id])
   user                      User           @relation(fields: [userId], references: [id])
@@ -370,6 +371,23 @@ model SnapshotTicker {
   rawJson                 String?
   createdAt               DateTime @default(now())
   atrCompressionRatio     Float?
+
+  // ── Breakout evidence capture (Layer 2, advisory only) ──
+  isBreakout20            Boolean?  // true if close >= 20-day high at snapshot time
+  breakoutDistancePct     Float?    // % distance from close to 20-day high (negative = above)
+  breakoutWindowDays      Int?      // consecutive days within 2% of 20-day high
+  entropy63               Float?    // Shannon entropy of 63-day log returns (bits)
+  netIsolation            Float?    // network isolation score (0 = correlated, 1 = isolated)
+  entropyObsCount         Int?      // number of observations used for entropy calc
+  netIsolationPeerCount   Int?      // number of peers in the isolation correlation window
+  netIsolationObsCount    Int?      // number of observations used for isolation calc
+  novelSignalVersion      Int?      // schema version for forward compatibility
+
+  // ── Novel signals — passive capture for Phase 6 prediction engine ──
+  smartMoney21            Float?    // CLV × volume, 21-day sum (institutional accumulation/distribution)
+  fractalDim              Float?    // Higuchi fractal dimension, 100-day window (<1.4 trending, ~1.5 random, >1.6 reverting)
+  complexity              Float?    // zlib compression ratio of discretised returns (low = patterned, high = random)
+
   snapshot                Snapshot @relation(fields: [snapshotId], references: [id], onDelete: Cascade)
 
   @@index([snapshotId])

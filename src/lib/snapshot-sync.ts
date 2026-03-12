@@ -1,10 +1,11 @@
 /**
  * DEPENDENCIES
  * Consumed by: nightly.ts, /api/nightly/route.ts, /api/snapshot/route.ts (if present)
- * Consumes: market-data.ts, modules/adaptive-atr-buffer.ts, breakout-integrity.ts, modules/data-validator.ts, prisma.ts, @/types
+ * Consumes: market-data.ts, modules/adaptive-atr-buffer.ts, breakout-integrity.ts, modules/data-validator.ts, signals/breakout-signals.ts, signals/entropy-signal.ts, signals/network-isolation.ts, signals/novel-signals.ts, prisma.ts, @/types
  * Risk-sensitive: YES
- * Last modified: 2026-02-26
+ * Last modified: 2026-03-11
  * Notes: Snapshot sync should reject stale/invalid data.
+ *        Breakout evidence, entropy, and network isolation are Layer 2 advisory captures.
  */
 // ============================================================
 // Snapshot Sync — Builds SnapshotTicker rows from live data
@@ -30,6 +31,10 @@ import { validateTickerData } from './modules/data-validator';
 import { calculateAdaptiveBuffer } from './modules/adaptive-atr-buffer';
 import { calcBIS } from './breakout-integrity';
 import { getEarningsInfo } from './earnings-calendar';
+import { computeBreakoutSignal } from './signals/breakout-signals';
+import { computeEntropy } from './signals/entropy-signal';
+import { computeNetworkIsolation } from './signals/network-isolation';
+import { computeAllNovelSignals } from './signals/novel-signals';
 import type { Sleeve } from '@/types';
 import { ATR_STOP_MULTIPLIER, SNAPSHOT_CLUSTER_WARNING, SNAPSHOT_SUPER_CLUSTER_WARNING } from '@/types';
 
@@ -222,6 +227,8 @@ export async function syncSnapshot(
   const failed: string[] = [];
   let done = 0;
   const batchData: Record<string, unknown>[] = [];
+  // Cache daily bars (close only) for post-batch network isolation computation
+  const dailyBarsCache = new Map<string, { date: string; close: number }[]>();
 
   for (let i = 0; i < stocks.length; i += BATCH_SIZE) {
     const batch = stocks.slice(i, i + BATCH_SIZE);
@@ -354,6 +361,16 @@ export async function syncSnapshot(
             // Non-critical — defaults to null (no penalty)
           }
 
+          // ── Breakout evidence capture (Layer 2 advisory — never affects scan decisions) ──
+          const breakoutSignal = computeBreakoutSignal(daily);
+          const entropySignal = computeEntropy(daily);
+
+          // ── Novel signals — passive capture for Phase 6 prediction engine ──
+          const novelSignals = computeAllNovelSignals(daily);
+
+          // Cache daily bars for post-batch network isolation computation
+          dailyBarsCache.set(stock.ticker, daily.slice(0, 127).map((d) => ({ date: d.date, close: d.close })));
+
           return {
             snapshotId: snapshot.id,
             ticker: stock.ticker,
@@ -398,6 +415,17 @@ export async function syncSnapshot(
             maxSuperClusterPct: maxSuperClusterPct * 100,
             bisScore,
             rawJson,
+            // ── Breakout evidence (Layer 2 advisory, nullable) ──
+            isBreakout20: breakoutSignal?.isBreakout20 ?? null,
+            breakoutDistancePct: breakoutSignal?.breakoutDistancePct ?? null,
+            breakoutWindowDays: breakoutSignal?.breakoutWindowDays ?? null,
+            entropy63: entropySignal?.entropy63 ?? null,
+            entropyObsCount: entropySignal?.obsCount ?? null,
+            // ── Novel signals — passive Phase 6 capture ──
+            smartMoney21: novelSignals.smartMoney21,
+            fractalDim: novelSignals.fractalDim,
+            complexity: novelSignals.complexity,
+            novelSignalVersion: 2,
           };
         } catch (err) {
           console.warn(`[Sync] Failed ${stock.ticker}:`, (err as Error).message);
@@ -430,6 +458,48 @@ export async function syncSnapshot(
       await new Promise((r) => setTimeout(r, BATCH_DELAY_MS));
     }
   }
+
+  // 6b. Post-batch: compute network isolation scores using cached daily bars.
+  //     Each ticker is correlated against same-cluster peers. Layer 2 advisory only.
+  try {
+    // Group tickers by cluster for peer-based isolation scoring
+    const clusterTickers = new Map<string, string[]>();
+    for (const row of batchData) {
+      const r = row as { ticker: string; clusterName?: string };
+      const cl = r.clusterName || 'General';
+      const list = clusterTickers.get(cl) || [];
+      list.push(r.ticker);
+      clusterTickers.set(cl, list);
+    }
+
+    for (const row of batchData) {
+      const r = row as { ticker: string; clusterName?: string; netIsolation?: number | null; netIsolationPeerCount?: number | null; netIsolationObsCount?: number | null };
+      const cl = r.clusterName || 'General';
+      const peers = clusterTickers.get(cl) || [];
+      const targetBars = dailyBarsCache.get(r.ticker);
+      if (!targetBars || peers.length < 4) continue; // need ≥3 peers (excl self)
+
+      const peerBarsMap = new Map<string, { date: string; close: number }[]>();
+      for (const peer of peers) {
+        if (peer === r.ticker) continue;
+        const peerBars = dailyBarsCache.get(peer);
+        if (peerBars) peerBarsMap.set(peer, peerBars);
+      }
+
+      const isolation = computeNetworkIsolation(targetBars, peerBarsMap);
+      if (isolation) {
+        r.netIsolation = isolation.netIsolation;
+        r.netIsolationPeerCount = isolation.peerCount;
+        r.netIsolationObsCount = isolation.obsCount;
+      }
+    }
+  } catch (err) {
+    // Network isolation failure is non-critical — continue with null values
+    console.warn('[Sync] Network isolation post-processing failed:', (err as Error).message);
+  }
+
+  // Free memory — daily bars cache no longer needed
+  dailyBarsCache.clear();
 
   // 7. Write collected rows in batches to reduce SQLite write-lock duration.
   //    Each batch holds the lock only for ~50 inserts instead of ~268.

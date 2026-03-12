@@ -16,10 +16,10 @@ A systematic trading dashboard for momentum trend-following across ~268 tickers 
 - **Account:** Small account (SMALL_ACCOUNT risk profile)
 - **Testing:** Vitest + Zod validation
 - **Auth:** NextAuth JWT (optional — single-user local app)
-- **Pages:** 26 content pages + 5 redirects
-- **API Routes:** 44 route groups (~105 endpoints)
+- **Pages:** 28 content pages + 5 redirects
+- **API Routes:** 46 route groups (~109 endpoints)
 - **DB Tables:** 40 (24 core + 16 prediction engine)
-- **Prediction Engine:** 17 phases (conformal, failure modes, signal weighting, stress test, MI audit, immune system, lead-lag, GNN, Bayesian, Kelly, Meta-RL, VPIN, sentiment, TDA, execution quality, TradePulse, causal invariance)
+- **Prediction Engine:** 17 phases + Phase 6 prediction model (conformal, failure modes, signal weighting, stress test, MI audit, immune system, lead-lag, GNN, Bayesian, Kelly, Meta-RL, VPIN, sentiment, TDA, execution quality, TradePulse, causal invariance, Phase 6 Ridge regression)
 
 ---
 
@@ -97,6 +97,14 @@ Recent READY/WATCH candidates ranked by NCS with grade pills, linking to individ
 Full unified confidence dashboard: hero score dial, decision bar, signal contribution grid (12+ signals), concerns (risks first), opportunities, Kelly sizing advisory, RL recommendation badge, stale data indicator.
 **Components:** `Navbar`, `TradePulseDial`, `SignalCard`, `KellySizePanel`, `TradeAdvisorPanel`
 
+### `/breakout-evidence` — Breakout Evidence *(added)*
+Breakout vs non-breakout performance comparison, shadow stats for breakout + low entropy and breakout + high isolation, detail table with novel signal values (entropy, isolation, smart money, fractal dimension, complexity).
+**Components:** `Navbar`, `StatsCard`
+
+### `/prediction-status` — Prediction Engine Status *(added)*
+Phase 6 Ridge regression model dashboard: model status, training metrics (R², MAE, RMSE), feature importance bars, READY candidates ranked by predicted R-multiple, manual training trigger. Advisory only.
+**Components:** `Navbar`
+
 ### `/login` — Sign In
 Email/password authentication via NextAuth.
 
@@ -114,7 +122,7 @@ Account creation with password validation.
 
 ---
 
-## 3. API Routes (44 Route Groups)
+## 3. API Routes (46 Route Groups)
 
 ### Core Routes
 
@@ -198,6 +206,7 @@ Account creation with password validation.
 | `/api/analytics/execution-drag` | GET | Slippage vs planned entries |
 | `/api/analytics/execution-audit` | GET | Execution quality: timing, fills, conditions |
 | `/api/analytics/candidate-outcomes` | GET | Scan candidates matched to trade outcomes |
+| `/api/analytics/breakout-evidence` | GET | Breakout vs non-breakout performance + novel signal stats |
 
 ### Prediction Engine Routes *(added)*
 
@@ -217,6 +226,7 @@ Account creation with password validation.
 | `/api/prediction/trade-recommendation` | GET, POST | Meta-RL policy action; MAML training |
 | `/api/prediction/trade-pulse` | GET | Unified confidence dashboard aggregation |
 | `/api/prediction/invariance` | GET, POST | IRM causal invariance scores |
+| `/api/prediction/phase6` | GET, POST | Phase 6 Ridge model: status + ranked candidates; trigger training |
 
 ### Signal Routes *(added)*
 
@@ -724,7 +734,7 @@ Invariant Risk Minimisation identifies which signals are causally stable across 
 
 **Framework:** Vitest. Co-located `.test.ts` files alongside source.
 
-**36 test files covering:**
+**45 test files covering:**
 
 | Area | Test Files |
 |------|-----------|
@@ -736,7 +746,10 @@ Invariant Risk Minimisation identifies which signals are causally stable across 
 | Data & Research | `candidate-outcome.test.ts`, `candidate-outcome-enrichment.test.ts`, `research-loop.test.ts`, `audit-harness.test.ts`, `ev-modifier.test.ts` |
 | Infrastructure | `fetch-retry.test.ts`, `market-data.trigger-window.test.ts`, `trading212-dual.test.ts`, `laggard-detector.test.ts` |
 | Modules | `adaptive-atr-buffer.test.ts` |
+| Signals | `breakout-signals.test.ts`, `entropy-signal.test.ts`, `network-isolation.test.ts`, `novel-signals.test.ts` |
+| Prediction (Phase 6) | `prediction/phase6/ridge-model.test.ts`, `prediction/phase6/feature-extract.test.ts` |
 | API Routes | `api/risk/route.test.ts`, `api/positions/route.test.ts`, `api/positions/execute/route.test.ts` |
+| Workflow | `packages/workflow/src/execution.test.ts` |
 
 All external data responses validated with Zod schemas.
 

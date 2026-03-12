@@ -132,6 +132,11 @@ You can:
 - review what worked and what failed per trade
 - view performance by regime and monthly trends
 
+## Journal (`/journal`)
+Use this to track per-position notes and lessons.
+
+The journal provides a per-position timeline for entry notes, confidence levels, close notes, and post-trade lessons. Each position can have an entry note (recorded at time of trade) and a close note (recorded when exiting). The journal is also accessible via the **Journal Drawer** in Portfolio → Positions — click the journal icon on any position row.
+
 ## Notifications (`/notifications`)
 Use this to track system alerts.
 
@@ -212,6 +217,8 @@ Shows:
 - check dashboard health daily
 - review stops and update when ladder thresholds are hit
 - monitor risk budget and concentration
+
+> **Mid-week entries:** Opportunistic entries are permitted Wed–Fri under stricter conditions: Auto-Yes only (NCS ≥ 70 AND FWS ≤ 30), BULLISH regime confirmed, maximum one new position per day. Monday remains a hard block with no exceptions.
 
 ---
 
@@ -300,6 +307,11 @@ If PC is off at schedule time, task may run late when machine resumes (depending
 - re-check credentials in Settings
 - confirm API access is active
 - retry sync from positions page
+
+## Trading 212 connection fails immediately / auth error
+- Trading 212 uses Basic Auth with base64 encoding, not a bearer token
+- verify your API key and secret are correct
+- confirm you are using the right environment (Demo vs Live)
 
 ---
 

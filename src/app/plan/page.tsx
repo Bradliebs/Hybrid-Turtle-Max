@@ -169,6 +169,7 @@ export default function PlanPage() {
   const { weeklyPhase, marketRegime } = useStore();
   const [positions, setPositions] = useState<PositionData[]>([]);
   const [scanCandidates, setScanCandidates] = useState<ReadyCandidate[]>([]);
+  const [liveTickers, setLiveTickers] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
   const [healthReport, setHealthReport] = useState<HealthReportData | null>(null);
   const [riskSummary, setRiskSummary] = useState<RiskSummaryData | null>(null);
@@ -367,6 +368,53 @@ export default function PlanPage() {
     fetchAllocationScores();
   }, [scanCandidates.length]);
 
+  // Fetch live prices for READY/WATCH candidates and update distance/price/status
+  useEffect(() => {
+    if (scanCandidates.length === 0) return;
+    const fetchLivePrices = async () => {
+      try {
+        const tickers = scanCandidates.map((c) => c.yahooTicker || c.ticker);
+        if (tickers.length === 0) return;
+        const data = await apiRequest<{
+          prices: Record<string, { price: number; change: number; changePercent: number }>;
+          fetchedAt: string;
+        }>('/api/scan/live-prices', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tickers }),
+        });
+        if (!data.prices) return;
+
+        // Build a map from display ticker → live price
+        const liveMap = new Map<string, number>();
+        scanCandidates.forEach((c) => {
+          const key = c.yahooTicker || c.ticker;
+          if (data.prices[key]?.price) liveMap.set(c.ticker, data.prices[key].price);
+        });
+
+        if (liveMap.size === 0) return;
+
+        // Track which tickers have live price data
+        setLiveTickers(new Set(liveMap.keys()));
+
+        // Update candidates with live prices and recalculated distances
+        setScanCandidates((prev) =>
+          prev.map((c) => {
+            const livePrice = liveMap.get(c.ticker);
+            if (!livePrice || !c.entryTrigger) return c;
+            const liveDistance = ((c.entryTrigger - livePrice) / livePrice) * 100;
+            // Promote WATCH → READY if live price has now triggered
+            const liveStatus = liveDistance <= 0 && c.status === 'WATCH' ? 'READY' : c.status;
+            return { ...c, price: livePrice, distancePercent: liveDistance, status: liveStatus };
+          })
+        );
+      } catch {
+        // Silent fail — scan-time prices still shown
+      }
+    };
+    fetchLivePrices();
+  }, [scanCandidates.length]);
+
   // Use cross-referenced scan candidates from 7-stage engine + dual scores
   const candidates = scanCandidates;
 
@@ -490,7 +538,7 @@ export default function PlanPage() {
 
               {/* Middle Column */}
               <div className="space-y-6">
-                <ReadyCandidates candidates={candidates} heldTickers={new Set(positions.map(p => p.ticker))} />
+                <ReadyCandidates candidates={candidates} heldTickers={new Set(positions.map(p => p.ticker))} liveTickers={liveTickers} />
                 <PositionSizerWidget />
               </div>
 

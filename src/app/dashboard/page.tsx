@@ -79,6 +79,7 @@ export default function DashboardPage() {
   const [publications, setPublications] = useState<PublicationItem[]>([]);
   const [triggerMetCount, setTriggerMetCount] = useState(0);
   const [triggerMetTickers, setTriggerMetTickers] = useState<string[]>([]);
+  const [breakoutCount, setBreakoutCount] = useState(0);
   const [scanCachedAt, setScanCachedAt] = useState<string | null>(null);
   const nightlyRunning = useStore((s) => s.nightlyRunning);
   const nightlyResult = useStore((s) => s.nightlyResult);
@@ -133,13 +134,17 @@ export default function DashboardPage() {
       const data = await apiRequest<ScanApiSummary>('/api/scan');
       const candidates = data.candidates || [];
       const triggered = candidates.filter((candidate) => candidate.passesAllFilters && candidate.distancePercent <= 0);
+      // Breakout count: candidates at or above their 20-day high (advisory context)
+      const breakoutCandidates = candidates.filter((candidate) => candidate.distancePercent <= 0);
 
       setTriggerMetCount(triggered.length);
       setTriggerMetTickers(triggered.map((candidate) => candidate.ticker));
+      setBreakoutCount(breakoutCandidates.length);
       setScanCachedAt(data.cachedAt || null);
     } catch {
       setTriggerMetCount(0);
       setTriggerMetTickers([]);
+      setBreakoutCount(0);
       setScanCachedAt(null);
     }
   }, []);
@@ -258,6 +263,11 @@ export default function DashboardPage() {
               <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 text-xs font-bold">
                 {triggerMetCount} TRIGGERED — READY TO BUY
               </div>
+              {breakoutCount > 0 && (
+                <div className="inline-flex items-center gap-1.5 ml-2 px-3 py-1 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 text-xs font-semibold">
+                  {breakoutCount} at breakout
+                </div>
+              )}
               <div className="flex flex-wrap gap-2">
                 {triggerMetTickers.slice(0, 8).map((ticker) => (
                   <span
@@ -282,6 +292,11 @@ export default function DashboardPage() {
           ) : (
             <div className="text-xs text-muted-foreground">
               No trigger met in the latest scan cache.
+              {breakoutCount > 0 && (
+                <span className="ml-1 text-cyan-300">
+                  ({breakoutCount} at breakout level)
+                </span>
+              )}
             </div>
           )}
         </div>

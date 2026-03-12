@@ -532,6 +532,8 @@ export const MAIN_NAV_ITEMS: NavEntry[] = [
       { label: 'Signals', href: '/backtest' },
       { label: 'Scorecard', href: '/filter-scorecard' },
       { label: 'Score Lab', href: '/score-validation' },
+      { label: 'Breakout Evidence', href: '/breakout-evidence' },
+      { label: 'Prediction', href: '/prediction-status' },
     ],
   },
   {

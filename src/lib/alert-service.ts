@@ -37,7 +37,8 @@ export type NotificationType =
   | 'STOP_MISMATCH'
   | 'FAILED_ORDER'
   | 'EXCESSIVE_DRAWDOWN'
-  | 'RISK_LIMIT_BREACH';
+  | 'RISK_LIMIT_BREACH'
+  | 'NEAR_STOP';
 
 export type AlertPriority = 'INFO' | 'WARNING' | 'CRITICAL';
 

@@ -55,6 +55,7 @@ interface Candidate {
 interface ReadyCandidatesProps {
   candidates: Candidate[];
   heldTickers?: Set<string>;
+  liveTickers?: Set<string>;
 }
 
 const matchTypeBadge: Record<string, { label: string; color: string; icon: typeof CheckCircle2 }> = {
@@ -87,7 +88,7 @@ function downloadCsv(rows: Candidate[]) {
   URL.revokeObjectURL(url);
 }
 
-export default function ReadyCandidates({ candidates, heldTickers = new Set() }: ReadyCandidatesProps) {
+export default function ReadyCandidates({ candidates, heldTickers = new Set(), liveTickers = new Set() }: ReadyCandidatesProps) {
   const [showScoreHelp, setShowScoreHelp] = useState(false);
   const [expandedTicker, setExpandedTicker] = useState<string | null>(null);
   const ready = candidates.filter(c => c.status === 'READY');
@@ -166,6 +167,7 @@ export default function ReadyCandidates({ candidates, heldTickers = new Set() }:
             const badge = matchTypeBadge[c.matchType || 'SCAN_ONLY'] || matchTypeBadge.SCAN_ONLY;
             const BadgeIcon = badge.icon;
             const isHeld = heldTickers.has(c.ticker);
+            const isLive = liveTickers.has(c.ticker);
             const isTriggerMet = c.price > 0 && c.entryTrigger > 0 && c.price >= c.entryTrigger;
             const isBuyReady = c.matchType === 'BOTH_RECOMMEND'
               && !isHeld
@@ -197,6 +199,11 @@ export default function ReadyCandidates({ candidates, heldTickers = new Set() }:
                       <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium border text-primary-400 bg-primary-500/15 border-primary-500/30">
                         <Briefcase className="w-3 h-3" />
                         HELD
+                      </span>
+                    )}
+                    {isLive && (
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-bold border text-cyan-400 bg-cyan-500/20 border-cyan-500/30">
+                        ⚡ LIVE
                       </span>
                     )}
                     <span className={cn("inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium border", badge.color)}>

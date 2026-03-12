@@ -351,6 +351,26 @@ async function runNightlyProcess() {
     }
     console.log(`        ${stopRecs.length} R-based, ${trailingStopChanges.length} trailing ATR`);
 
+    // Clear near-stop alert flag for positions whose stop just moved
+    // (so the alert can fire again if price approaches the new, higher stop)
+    const movedPositionIds = [
+      ...stopChanges.map((sc) => positions.find((p) => p.stock.ticker === sc.ticker)?.id),
+      ...trailingStopChanges.map((sc) => positions.find((p) => p.stock.ticker === sc.ticker)?.id),
+    ].filter((id): id is string => !!id);
+    if (movedPositionIds.length > 0) {
+      try {
+        // Clear via raw SQL — Prisma client may not have the field type yet if generate hasn't run
+        for (const pid of movedPositionIds) {
+          await prisma.$executeRawUnsafe(
+            'UPDATE "Position" SET "nearStopAlertSentAt" = NULL WHERE "id" = ? AND "nearStopAlertSentAt" IS NOT NULL',
+            pid
+          );
+        }
+      } catch (err) {
+        console.warn('  [3] Near-stop flag clear failed:', (err as Error).message);
+      }
+    }
+
     // Step 3c: Gap Risk detection for HIGH_RISK positions (advisory only)
     const gapRiskAlerts: NightlyGapRiskAlert[] = [];
     try {
@@ -482,6 +502,65 @@ async function runNightlyProcess() {
       console.warn('  [3e] Breakout failure detection failed:', (error as Error).message);
     }
     console.log(`        Breakout failures: ${breakoutFailureAlerts.length} detected`);
+
+    // Step 3f: Near-stop alert — warn when price is within 3% of stop-loss
+    // Only fires once per position (until stop is moved). HEDGE positions excluded.
+    let nearStopCount = 0;
+    try {
+      const NEAR_STOP_THRESHOLD = 0.03; // 3%
+
+      // Fetch nearStopAlertSentAt for open positions (may not be in Prisma types yet)
+      const alertFlags = await prisma.$queryRawUnsafe<Array<{ id: string; nearStopAlertSentAt: string | null }>>(
+        'SELECT "id", "nearStopAlertSentAt" FROM "Position" WHERE "status" = \'OPEN\''
+      );
+      const alertFlagMap = new Map(alertFlags.map((r) => [r.id, r.nearStopAlertSentAt]));
+
+      for (const p of positions) {
+        // Skip HEDGE positions — excluded from risk alerts per CLAUDE.md
+        if ((p.stock as { sleeve?: string }).sleeve === 'HEDGE') continue;
+
+        const currentPrice = livePrices[p.stock.ticker];
+        if (!currentPrice || currentPrice <= 0 || p.currentStop <= 0) continue;
+
+        // Already hit stop (handled by step 3d) or stop above price — skip
+        if (currentPrice <= p.currentStop) continue;
+
+        const distanceToStop = (currentPrice - p.currentStop) / currentPrice;
+        if (distanceToStop > NEAR_STOP_THRESHOLD) continue;
+
+        // Already alerted for this stop level — skip until stop moves
+        if (alertFlagMap.get(p.id)) continue;
+
+        // Price is within 3% of stop — fire alert
+        const isUK = p.stock.ticker.endsWith('.L') || /^[A-Z]{2,5}l$/.test(p.stock.ticker);
+        const currency = isUK ? 'GBX' : (p.stock.currency || 'USD').toUpperCase();
+        const currSymbol = currency === 'GBP' || currency === 'GBX' ? '\u00a3' : currency === 'EUR' ? '\u20ac' : '$';
+        const distPct = (distanceToStop * 100).toFixed(1);
+
+        await sendAlert({
+          type: 'NEAR_STOP',
+          title: `\u26a0 Near stop \u2014 ${p.stock.ticker} is ${distPct}% from stop`,
+          message: `${p.stock.name || p.stock.ticker} is approaching its stop-loss.\n\nCurrent price: ${currSymbol}${currentPrice.toFixed(2)}\nStop-loss: ${currSymbol}${p.currentStop.toFixed(2)}\nDistance: ${distPct}%\n\nConsider reviewing this position. The stop will execute automatically if the price drops further.`,
+          data: { ticker: p.stock.ticker, currentPrice, currentStop: p.currentStop, distancePct: parseFloat(distPct) },
+          priority: 'WARNING',
+        });
+
+        // Mark as alerted — prevents duplicate alerts until stop moves
+        await prisma.$executeRawUnsafe(
+          'UPDATE "Position" SET "nearStopAlertSentAt" = ? WHERE "id" = ?',
+          new Date().toISOString(),
+          p.id
+        );
+
+        nearStopCount++;
+      }
+      if (nearStopCount > 0) {
+        alerts.push(`\u26a0\ufe0f ${nearStopCount} position(s) within 3% of stop-loss`);
+      }
+    } catch (error) {
+      console.warn('  [3f] Near-stop alert failed:', (error as Error).message);
+    }
+    console.log(`        Near-stop alerts: ${nearStopCount} sent`);
 
     // Step 4: Detect laggards + collect alerts
     console.log('  [4/9] Detecting laggards...');
