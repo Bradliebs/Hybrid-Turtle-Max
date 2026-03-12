@@ -27,6 +27,7 @@ export async function GET() {
     const user = await prisma.user.findUnique({
       where: { id: 'default-user' },
       select: {
+        equity: true,
         startingEquityOverride: true,
         t212TotalValue: true,
         t212IsaTotalValue: true,
@@ -45,7 +46,9 @@ export async function GET() {
       ?? (firstRealSnapshot ? firstRealSnapshot.equity : null)
       ?? (hasT212 && t212Combined > 0 ? t212Combined : null)
       ?? (snapshots.length > 0 ? snapshots[0].equity : null);
-    const currentEquity = snapshots.length > 0 ? snapshots[snapshots.length - 1].equity : null;
+    // Current equity: prefer live user.equity (updated by broker sync) over stale snapshots
+    const currentEquity = user?.equity
+      ?? (snapshots.length > 0 ? snapshots[snapshots.length - 1].equity : null);
     const totalGainLoss =
       startingEquity != null && currentEquity != null
         ? currentEquity - startingEquity
