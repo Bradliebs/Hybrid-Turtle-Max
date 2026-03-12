@@ -69,6 +69,7 @@ export async function GET(request: NextRequest) {
         t212AccountId: true,
         t212Currency: true,
         t212LastSync: true,
+        t212TotalValue: true,
         // Trading 212 ISA
         t212IsaApiKey: true,
         t212IsaApiSecret: true,
@@ -76,6 +77,7 @@ export async function GET(request: NextRequest) {
         t212IsaAccountId: true,
         t212IsaCurrency: true,
         t212IsaLastSync: true,
+        t212IsaTotalValue: true,
       },
     });
 
