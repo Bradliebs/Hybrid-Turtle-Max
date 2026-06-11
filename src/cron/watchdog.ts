@@ -3,7 +3,7 @@
  * Consumed by: watchdog-task.bat, Task Scheduler
  * Consumes: prisma.ts, telegram.ts
  * Risk-sensitive: NO — monitoring only
- * Last modified: 2026-03-04
+ * Last modified: 2026-06-11
  * Notes: Lightweight watchdog that checks for missed nightly/midday heartbeats
  *        and sends a Telegram alert if the nightly hasn't run in 26+ hours.
  *        Runs daily at 10:00 AM via Task Scheduler.
@@ -13,7 +13,7 @@ import prisma from '@/lib/prisma';
 import { sendThrottledTelegramAlert } from '@/lib/telegram';
 import { ALERT_CATEGORY, buildAlertKey } from '@/lib/alert-categories';
 import { createCronLogger } from '@/lib/cron-logger';
-import { exec, execFile } from 'child_process';
+import { spawn, execFile } from 'child_process';
 import path from 'path';
 import { waitForDashboardRecovery } from './watchdog-recovery';
 import {
@@ -156,7 +156,18 @@ async function runWatchdog(): Promise<void> {
           consecutiveFailures: priorState.consecutiveFailures,
           budget: MAX_CONSECUTIVE_RESTART_FAILURES,
         });
-        exec(`start "" /min cmd /c "${startBat}"`, { cwd: rootDir });
+        // Detach the launcher so its (persistent) server child does not keep
+        // this watchdog's event loop alive. Without detached+unref the watchdog
+        // never exits naturally and Task Scheduler kills it at PT10M, leaving
+        // Last Result 267014 — which Check 4 below then misreads as a killed
+        // task and alerts about the watchdog itself. See audit 2026-06-11.
+        const restartChild = spawn(`start "" /min cmd /c "${startBat}"`, {
+          cwd: rootDir,
+          detached: true,
+          stdio: 'ignore',
+          shell: true,
+        });
+        restartChild.unref();
 
         const recovered = await waitForDashboardRecovery();
         if (recovered) {
@@ -278,11 +289,18 @@ async function runWatchdog(): Promise<void> {
 // nor NODE_ENV=test set, so this gate is a no-op there.
 if (process.env.VITEST !== 'true' && process.env.NODE_ENV !== 'test') {
   runWatchdog()
+    .then(() => {
+      process.exitCode = 0;
+    })
     .catch((err) => {
       log.error('Watchdog error', { error: (err as Error).message });
-      process.exit(1);
+      process.exitCode = 1;
     })
     .finally(async () => {
       await prisma.$disconnect();
+      // Force a clean exit. As a one-shot monitoring script the watchdog must
+      // never linger on a dangling handle; otherwise Task Scheduler kills it at
+      // PT10M (Last Result 267014). Exit with the code set above.
+      process.exit(process.exitCode ?? 0);
     });
 }
