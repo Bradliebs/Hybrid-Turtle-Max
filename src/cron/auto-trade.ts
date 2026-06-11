@@ -46,6 +46,7 @@
 import 'dotenv/config';
 import prisma from '@/lib/prisma';
 import { runFullScan } from '@/lib/scan-engine';
+import { persistScanSnapshot } from '@/lib/persist-scan-snapshot';
 import { calculatePositionSize } from '@/lib/position-sizer';
 import { validateRiskGates } from '@/lib/risk-gates';
 import { Trading212Client, Trading212Error, type T212PendingOrder } from '@/lib/trading212';
@@ -952,7 +953,7 @@ async function runAutoTrade(session: Session) {
   // ── Gate 3: Broker configured check ──
   const user = await prisma.user.findUnique({
     where: { id: userId },
-    select: { riskProfile: true, equity: true, t212Connected: true, t212IsaConnected: true, operatingMode: true },
+    select: { riskProfile: true, equity: true, t212Connected: true, t212IsaConnected: true, operatingMode: true, modelLayerEnabled: true },
   });
   if (!user) {
     console.error('  ✗ User not found');
@@ -1156,6 +1157,21 @@ async function runAutoTrade(session: Session) {
 
   // ── Scan-only session: report and exit ──
   if (session === 'scan') {
+    // Persist the scan we just computed so the dashboard / today-directive /
+    // ready-to-buy / analyst / research dataset stay fresh without a manual
+    // "Run Full Scan" click. This session never places orders, and the persist
+    // is non-fatal — a DB failure must not break the Telegram report below.
+    try {
+      const persisted = await persistScanSnapshot({
+        userId,
+        scanResult,
+        modelLayerEnabled: user.modelLayerEnabled ?? false,
+      });
+      console.log(`    Persisted scan snapshot: ${persisted.scanId ?? 'FAILED'} (${persisted.gradedCandidates.length} candidates)`);
+    } catch (persistErr) {
+      console.warn(`    [SCAN PERSIST] Failed (non-fatal): ${(persistErr as Error).message}`);
+    }
+
     // Also report all READY candidates regardless of session filter
     const allReady = scanResult.candidates.filter(c => c.passesAllFilters && c.status === 'READY' && !openTickers.has(c.ticker));
     allReady.sort((a, b) => b.rankScore - a.rankScore);

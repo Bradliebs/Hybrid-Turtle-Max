@@ -28,13 +28,9 @@ import { isNightlyRunning } from '@/lib/nightly-guard';
 import { normalizePersistedPassFlag } from '@/lib/scan-pass-flags';
 import { updateScanProgress, clearScanProgress } from '@/lib/scan-progress';
 import { getSlippageStats } from '@/lib/slippage-tracker';
-import { saveFilterAttributions } from '@/lib/filter-attribution';
-import { saveCandidateOutcomes } from '@/lib/candidate-outcome';
-import { getDataFreshness } from '@/lib/market-data';
+import { persistScanSnapshot } from '@/lib/persist-scan-snapshot';
 import { applyModelLayerToCandidates } from '../../../../packages/model/src';
 import { assertScanAllowed, SafetyControlError } from '../../../../packages/workflow/src';
-import { classifyCandidates, type GradingContext } from '@/lib/candidate-grade';
-import { getLatestScoresByTicker } from '@/lib/score-lookup';
 
 const scanRequestSchema = z.object({
   userId: z.string().trim().min(1),
@@ -104,128 +100,23 @@ export async function POST(request: NextRequest) {
       (stage, processed, total) => updateScanProgress(stage, processed, total),
       slippageBuffer
     );
-    const modelLayer = applyModelLayerToCandidates(result.candidates, {
-      enabled: userSettings?.modelLayerEnabled ?? false,
-    }, result.regime);
-
-    // ── Classify candidates (A/B/C/BLOCKED grades) ──
-    const latestHealth = await prisma.healthCheck.findFirst({
-      where: { userId },
-      orderBy: { runDate: 'desc' },
-      select: { overall: true },
-    }).catch(() => null);
-
-    // Look up the latest BQS/FWS/NCS for every candidate ticker so per-candidate
-    // grading uses the same scores nightly.ts wrote into ScoreBreakdown.
-    // Without this the grader receives null scores and treats every candidate
-    // as worst-case (NCS=0, FWS=100, BQS=0), which means nothing ever reaches
-    // A_GRADE_BUY and auto-trade never fires.
-    const candidateTickers = modelLayer.candidates.map((c) => c.ticker);
-    const scoresByTicker = await getLatestScoresByTicker(candidateTickers).catch((err) => {
-      console.warn('[Scan] getLatestScoresByTicker failed, falling back to null scores:', (err as Error).message);
-      return new Map<string, ReturnType<typeof Map.prototype.get>>() as Map<string, never>;
+    // Apply model layer, grade all candidates, and persist the full snapshot
+    // (Scan + ScanResult + FilterAttribution + CandidateOutcome). Shared with
+    // the scheduled scan-only session so both produce identical snapshots and
+    // the persisted scan stays fresh without a manual click. Grading is
+    // returned even if DB persistence fails (non-fatal — results still served).
+    const { gradedCandidates, modelLayer } = await persistScanSnapshot({
+      userId,
+      scanResult: result,
+      modelLayerEnabled: userSettings?.modelLayerEnabled ?? false,
     });
-
-    const baseGradingContext: GradingContext = {
-      regime: result.regime,
-      healthOverall: (latestHealth?.overall as string) ?? 'GREEN',
-    };
-
-    // Per-candidate context: shared regime/health + ticker-specific scores.
-    const gradedCandidates = classifyCandidates(
-      modelLayer.candidates,
-      (candidate) => {
-        const scores = scoresByTicker.get(candidate.ticker);
-        return scores
-          ? { ...baseGradingContext, ncs: scores.ncs, fws: scores.fws, bqs: scores.bqs }
-          : baseGradingContext;
-      },
-    );
 
     const responseResult = {
       ...result,
       candidates: gradedCandidates,
-      modelLayer: {
-        enabled: modelLayer.settings.enabled,
-        versions: modelLayer.versions,
-      },
+      modelLayer,
     };
     clearScanProgress();
-
-    // ── Persist to database ──────────────────────────────────────────
-    try {
-      // Look up stockId for each candidate
-      const allStocks = await prisma.stock.findMany({
-        where: { active: true },
-        select: { id: true, ticker: true },
-      });
-      const stockMap = new Map(allStocks.map((s) => [s.ticker, s.id]));
-
-      const scan = await prisma.scan.create({
-        data: {
-          userId,
-          regime: responseResult.regime,
-          results: {
-            create: responseResult.candidates
-              .filter((c) => stockMap.has(c.ticker)) // only known tickers
-              .map((c) => ({
-                stockId: stockMap.get(c.ticker)!,
-                price: c.price,
-                ma200: c.technicals?.ma200 ?? 0,
-                adx: c.technicals?.adx ?? 0,
-                plusDI: c.technicals?.plusDI ?? 0,
-                minusDI: c.technicals?.minusDI ?? 0,
-                atrPercent: c.technicals?.atrPercent ?? 0,
-                efficiency: c.technicals?.efficiency ?? 0,
-                twentyDayHigh: c.technicals?.twentyDayHigh ?? 0,
-                entryTrigger: c.entryTrigger,
-                stopPrice: c.stopPrice,
-                distancePercent: c.distancePercent,
-                status: c.status,
-                entryMode: c.pullbackSignal?.triggered ? 'PULLBACK_CONTINUATION' : 'BREAKOUT',
-                stage6Reason: c.pullbackSignal?.reason ?? c.antiChaseResult?.reason ?? null,
-                passesRiskGates: c.passesRiskGates ?? null,
-                passesAntiChase: c.passesAntiChase ?? null,
-                rankScore: c.rankScore,
-                passesAllFilters: c.passesAllFilters,
-                shares: c.shares ?? null,
-                riskDollars: c.riskDollars ?? null,
-                grade: (c as { classification?: { grade: string } }).classification?.grade ?? null,
-                gradeReason: (c as { classification?: { reason: string } }).classification?.reason ?? null,
-                ncs: scoresByTicker.get(c.ticker)?.ncs ?? null,
-                fws: scoresByTicker.get(c.ticker)?.fws ?? null,
-                bqs: scoresByTicker.get(c.ticker)?.bqs ?? null,
-              })),
-          },
-        },
-      });
-      console.log(`[Scan] Saved scan ${scan.id} with ${responseResult.candidates.length} candidates to DB`);
-
-      // ── Filter Attribution: record per-candidate filter decisions for analytics ──
-      try {
-        const attrResult = await saveFilterAttributions(responseResult.candidates, scan.id, responseResult.regime);
-        console.log(`[FilterAttribution] Saved ${attrResult.saved}, errors: ${attrResult.errors}`);
-      } catch (attrError) {
-        console.warn('[FilterAttribution] Failed:', (attrError as Error).message);
-      }
-
-      // ── Candidate Outcome: research-grade dataset for every candidate ──
-      try {
-        const freshness = getDataFreshness();
-        const coResult = await saveCandidateOutcomes(
-          responseResult.candidates,
-          scan.id,
-          responseResult.regime,
-          freshness.source
-        );
-        console.log(`[CandidateOutcome] Saved ${coResult.saved}, errors: ${coResult.errors}`);
-      } catch (coError) {
-        console.warn('[CandidateOutcome] Failed:', (coError as Error).message);
-      }
-    } catch (dbError) {
-      console.warn('[Scan] Failed to persist scan to DB:', (dbError as Error).message);
-      // Non-fatal — scan still returns results via cache
-    }
 
     // Cache the result so GET can return it without re-scanning
     const cached = setScanCache({

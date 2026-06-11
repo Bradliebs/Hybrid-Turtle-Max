@@ -29,6 +29,23 @@ Each entry uses this shape (newest at top of the History section):
 
 ## History
 
+### 2026-06-11 - pending - Persist scheduled scan snapshot in scan-only session
+
+- File(s):
+  - `src/cron/auto-trade.ts`:
+    - In the `if (session === 'scan')` branch only, added a `try/catch`-wrapped call to `persistScanSnapshot({ userId, scanResult, modelLayerEnabled })` before the existing session summary / heartbeat / disconnect. The scan-only session places no orders.
+    - Added `modelLayerEnabled: true` to the trading-session `user` select so the persist call can honour the model-layer setting.
+  - Supporting (non-sacred): new `src/lib/persist-scan-snapshot.ts` helper (extracted from the dashboard scan route) and `src/lib/persist-scan-snapshot.test.ts`; `src/app/api/scan/route.ts` refactored to call the same helper.
+- Why: `runFullScan` never persisted, so a `Scan` row was only written when a human clicked "Run Full Scan" in the dashboard. The scheduled evening scan recomputed the same data and discarded it, leaving `scanAgeHours` (today-directive, ready-to-buy, analyst, briefings) and the `CandidateOutcome` research dataset stale between manual scans. Persisting the scan the cron already runs keeps them fresh at zero extra Yahoo load.
+- Behaviour preserved:
+  - The scan-only branch still places no orders; no gate, sizing, stop, account-routing, anti-chase, or execution logic was touched.
+  - Persistence is non-fatal — a DB failure is caught and logged, and never alters the existing Telegram session summary or heartbeat behaviour.
+  - All trading-session gates and the `revalidateLivePrice` anti-chase guard are byte-for-byte unchanged.
+- Tests:
+  - `npx vitest run src/lib/persist-scan-snapshot.test.ts src/cron/auto-trade.test.ts src/cron/auto-trade-stop-retry.test.ts` — 82/82 pass.
+  - `npx tsc --noEmit` clean; `eslint` clean on all touched files.
+- Author: GitHub Copilot (agent), on user instruction.
+
 ### 2026-06-08 - pending - Entry revalidation forces a fresh quote
 
 - File(s):
