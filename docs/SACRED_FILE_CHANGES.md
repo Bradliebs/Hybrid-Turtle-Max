@@ -29,6 +29,28 @@ Each entry uses this shape (newest at top of the History section):
 
 ## History
 
+### 2026-06-15 - pending - F1 currency strict, F6 orphan T212 fill recovery, F7 FX warn-only
+
+- File(s):
+  - `src/cron/auto-trade.ts`:
+    - F1 (currency strict, execution loop): refuses to assume USD when `stock.currency` is null/empty and the ticker is not a `.L` London symbol — the entry is skipped with a diagnostic rather than sized in the wrong currency.
+    - F6 (orphan T212 fill recovery, Phase D): the catch around the persist-after-fill path now invokes a `recordOrphanT212Fill` helper that writes a durable JSONL incident to `data/incidents/orphan-fills.jsonl` (full recovery payload: order id, ticker, side, qty, fill price, currency, account, timestamp) AND raises a CRITICAL `ORPHAN_T212_FILL` Notification with `notificationDedupeKey = orphan-<buyOrderId>`. T212 fills are never rolled back — emergency-sell on DB failure is strictly worse than the orphan.
+    - F7 (FX warn-only fallback, Phase D): `fxToGbp` fallback is `isFinite`-guarded and warn-only so a transient FX outage cannot orphan a live position; the execution loop's hard currency skip (F1) remains the only entry gate, so this is post-fill bookkeeping only.
+  - `src/cron/midday-sync.ts`: matches the F1 currency-strict policy when reconciling broker positions.
+  - `src/cron/hourly-status.ts`: surfaces unread `ORPHAN_T212_FILL` notifications in the blockers panel (30-day window, top 5) so an orphan cannot go unseen until the user next opens the dashboard.
+  - `src/lib/alert-service.ts` (non-sacred): `NotificationType` union gained `ORPHAN_T212_FILL`.
+- Why: 2026-05/06 ORACLE SYSTEM AUDIT findings F1 (MED — silent currency assumption), F6 (HIGH — a T212 fill landing while DB persist failed produced a live position with no DB row, no stop, and no alert), and F7 (MED — FX call failure could orphan a position via the wrong execution path). Each was verified in its own prior phase; this commit groups them so they ship together rather than lingering uncommitted.
+- Behaviour preserved:
+  - All sizing, gate, stop, account-routing, anti-chase, and revalidation logic is byte-for-byte unchanged.
+  - F1 makes the loop MORE conservative — it adds skips, never adds entries.
+  - F6 changes nothing about the broker call; it only adds a recovery path on the existing catch branch (which previously logged and swallowed). No T212 cancel/sell is ever attempted.
+  - F7 fallback is warn-only and only runs when the execution-loop currency gate (F1) has already passed.
+  - Scan-only sessions still skip the trading gates entirely.
+- Tests:
+  - `npm run typecheck` clean.
+  - `npx vitest run src/cron/auto-trade.test.ts src/cron/auto-trade-stop-retry.test.ts src/lib/alert-service.test.ts src/lib/stop-hit-detection.test.ts src/lib/nightly-stop-apply.test.ts src/lib/persist-scan-snapshot.test.ts` — 104/104 pass on the combined working tree.
+- Author: GitHub Copilot (agent), on user instruction ("do what needs to be done, always remember real money" / "please do what is best to tidy this up").
+
 ### 2026-06-11 - pending - Persist scheduled scan snapshot in scan-only session
 
 - File(s):

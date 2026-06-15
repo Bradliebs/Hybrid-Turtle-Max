@@ -44,6 +44,8 @@
  */
 
 import 'dotenv/config';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import prisma from '@/lib/prisma';
 import { runFullScan } from '@/lib/scan-engine';
 import { persistScanSnapshot } from '@/lib/persist-scan-snapshot';
@@ -300,6 +302,67 @@ async function logExecution(data: {
   } catch (logErr) {
     console.error('[ExecutionLog] Failed to write log:', logErr);
   }
+}
+
+// ── Orphan Reconciliation Record (audit F6, 2026-) ───────────
+// When a T212 buy fills but the DB position.create fails, the position
+// is LIVE on T212 but invisible to the dashboard, stop manager, and
+// hourly status. The pre-existing path only logged to ExecutionLog and
+// returned critical=true — but if Prisma itself is the failure mode the
+// ExecutionLog write may also fail. This helper writes a durable
+// filesystem JSONL record (survives a Prisma outage) AND a Notification
+// via sendAlert (best-effort second channel). Recovery: operator inserts
+// the missing Position row manually, then marks the notification read.
+// We deliberately do NOT attempt to roll back the T212 fill: filled
+// orders cannot be cancelled, and an emergency market-sell on a DB-write
+// failure introduces worse market risk than the orphan itself.
+async function recordOrphanT212Fill(record: {
+  ticker: string;
+  t212Ticker: string;
+  accountType: T212AccountType;
+  buyOrderId: string;
+  filledQuantity: number;
+  filledPrice: number;
+  stopOrderId?: string | null;
+  stopPrice?: number | null;
+  stopPlaced: boolean;
+  dbError: string;
+}): Promise<void> {
+  const payload = {
+    timestamp: new Date().toISOString(),
+    ukTime: getUKTimeString(),
+    ...record,
+  };
+
+  // Layer A: durable filesystem record (works even if Prisma is down)
+  try {
+    const dir = path.join(process.cwd(), 'data', 'incidents');
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'orphan-fills.jsonl');
+    fs.appendFileSync(file, JSON.stringify(payload) + '\n', 'utf8');
+  } catch (fsErr) {
+    console.error('[recordOrphanT212Fill] Filesystem write failed:', (fsErr as Error).message);
+  }
+
+  // Layer B: in-app notification + Telegram (sendAlert never throws)
+  await sendAlert({
+    type: 'ORPHAN_T212_FILL',
+    title: `🚨 ORPHAN T212 FILL — ${record.ticker}`,
+    message: [
+      `T212 buy filled (order ${record.buyOrderId}) but DB position.create FAILED.`,
+      `Position is LIVE on T212 but invisible to HybridTurtle.`,
+      `Account: ${record.accountType} | Qty: ${record.filledQuantity} @ ${record.filledPrice.toFixed(4)}`,
+      record.stopPlaced
+        ? `Stop placed @ ${record.stopPrice?.toFixed(4) ?? '?'} (order ${record.stopOrderId ?? '?'})`
+        : `⚠ STOP NOT PLACED — manual stop required`,
+      `DB error: ${record.dbError}`,
+      `Reconcile: manually insert Position row, then mark this notification read.`,
+    ].join('\n'),
+    data: payload,
+    priority: 'CRITICAL',
+    notificationDedupeKey: `orphan-${record.buyOrderId}`,
+    telegramDedupeKey: `orphan-${record.buyOrderId}`,
+  });
 }
 
 // ── T212 Client Factory (standalone — no HTTP request context) ──
@@ -641,11 +704,32 @@ async function executeTrade(
 
     // FX rate for trade log
     const stock = await prisma.stock.findUnique({ where: { id: candidate.stockId }, select: { currency: true, ticker: true } });
-    const currency = (stock?.currency || 'USD').toUpperCase();
+    const rawCurrency = stock?.currency ? stock.currency.trim() : '';
+    const currency = (rawCurrency || 'USD').toUpperCase();
     const isUk = ticker.endsWith('.L');
+    // Audit fix F7 (2026-): warn on missing currency so the operator notices
+    // a Stock row that needs backfilling. We do NOT skip or throw here: the
+    // T212 fill is already live, so any failure in this branch would create
+    // an orphan (the surrounding try/catch fires recordOrphanT212Fill).
+    // Wrong positionSizeGbp in the trade log is far less bad than an orphan.
+    if (!rawCurrency && !isUk) {
+      console.warn(`    ⚠ ${ticker} has no currency in Stock row — defaulting to USD for trade log (orphan-safe). Backfill Stock.currency to fix.`);
+    }
     let fxToGbp = 1;
     if (isUk || currency === 'GBX' || currency === 'GBp') fxToGbp = 0.01;
-    else if (currency !== 'GBP') fxToGbp = await getFXRate(currency, 'GBP');
+    else if (currency !== 'GBP') {
+      try {
+        fxToGbp = await getFXRate(currency, 'GBP');
+        if (!isFinite(fxToGbp) || fxToGbp <= 0) {
+          console.warn(`    ⚠ FX rate invalid for ${currency} (got ${fxToGbp}) — using 1 for trade log only.`);
+          fxToGbp = 1;
+        }
+      } catch (fxErr) {
+        // Never propagate: would orphan a live T212 position over a reporting field.
+        console.warn(`    ⚠ FX rate unavailable for ${currency} in trade log: ${(fxErr as Error).message} — using 1.`);
+        fxToGbp = 1;
+      }
+    }
 
     const position = await prisma.$transaction(async (tx) => {
       const pos = await tx.position.create({
@@ -724,6 +808,34 @@ async function executeTrade(
       requestBody: JSON.stringify({ filledPrice, filledQuantity }), accountType, error: msg,
     });
     console.error(`    ✗ DB position failed — trade IS live on T212. ${msg}`);
+
+    // Audit fix F6 (2026-): write a durable orphan-fill record so the live
+    // T212 position is recoverable even when Prisma is the failure mode.
+    // Filesystem JSONL + Notification both fire; sendAlert never throws.
+    const lastStopOrderId = stopAttempts
+      .filter(a => a.orderId)
+      .map(a => a.orderId!)
+      .pop() ?? null;
+    try {
+      await recordOrphanT212Fill({
+        ticker,
+        t212Ticker,
+        accountType,
+        buyOrderId: String(buyOrder.id),
+        filledQuantity,
+        filledPrice,
+        stopOrderId: lastStopOrderId,
+        stopPrice: stopPlaced ? actualStopPrice : null,
+        stopPlaced,
+        dbError: msg,
+      });
+    } catch (orphanErr) {
+      // Defensive: recordOrphanT212Fill is best-effort and sendAlert never
+      // throws, but the helper's filesystem write could in theory raise
+      // (e.g. disk full). Never let recovery itself break the caller.
+      console.error(`    ✗ Orphan-record write failed (orphan still live on T212): ${(orphanErr as Error).message}`);
+    }
+
     return {
       ticker, success: true, shares: filledQuantity, filledPrice, stopPrice: actualStopPrice,
       stopPlaced, error: `DB save failed: ${msg}`, critical: true,
@@ -1318,12 +1430,34 @@ async function runAutoTrade(session: Session) {
     }
 
     // FX conversion for sizing
-    const currency = (stock.currency || 'USD').toUpperCase();
     const isUk = candidate.ticker.endsWith('.L');
+    const rawCurrency = stock.currency ? stock.currency.trim() : '';
+    // Audit fix F7 (2026-): refuse to silently default a missing currency to
+    // USD for non-.L tickers. A non-GBP candidate sized at the wrong FX is
+    // mis-sized by 20–50%. .L tickers are safe because the isUk branch forces
+    // GBp→GBP regardless of currency string.
+    if (!rawCurrency && !isUk) {
+      skipped.push({ ticker: candidate.ticker, reason: 'Currency not set in Stock row — refusing to assume USD' });
+      continue;
+    }
+    const currency = (rawCurrency || 'USD').toUpperCase();
     let fxToGbp = 1;
     if (isUk || currency === 'GBX' || currency === 'GBp') fxToGbp = 0.01;
     else if (currency !== 'GBP') {
-      try { fxToGbp = await getFXRate(currency, 'GBP'); } catch { fxToGbp = 1; }
+      // Audit fix F1 (2026-): never silently fall back to fxToGbp=1 on FX
+      // failure. A non-GBP candidate sized at parity is mis-sized by 20–50%
+      // (e.g. USD at 1.0 instead of 0.79). Skip the candidate instead so the
+      // operator sees the gap and can act.
+      try {
+        fxToGbp = await getFXRate(currency, 'GBP');
+      } catch (fxErr) {
+        skipped.push({ ticker: candidate.ticker, reason: `FX rate unavailable for ${currency}: ${(fxErr as Error).message}` });
+        continue;
+      }
+      if (!isFinite(fxToGbp) || fxToGbp <= 0) {
+        skipped.push({ ticker: candidate.ticker, reason: `FX rate invalid for ${currency} (got ${fxToGbp})` });
+        continue;
+      }
     }
 
     // Position sizing

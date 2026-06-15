@@ -38,7 +38,8 @@ export type NotificationType =
   | 'FAILED_ORDER'
   | 'EXCESSIVE_DRAWDOWN'
   | 'RISK_LIMIT_BREACH'
-  | 'NEAR_STOP';
+  | 'NEAR_STOP'
+  | 'ORPHAN_T212_FILL';
 
 export type AlertPriority = 'INFO' | 'WARNING' | 'CRITICAL';
 

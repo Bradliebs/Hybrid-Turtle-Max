@@ -1,12 +1,16 @@
 /**
  * DEPENDENCIES
  * Consumed by: hourly-status-task.bat, Windows Task Scheduler
- * Consumes: prisma.ts, telegram.ts, market-data.ts, risk-gates.ts, scan-engine.ts, safety-controls.ts
- * Risk-sensitive: NO — read-only status reporting, no trading actions
- * Last modified: 2026-04-26
+ * Consumes: prisma.ts, telegram.ts, market-data.ts, risk-gates.ts, scan-engine.ts, safety-controls.ts, position-sync.ts
+ * Risk-sensitive: YES (audit F3+F8, 2026-) — now calls syncClosedPositions
+ *                 before reporting to close the count-drift window (Telegram
+ *                 was reporting stale OPEN counts up to 2–3h after a T212
+ *                 stop-out). Sync uses the same safety guards as midday-sync;
+ *                 only closes a DB position when T212 confirms it is gone.
+ * Last modified: 2026-
  * Notes: Sends hourly Telegram status during market hours (08:00–21:00 UK Mon-Fri).
  *        Reports portfolio state, blockers, candidate readiness, and system health.
- *        Designed to be lightweight and never fail the pipeline.
+ *        Position reconciliation is best-effort — failure does not block the report.
  */
 /**
  * HybridTurtle Hourly Status — Telegram Status Updates
@@ -66,7 +70,22 @@ async function runHourlyStatus() {
   }
 
   try {
-    // ── Gather data (all read-only, all wrapped in try/catch) ──
+    // Audit fix F3+F8 (2026-): reconcile DB positions against T212 BEFORE
+    // reading them, so the Telegram status reflects current broker reality
+    // (previously stop-outs were invisible until the next midday-sync, up
+    // to 2–3h later). detectUntrackedSales=false matches midday-sync — we
+    // only close positions T212 confirms are gone, never adjust quantities.
+    try {
+      const { syncClosedPositions } = await import('@/lib/position-sync');
+      const syncResult = await syncClosedPositions(userId, { detectUntrackedSales: false });
+      if (syncResult.closed > 0) {
+        console.log(`  Pre-status sync closed ${syncResult.closed} position(s) detected as gone in T212`);
+      }
+    } catch (syncErr) {
+      console.warn(`  Pre-status sync failed (non-fatal): ${(syncErr as Error).message}`);
+    }
+
+    // ── Gather data (read-only from here, all wrapped in try/catch) ──
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
@@ -151,9 +170,15 @@ async function runHourlyStatus() {
     let totalUnrealisedPnl = 0;
     let totalOpenRisk = 0;
     let totalMarketValue = 0;
+    // Audit fix F5 (2026-): track tickers where no live price is available.
+    // Previous behaviour silently substituted entryPrice, which falsely
+    // reported 0% P&L and inaccurate open risk.
+    const stalePriceTickers: string[] = [];
 
     for (const p of positions) {
-      const currentPrice = gbpPrices[p.stock.ticker] ?? (prices[p.stock.ticker] || p.entryPrice);
+      const livePrice = gbpPrices[p.stock.ticker] ?? prices[p.stock.ticker];
+      const currentPrice = livePrice ?? p.entryPrice;
+      if (livePrice == null) stalePriceTickers.push(p.stock.ticker);
       const rawPrice = prices[p.stock.ticker] || p.entryPrice;
       const fxRatio = rawPrice > 0 ? currentPrice / rawPrice : 1;
       const entryGbp = p.entryPrice * fxRatio;
@@ -178,13 +203,20 @@ async function runHourlyStatus() {
     if (positions.length > 0) {
       lines.push(`<b>Positions</b>`);
       for (const p of positions) {
-        const currentPrice = prices[p.stock.ticker] || p.entryPrice;
+        const livePrice = prices[p.stock.ticker];
+        const currentPrice = livePrice ?? p.entryPrice;
+        const staleMark = livePrice == null ? ' 🟧' : '';
         const initialR = p.initialRisk || (p.entryPrice - p.stopLoss) || 1;
         const rMultiple = (currentPrice - p.entryPrice) / initialR;
         const pnlPct = p.entryPrice > 0 ? ((currentPrice - p.entryPrice) / p.entryPrice) * 100 : 0;
         const posEmoji = rMultiple >= 0 ? '🟩' : '🟥';
         const protLevel = p.protectionLevel || 'INITIAL';
-        lines.push(`  ${posEmoji} <b>${p.stock.ticker}</b> ${currentPrice.toFixed(2)} | ${rMultiple >= 0 ? '+' : ''}${rMultiple.toFixed(1)}R | ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}% | Stop: ${p.currentStop.toFixed(2)} [${protLevel}]`);
+        lines.push(`  ${posEmoji} <b>${p.stock.ticker}</b>${staleMark} ${currentPrice.toFixed(2)} | ${rMultiple >= 0 ? '+' : ''}${rMultiple.toFixed(1)}R | ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}% | Stop: ${p.currentStop.toFixed(2)} [${protLevel}]`);
+      }
+      // Audit fix F5: explicit stale warning so operator does not trust the
+      // entry-price-substituted values.
+      if (stalePriceTickers.length > 0) {
+        lines.push(`  🟧 Stale prices (using entry): ${stalePriceTickers.join(', ')}`);
       }
       lines.push('');
     }
@@ -199,6 +231,52 @@ async function runHourlyStatus() {
     if (!autoEnabled) blockers.push('⏸ Auto-trading: OFF');
     if (positions.length >= profile.maxPositions) blockers.push(`📊 Max positions reached (${positions.length}/${profile.maxPositions})`);
     if (openRiskPct >= profile.maxOpenRisk) blockers.push(`📊 Open risk at limit (${openRiskPct.toFixed(1)}%/${profile.maxOpenRisk}%)`);
+
+    // Audit fix F2 (2026-): surface unresolved STOP_MISMATCH notifications so
+    // stop drift is visible every hour, not just once per 12h Telegram window.
+    // The in-app dedupe is the Notification.readAt flag — the operator clears
+    // these from the dashboard once they act on them.
+    try {
+      const driftNotes = await prisma.notification.findMany({
+        where: {
+          type: 'STOP_MISMATCH',
+          readAt: null,
+          createdAt: { gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 3,
+        select: { createdAt: true, title: true },
+      });
+      for (const n of driftNotes) {
+        const ageHr = Math.round((Date.now() - n.createdAt.getTime()) / 3600000);
+        blockers.push(`🚨 ${n.title} (${ageHr}h ago, unread)`);
+      }
+    } catch (driftErr) {
+      console.warn(`  Stop-drift notification check failed: ${(driftErr as Error).message}`);
+    }
+
+    // Audit fix F6 (2026-): surface unresolved ORPHAN_T212_FILL notifications.
+    // An orphan = live T212 position with no DB row → invisible to dashboard
+    // and stop manager. Operator MUST reconcile (manual Position insert) and
+    // then mark the notification read.
+    try {
+      const orphanNotes = await prisma.notification.findMany({
+        where: {
+          type: 'ORPHAN_T212_FILL',
+          readAt: null,
+          createdAt: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 5,
+        select: { createdAt: true, title: true },
+      });
+      for (const n of orphanNotes) {
+        const ageHr = Math.round((Date.now() - n.createdAt.getTime()) / 3600000);
+        blockers.push(`🚨 ${n.title} (${ageHr}h ago, RECONCILE)`);
+      }
+    } catch (orphanErr) {
+      console.warn(`  Orphan-fill notification check failed: ${(orphanErr as Error).message}`);
+    }
 
     if (blockers.length > 0) {
       lines.push(`<b>⛔ Blockers (${blockers.length})</b>`);
@@ -231,6 +309,10 @@ async function runHourlyStatus() {
     lines.push(`<b>System</b>`);
     lines.push(`  Health: ${healthEmoji} ${latestHealth?.overall ?? 'UNKNOWN'} | Regime: ${regimeEmoji} ${regime}`);
     lines.push(`  Auto-trade: ${autoEnabled ? '✅ ON' : '⏸ OFF'}`);
+    // Audit fix F13 (2026-): explicit freshness watermark so the operator
+    // can tell at a glance whether they are reading a current report or a
+    // stuck cron run.
+    lines.push(`  Data refreshed: ${getUKTimeString()} UK`);
 
     if (lastAutoTrade) {
       const ago = Math.round((Date.now() - new Date(lastAutoTrade.timestamp).getTime()) / 3600000);

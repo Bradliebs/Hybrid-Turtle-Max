@@ -11,6 +11,7 @@
 import prisma from '@/lib/prisma';
 import type { PositionSyncResult } from '@/lib/position-sync';
 import { sendAlert } from '@/lib/alert-service';
+import { refreshUserEquityFromBroker } from '@/lib/equity-refresh';
 import { createCronLogger } from '@/lib/cron-logger';
 import { getUKDayOfWeek } from '@/lib/uk-time';
 
@@ -99,6 +100,21 @@ async function runMiddaySync() {
     result = await syncClosedPositions(userId, { detectUntrackedSales: false });
 
     console.log(`  Result: ${result.checked} checked, ${result.closed} closed, ${result.skipped} skipped, ${result.updated} updated`);
+
+    // Audit fix F4 (2026-): refresh User.equity from T212 combined totalValue.
+    // Without this, sizing and hourly/nightly reporting drift from broker
+    // reality between dashboard syncs. Failure is non-fatal — helper leaves
+    // existing equity untouched on T212 / decrypt failure.
+    try {
+      const eq = await refreshUserEquityFromBroker(userId);
+      if (eq.written) {
+        console.log(`  Equity refreshed: £${eq.combinedTotalValueGbp.toFixed(2)} (invest=${eq.investTotalValue ?? 'n/a'}, isa=${eq.isaTotalValue ?? 'n/a'})`);
+      } else {
+        console.warn('  Equity refresh skipped or failed — User.equity unchanged.');
+      }
+    } catch (eqErr) {
+      console.warn(`  Equity refresh threw unexpectedly: ${(eqErr as Error).message}`);
+    }
 
     if (result.errors.length > 0) {
       for (const err of result.errors) {
