@@ -77,3 +77,6 @@ ticker-audit.log
 
 # HVE-Core AI workflow artifacts (local only)
 .copilot-tracking/
+
+# Personal chat / session checkpoint notes (local only)
+docs/chat_checkpoint*.md
