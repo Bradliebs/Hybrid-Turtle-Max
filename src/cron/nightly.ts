@@ -56,6 +56,7 @@ import { preCacheEarningsBatch } from '@/lib/earnings-calendar';
 import { getRiskBudget, canPyramid, calculatePyramidAddSize, validateRiskGates } from '@/lib/risk-gates';
 import { calculateRMultiple } from '@/lib/position-sizer';
 import { sendAlert } from '@/lib/alert-service';
+import { selectStopHitTriggerPrice } from '@/lib/stop-hit-detection';
 import { backupDatabase } from '@/lib/db-backup';
 import { isAutoTradingEnabled } from '../../packages/workflow/src';
 import { Trading212Client } from '@/lib/trading212';
@@ -689,33 +690,72 @@ async function runNightlyProcess() {
     }
     console.log(`        Gap risk: ${gapRiskAlerts.length} flagged`);
 
-    // Step 3d: Stop-hit detection — alert if any position price <= currentStop
-    const stopHitPositions: Array<{ ticker: string; name: string; currentStop: number; currentPrice: number; currency: string }> = [];
+    // Step 3d: Stop-hit detection — alert when today's intra-day low <= currentStop.
+    // Snapshot price (livePrices) is close-of-day Yahoo + T212 real-time quote —
+    // both miss the case where a stop was hit intra-day and price recovered before
+    // snapshot time. T212 may have already filled the stop in that window; without
+    // checking today's bar.low we never alert. Fall back to snapshot only when
+    // today's bar is unavailable (weekend, holiday, data outage). Dedupe per
+    // ticker per UTC day so a stuck-below-stop position reminds once daily, not
+    // every nightly run.
+    const stopHitPositions: Array<{ ticker: string; name: string; currentStop: number; triggerPrice: number; triggerSource: 'INTRA_DAY_LOW' | 'SNAPSHOT'; currency: string }> = [];
+    const stopHitTodayStr = new Date().toISOString().split('T')[0];
     try {
       for (const p of positions) {
-        const currentPrice = livePrices[p.stock.ticker];
-        if (!currentPrice || currentPrice <= 0) continue;
-        if (currentPrice <= p.currentStop) {
+        // Fetch today's bar from cached daily history (compact = ~100 days).
+        // getDailyPrices is memoised, so this also warms the cache for the
+        // trailing-ATR step later in this run. Fire-and-forget on failure —
+        // fall back to the snapshot path inside the helper.
+        let todayBar: { date: string; low: number } | null = null;
+        try {
+          const bars = await getDailyPrices(p.stock.ticker, 'compact');
+          if (bars.length > 0 && bars[0].low != null) {
+            todayBar = { date: bars[0].date, low: bars[0].low };
+          }
+        } catch (err) {
+          console.warn(`  [3d] intra-day bar fetch failed for ${p.stock.ticker}: ${(err as Error).message}`);
+        }
+
+        const trigger = selectStopHitTriggerPrice(
+          todayBar,
+          livePrices[p.stock.ticker],
+          stopHitTodayStr
+        );
+        if (!trigger) continue;
+
+        if (trigger.price <= p.currentStop) {
           const isUK = p.stock.ticker.endsWith('.L') || /^[A-Z]{2,5}l$/.test(p.stock.ticker);
           const currency = isUK ? 'GBX' : (p.stock.currency || 'USD').toUpperCase();
           stopHitPositions.push({
             ticker: p.stock.ticker,
             name: p.stock.name || p.stock.ticker,
             currentStop: p.currentStop,
-            currentPrice,
+            triggerPrice: trigger.price,
+            triggerSource: trigger.source,
             currency,
           });
         }
       }
-      // Send stop-hit alerts (any day of the week)
+      // Send stop-hit alerts (any day of the week). Dedupe key prevents
+      // duplicate DB rows + Telegram messages when the same position is still
+      // below its stop on subsequent nightly runs within the same UTC day.
       for (const hit of stopHitPositions) {
         const currSymbol = hit.currency === 'GBP' || hit.currency === 'GBX' ? '£' : hit.currency === 'EUR' ? '€' : '$';
+        const sourceLabel = hit.triggerSource === 'INTRA_DAY_LOW' ? 'intra-day low' : 'latest price';
+        const dedupeKey = `stop-hit:${hit.ticker}:${stopHitTodayStr}`;
         await sendAlert({
           type: 'STOP_HIT',
           title: `⚠ Action needed — ${hit.ticker} may have hit its stop`,
-          message: `${hit.name} (${hit.ticker}) has fallen to or below your stop-loss level.\n\nStop price: ${currSymbol}${hit.currentStop.toFixed(2)}\nCurrent price: ${currSymbol}${hit.currentPrice.toFixed(2)}\n\nCheck Trading 212 and confirm whether the position has been closed. If not, close it manually now.`,
-          data: { ticker: hit.ticker, currentStop: hit.currentStop, currentPrice: hit.currentPrice },
+          message: `${hit.name} (${hit.ticker}) has fallen to or below your stop-loss level.\n\nStop price: ${currSymbol}${hit.currentStop.toFixed(2)}\n${sourceLabel === 'intra-day low' ? 'Today\'s low' : 'Current price'}: ${currSymbol}${hit.triggerPrice.toFixed(2)} (${sourceLabel})\n\nCheck Trading 212 and confirm whether the position has been closed. If not, close it manually now.`,
+          data: {
+            ticker: hit.ticker,
+            currentStop: hit.currentStop,
+            triggerPrice: hit.triggerPrice,
+            triggerSource: hit.triggerSource,
+          },
           priority: 'WARNING',
+          notificationDedupeKey: dedupeKey,
+          telegramDedupeKey: dedupeKey,
         });
       }
       if (stopHitPositions.length > 0) {
@@ -923,6 +963,24 @@ async function runNightlyProcess() {
     console.log('  [4/9] Detecting laggards...');
     startStep('4', 'Laggard detection');
     log.info('Step 4: Laggard detection');
+
+    // Audit fix F4 (2026-): refresh User.equity from T212 combined totalValue
+    // BEFORE reading it for the rest of nightly (Step 6 snapshot, drawdown
+    // alert, openRiskPercent, pyramid gating). Without this, nightly sizing
+    // and snapshots used whatever value was last written by the dashboard
+    // sync — which could be stale by days. Failure is non-fatal.
+    try {
+      const { refreshUserEquityFromBroker } = await import('@/lib/equity-refresh');
+      const eq = await refreshUserEquityFromBroker(userId);
+      if (eq.written) {
+        console.log(`        Equity refreshed from broker: £${eq.combinedTotalValueGbp.toFixed(2)}`);
+      } else {
+        console.warn('        Equity refresh skipped — using last-known User.equity.');
+      }
+    } catch (eqErr) {
+      console.warn(`        Equity refresh failed: ${(eqErr as Error).message}`);
+    }
+
     const user = await prisma.user.findUnique({ where: { id: userId } });
     const equity = user?.equity || 0;
 
