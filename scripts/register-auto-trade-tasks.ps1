@@ -51,7 +51,9 @@ Set-TaskResilient "HybridTurtle-Trade-USC"
 Write-Host "USC: $LASTEXITCODE"
 
 schtasks /Delete /TN "HybridTurtle-HourlyStatus" /F 2>$null
-schtasks /Create /TN "HybridTurtle-HourlyStatus" /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 08:00 /RI 60 /DU 13:00 /TR "`"$hs`" --scheduled" /RL HIGHEST /F
+# Audit 2026-06-16 (MEDIUM-2): /ST 08:02 so the final hourly tick lands at
+# 21:02 instead of colliding with the 21:00 nightly start.
+schtasks /Create /TN "HybridTurtle-HourlyStatus" /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 08:02 /RI 60 /DU 13:00 /TR "`"$hs`" --scheduled" /RL HIGHEST /F
 $task = Get-ScheduledTask -TaskName "HybridTurtle-HourlyStatus" -ErrorAction SilentlyContinue
 if ($task) {
   $task.Settings.DisallowStartIfOnBatteries = $false

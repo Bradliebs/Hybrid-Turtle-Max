@@ -128,10 +128,13 @@ if %errorlevel% equ 0 (
 :: ── Hourly Status (every hour during market hours) ──
 echo  [7/7] Registering hourly Telegram status...
 set "HS_BAT=%SCRIPT_DIR%hourly-status-task.bat"
+:: Audit 2026-06-16 (MEDIUM-2): /ST 08:02 keeps iterations on the :02 grid so
+:: the final hourly tick lands at 21:02, two minutes after the 21:00 nightly
+:: start — avoids SQLite WAL contention with nightly's first writes.
 schtasks /Delete /TN "HybridTurtle-HourlyStatus" /F >nul 2>&1
-schtasks /Create /TN "HybridTurtle-HourlyStatus" /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 08:00 /RI 60 /DU 13:00 /TR "\"%HS_BAT%\" --scheduled" /RL HIGHEST /F >nul 2>&1
+schtasks /Create /TN "HybridTurtle-HourlyStatus" /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 08:02 /RI 60 /DU 13:00 /TR "\"%HS_BAT%\" --scheduled" /RL HIGHEST /F >nul 2>&1
 if %errorlevel% equ 0 (
-    echo         OK — HybridTurtle-HourlyStatus every hour 08:00-21:00
+    echo         OK — HybridTurtle-HourlyStatus every hour 08:02-21:02
 ) else (
     echo         FAILED — could not create hourly status task
 )

@@ -248,6 +248,61 @@ async function runNightlyProcess() {
       console.error('  [0] Pre-cache failed:', (error as Error).message);
     }
 
+    // Step 0a: Credential decrypt smoke-test
+    // Detects the silent-rotation cascade where rotating NEXTAUTH_SECRET (or
+    // a botched ENCRYPTION_SECRET migration) leaves stored T212/Telegram
+    // credentials undecryptable. Without this, the failure surfaces only as
+    // a generic "broker not connected" at the next session, with no pointer
+    // to root cause. Audit 2026-06-16 (HIGH-2).
+    console.log('  [0a] Credential decrypt smoke-test...');
+    try {
+      const u = await prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+          t212ApiKey: true,
+          t212IsaApiKey: true,
+          telegramBotToken: true,
+          telegramChatId: true,
+        },
+      });
+      const fields: Array<[string, string | null | undefined]> = u ? [
+        ['t212ApiKey', u.t212ApiKey],
+        ['t212IsaApiKey', u.t212IsaApiKey],
+        ['telegramBotToken', u.telegramBotToken],
+        ['telegramChatId', u.telegramChatId],
+      ] : [];
+      const broken: string[] = [];
+      for (const [name, value] of fields) {
+        if (!value || !value.startsWith('enc:')) continue;
+        try {
+          decryptField(value);
+        } catch (err) {
+          broken.push(`${name}: ${(err as Error).message}`);
+        }
+      }
+      if (broken.length > 0) {
+        console.error(`  [0a] CREDENTIAL DECRYPT FAILED for ${broken.length} field(s)`);
+        await sendAlert({
+          type: 'SYSTEM',
+          title: 'Credential decrypt failed — broker may be unreachable',
+          message:
+            `Stored credentials cannot be decrypted: ${broken.join('; ')}.\n\n` +
+            `Likely cause: NEXTAUTH_SECRET was rotated without setting ` +
+            `ENCRYPTION_SECRET first. Restore the previous secret value or ` +
+            `re-encrypt credentials before the next trading session.`,
+          priority: 'CRITICAL',
+          telegramDedupeKey: 'credential-decrypt-failed',
+          notificationDedupeKey: 'credential-decrypt-failed',
+        });
+        hadFailure = true;
+      } else {
+        console.log('        Credential decrypt OK');
+      }
+    } catch (err) {
+      console.error('  [0a] Credential smoke-test threw:', (err as Error).message);
+      // Do not block — the test is diagnostic, not a gate.
+    }
+
     // Step 0b: Database backup
     console.log('  [0b] Database backup...');
     try {
@@ -257,11 +312,44 @@ async function runNightlyProcess() {
       } else {
         console.warn(`        Backup failed: ${backupResult.error}`);
         hadFailure = true;
-        // Do NOT abort — backup failure should not stop the rest of the pipeline
+        // Do NOT abort — backup failure should not stop the rest of the pipeline.
+        // BUT: a 48h-stale backup hard-blocks all auto-trade sessions
+        // (pre-execution-dry-run.ts), so a silent backup failure on Sunday
+        // night blocks Monday trading with no clear in-app pointer to the
+        // root cause. Fire a CRITICAL alert at the moment of failure.
+        // Audit 2026-06-16 (HIGH-4).
+        await sendAlert({
+          type: 'SYSTEM',
+          title: 'Nightly DB backup failed — trading may be blocked',
+          message:
+            `Backup failed: ${backupResult.error ?? 'unknown error'}.\n\n` +
+            `If the most recent successful backup is older than 48h, all ` +
+            `auto-trade sessions will be hard-blocked until a fresh backup ` +
+            `succeeds. Resolve disk space, permissions, or restore from a ` +
+            `known-good backup before the next session.`,
+          priority: 'CRITICAL',
+          telegramDedupeKey: 'nightly-backup-failed',
+          notificationDedupeKey: 'nightly-backup-failed',
+        }).catch((alertErr) => {
+          console.error('  [0b] Backup-failure alert dispatch failed:', (alertErr as Error).message);
+        });
       }
     } catch (err) {
       console.error('  [0b] Backup step threw unexpectedly:', err);
       hadFailure = true;
+      await sendAlert({
+        type: 'SYSTEM',
+        title: 'Nightly DB backup threw — trading may be blocked',
+        message:
+          `Backup step threw an unexpected error: ${(err as Error).message}.\n\n` +
+          `If the most recent successful backup is older than 48h, all ` +
+          `auto-trade sessions will be hard-blocked until a fresh backup succeeds.`,
+        priority: 'CRITICAL',
+        telegramDedupeKey: 'nightly-backup-threw',
+        notificationDedupeKey: 'nightly-backup-threw',
+      }).catch((alertErr) => {
+        console.error('  [0b] Backup-throw alert dispatch failed:', (alertErr as Error).message);
+      });
     }
 
     // Step 1: Run health check (isolated — failure doesn't block other steps)

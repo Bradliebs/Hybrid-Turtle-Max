@@ -6,6 +6,12 @@ const envSchema = z.object({
   CRON_SECRET: z.string().min(1, 'CRON_SECRET is required'),
   NEXTAUTH_URL: z.string().url('NEXTAUTH_URL must be a valid URL').optional(),
   NODE_ENV: z.enum(['development', 'test', 'production']).optional(),
+  // Optional but strongly recommended. crypto.ts falls back to NEXTAUTH_SECRET
+  // if absent, but that means rotating NEXTAUTH_SECRET will silently brick
+  // decryption of T212/Telegram credentials stored in the DB. Setting this
+  // explicitly decouples auth-session secrets from at-rest credential keys.
+  // See audit 2026-06-16 (HIGH-2) for the cascade.
+  ENCRYPTION_SECRET: z.string().min(1).optional(),
 });
 
 function formatEnvIssues(issues: z.ZodIssue[]): string {
@@ -38,6 +44,18 @@ function validateEnv() {
       `[Startup Env Validation Failed] ${diagnostics}`
     );
   }
+
+  // Soft warning: ENCRYPTION_SECRET is optional but recommended in production.
+  // Without it, NEXTAUTH_SECRET doubles as the at-rest credential key, which
+  // means rotating auth secrets will break broker decryption.
+  if (!process.env.ENCRYPTION_SECRET) {
+    console.warn(
+      '[env] ENCRYPTION_SECRET is not set — NEXTAUTH_SECRET will be used for ' +
+      'credential decryption. Rotating NEXTAUTH_SECRET will silently brick ' +
+      'stored T212/Telegram credentials. See docs/SACRED_FILE_CHANGES.md.'
+    );
+  }
 }
 
 validateEnv();
+

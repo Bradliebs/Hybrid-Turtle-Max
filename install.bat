@@ -436,9 +436,11 @@ schtasks /Create /TN "HybridTurtle-Trade-USC" /SC WEEKLY /D MON,TUE,WED,THU,FRI 
 echo         US near-close: 20:30 Mon-Fri
 
 set "HS_BAT=%SCRIPT_DIR%hourly-status-task.bat"
+:: Audit 2026-06-16 (MEDIUM-2): /ST 08:02 keeps the final tick at 21:02
+:: instead of colliding with the 21:00 nightly start.
 schtasks /Delete /TN "HybridTurtle-HourlyStatus" /F >> "%LOG%" 2>&1
-schtasks /Create /TN "HybridTurtle-HourlyStatus" /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 08:00 /RI 60 /DU 13:00 /TR "\"%HS_BAT%\" --scheduled" /RL HIGHEST /F >> "%LOG%" 2>&1
-echo         Hourly Telegram status: 08:00-21:00 Mon-Fri
+schtasks /Create /TN "HybridTurtle-HourlyStatus" /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 08:02 /RI 60 /DU 13:00 /TR "\"%HS_BAT%\" --scheduled" /RL HIGHEST /F >> "%LOG%" 2>&1
+echo         Hourly Telegram status: 08:02-21:02 Mon-Fri
 
 :: Midday sync (position detection)
 schtasks /Delete /TN "HybridTurtle-MiddaySync" /F >> "%LOG%" 2>&1

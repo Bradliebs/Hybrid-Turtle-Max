@@ -1241,6 +1241,22 @@ async function runAutoTrade(session: Session) {
       if (decision.action === 'SKIP') {
         liveRevalidationSkipped.push({ ticker: c.ticker, reason: decision.reason });
         readyCandidates.splice(i, 1);
+        // Persist a forensic ExecutionLog row so "why didn't X trade?" is
+        // queryable weeks later without grepping session-summary text.
+        // Best-effort — never blocks trading. Audit 2026-06-16 (MEDIUM-7).
+        await logExecution({
+          ticker: c.ticker,
+          phase: 'LIVE_REVAL_SKIP',
+          requestBody: JSON.stringify({
+            scanPrice: c.price,
+            entryTrigger: c.entryTrigger,
+            livePrice: livePrices[c.ticker] ?? null,
+            atr: c.technicals?.atr ?? null,
+            session,
+          }),
+          accountType: 'N/A',
+          error: decision.reason,
+        });
       }
     }
     if (liveRevalidationSkipped.length > 0) {

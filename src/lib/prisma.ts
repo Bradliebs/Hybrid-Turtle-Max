@@ -22,8 +22,14 @@ globalForPrisma.prisma = prisma;
 // SQLite concurrency: WAL allows reads during writes, busy_timeout retries
 // instead of failing immediately with SQLITE_BUSY.
 // WAL is persistent (stored in DB file), busy_timeout is per-connection.
-// These run once per process on first import — errors are non-fatal.
-prisma.$queryRawUnsafe('PRAGMA journal_mode = WAL;').catch(() => {});
-prisma.$queryRawUnsafe('PRAGMA busy_timeout = 5000;').catch(() => {});
+// These run once per process on first import — errors are non-fatal but
+// must be logged. A swallowed busy_timeout failure means this connection
+// will throw SQLITE_BUSY immediately on contention instead of waiting 5s.
+prisma.$queryRawUnsafe('PRAGMA journal_mode = WAL;').catch((err) => {
+  console.error('[prisma] PRAGMA journal_mode=WAL failed:', (err as Error).message);
+});
+prisma.$queryRawUnsafe('PRAGMA busy_timeout = 5000;').catch((err) => {
+  console.error('[prisma] PRAGMA busy_timeout=5000 failed:', (err as Error).message);
+});
 
 export default prisma;

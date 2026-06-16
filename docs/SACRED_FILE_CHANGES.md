@@ -29,6 +29,23 @@ Each entry uses this shape (newest at top of the History section):
 
 ## History
 
+### 2026-06-16 - pending - Log LIVE_REVAL_SKIP rows for live-revalidation skips
+
+- File(s):
+  - `src/cron/auto-trade.ts`:
+    - In the live-revalidation skip branch (the `if (!decision.proceed)` block immediately after `revalidateLivePrice`, just inside the existing `liveRevalidationSkipped.push(...)` + `readyCandidates.splice(i, 1)` pair), added a single `await logExecution({ ticker, phase: 'LIVE_REVAL_SKIP', requestBody: JSON.stringify({...}), accountType: 'N/A', error: decision.reason })` call.
+- Why: 2026-06-16 ORACLE SYSTEM AUDIT HIGH-7. Live-revalidation skips were previously only counted in the session-summary heartbeat (no per-ticker durable evidence). Without an ExecutionLog row per skip, "why did the bot reject GE on Tuesday's UK session?" was unanswerable post-hoc — the user could see the count but not the candidates, the prices that triggered the skip, or the decision reason. This adds a row per skip with the same shape as other execution-loop diagnostic rows (LIVE_REVAL_PASS, RISK_GATE_SKIP, etc.).
+- Behaviour preserved:
+  - The revalidation decision logic itself (`revalidateLivePrice` and the four SKIP/KEEP branches) is byte-for-byte unchanged.
+  - `logExecution` (the existing helper defined earlier in this file) has an internal `try/catch` and a `console.error` on DB failure — it never throws. So a logging failure cannot break the skip path, cannot prevent the candidate from being removed from `readyCandidates`, and cannot affect any later candidate's sizing or execution.
+  - The skip is still applied (the `splice(i, 1)` is still called); only diagnostic visibility is added.
+  - All sizing, gate, stop, account-routing, anti-chase, fresh-quote, and execution-path logic untouched.
+  - Scan-only sessions never enter this branch.
+- Tests:
+  - `npm run typecheck` clean.
+  - `npx vitest run` — 235/235 pass across 11 cron/lib test files (auto-trade, auto-trade-stop-retry, briefing-format, hourly-status, midday-sync, nightly-steps, watchdog-checks, watchdog-recovery, watchdog-restart-budget, health-check, audit-scheduled-tasks).
+- Author: GitHub Copilot (agent), on user instruction ("do what is suggested" - executing the ORACLE SYSTEM AUDIT recommended hardening).
+
 ### 2026-06-15 - pending - F1 currency strict, F6 orphan T212 fill recovery, F7 FX warn-only
 
 - File(s):

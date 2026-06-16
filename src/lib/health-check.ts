@@ -79,6 +79,9 @@ export async function runHealthCheck(userId: string): Promise<HealthCheckReport>
   // ---- A6: Yahoo Ticker Mappings ----
   results.push(await checkInvalidYahooTickers());
 
+  // ---- A7: Sector Coverage on Open Positions ----
+  results.push(checkSectorCoverage(user.positions));
+
   // ---- C1: Equity > £0 ----
   results.push(checkEquityPositive(user.equity));
 
@@ -167,23 +170,28 @@ export async function runHealthCheck(userId: string): Promise<HealthCheckReport>
 
 async function checkDataFreshness(): Promise<HealthCheckResult> {
   try {
+    // Filter by kind='NIGHTLY' so a fresh hourly-status / midday-sync heartbeat
+    // can never mask a missed nightly. Audit 2026-06-16 — A1 was reading the
+    // most recent heartbeat across all kinds and reporting GREEN even when
+    // nightly had been skipped for days.
     const heartbeat = await prisma.heartbeat.findFirst({
+      where: { kind: 'NIGHTLY' },
       orderBy: { timestamp: 'desc' },
     });
 
     if (!heartbeat) {
-      return { id: 'A1', label: 'Data Freshness', category: 'Data', status: 'YELLOW', message: 'No data fetch recorded yet' };
+      return { id: 'A1', label: 'Data Freshness', category: 'Data', status: 'YELLOW', message: 'No nightly heartbeat recorded yet' };
     }
 
     const hoursSince = (Date.now() - heartbeat.timestamp.getTime()) / (1000 * 60 * 60);
     const daysSince = hoursSince / 24;
     if (daysSince > 5) {
-      return { id: 'A1', label: 'Data Freshness', category: 'Data', status: 'RED', message: `Data is ${daysSince.toFixed(1)} days old (max 5 days)` };
+      return { id: 'A1', label: 'Data Freshness', category: 'Data', status: 'RED', message: `Nightly data is ${daysSince.toFixed(1)} days old (max 5 days)` };
     }
     if (daysSince > 2) {
-      return { id: 'A1', label: 'Data Freshness', category: 'Data', status: 'YELLOW', message: `Data is ${daysSince.toFixed(1)} days old (warn > 2 days)` };
+      return { id: 'A1', label: 'Data Freshness', category: 'Data', status: 'YELLOW', message: `Nightly data is ${daysSince.toFixed(1)} days old (warn > 2 days)` };
     }
-    return { id: 'A1', label: 'Data Freshness', category: 'Data', status: 'GREEN', message: `Data updated ${Math.floor(hoursSince)}h ago` };
+    return { id: 'A1', label: 'Data Freshness', category: 'Data', status: 'GREEN', message: `Nightly updated ${Math.floor(hoursSince)}h ago` };
   } catch {
     return { id: 'A1', label: 'Data Freshness', category: 'Data', status: 'YELLOW', message: 'Data freshness check failed — unable to query heartbeat' };
   }
@@ -722,6 +730,49 @@ function checkSectorConcentration(positions: HealthCheckPosition[], _equity: num
     return { id: 'G3', label: 'Sector Concentration', category: 'Allocation', status: 'YELLOW', message: `Sector warning: ${breaches.join(', ')}` };
   }
   return { id: 'G3', label: 'Sector Concentration', category: 'Allocation', status: 'GREEN', message: `Sector concentrations within ${(caps.sectorCap * 100).toFixed(0)}% cap` };
+}
+
+/**
+ * A7 — Sector Coverage on Open Positions.
+ *
+ * Detects the data-quality drift where a meaningful share of OPEN positions
+ * has a missing or 'Unknown' `Stock.sector`. The G3 sector-concentration
+ * check correctly buckets these under 'Unknown' but cannot tell the
+ * operator whether a breach reflects real concentration or a metadata
+ * gap. A7 surfaces the gap directly so it can be fixed at source.
+ *
+ * Status:
+ *   - GREEN  → 0 positions with missing sector
+ *   - YELLOW → up to 30% of positions (by count) missing sector
+ *   - RED    → more than 30% of positions missing sector
+ *
+ * Counts positions, not portfolio value — a single mis-tagged position is
+ * a data issue worth flagging even if it's a small £ slice.
+ *
+ * Audit 2026-06-16 (MEDIUM-8).
+ */
+export function checkSectorCoverage(positions: HealthCheckPosition[]): HealthCheckResult {
+  if (positions.length === 0) {
+    return { id: 'A7', label: 'Sector Coverage', category: 'Data', status: 'GREEN', message: 'No open positions' };
+  }
+  const missing = positions.filter((p) => {
+    const s = p.stock?.sector;
+    return !s || s.trim() === '' || s.toLowerCase() === 'unknown';
+  });
+  if (missing.length === 0) {
+    return { id: 'A7', label: 'Sector Coverage', category: 'Data', status: 'GREEN', message: `All ${positions.length} open positions have a sector` };
+  }
+  const pct = missing.length / positions.length;
+  const sample = missing.slice(0, 5).map((p) => p.stock.ticker).join(', ');
+  const more = missing.length > 5 ? ', …' : '';
+  const status: HealthStatus = pct > 0.3 ? 'RED' : 'YELLOW';
+  return {
+    id: 'A7',
+    label: 'Sector Coverage',
+    category: 'Data',
+    status,
+    message: `${missing.length}/${positions.length} (${(pct * 100).toFixed(0)}%) open positions missing sector: ${sample}${more}`,
+  };
 }
 
 async function checkHeartbeat(): Promise<HealthCheckResult> {

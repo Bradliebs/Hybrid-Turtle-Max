@@ -371,6 +371,7 @@ export const HEALTH_CHECK_ITEMS: { id: string; label: string; category: string }
   { id: 'A4', label: 'Open Position Uniqueness', category: 'Data' },
   { id: 'A5', label: 'T212 Ticker Mappings', category: 'Data' },
   { id: 'A6', label: 'Yahoo Ticker Mappings', category: 'Data' },
+  { id: 'A7', label: 'Sector Coverage', category: 'Data' },
   { id: 'C1', label: 'Equity > £0', category: 'Risk' },
   { id: 'C2', label: 'Open Risk Within Cap', category: 'Risk' },
   { id: 'C3', label: 'Valid Position Sizes', category: 'Risk' },

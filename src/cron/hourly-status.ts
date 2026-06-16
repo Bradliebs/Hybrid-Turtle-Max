@@ -143,8 +143,11 @@ async function runHourlyStatus() {
     });
 
     // Last heartbeat for auto-trade
+    // Use kind filter (added 2026-05-16 M1) instead of brittle JSON
+    // string-match on `details`. The schema migration is in place and
+    // auto-trade.ts has been writing kind='AUTO_TRADE' for over a month.
     const lastAutoTrade = await prisma.heartbeat.findFirst({
-      where: { details: { contains: 'auto-trade' } },
+      where: { kind: 'AUTO_TRADE' },
       orderBy: { timestamp: 'desc' },
       select: { timestamp: true, status: true, details: true },
     });

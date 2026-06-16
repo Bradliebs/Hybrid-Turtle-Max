@@ -30,6 +30,7 @@ $limits = @{
   'HybridTurtle-WeeklyDigest'     = 'PT10M'
   'HybridTurtle-TickerAudit'      = 'PT10M'
   'HybridTurtle-ResearchRefresh'  = 'PT20M'
+  'HybridTurtle-TelegramHeartbeat' = 'PT5M'
 }
 
 $results = @()
