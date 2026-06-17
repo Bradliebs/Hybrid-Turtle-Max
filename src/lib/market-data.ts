@@ -838,6 +838,30 @@ function isUKTicker(ticker: string): boolean {
   return ticker.endsWith('.L') || /^[A-Z]{2,5}l$/.test(ticker);
 }
 
+const ukGbpCurrencyWarnings = new Set<string>();
+
+function normalizeCurrencyCode(currency?: string | null): string | null {
+  const trimmed = currency?.trim();
+  if (!trimmed) return null;
+  if (trimmed === 'GBp') return 'GBX';
+  return trimmed.toUpperCase();
+}
+
+function getGbpNormalizationCurrency(ticker: string, stockCurrency?: string | null): string {
+  const explicitCurrency = normalizeCurrencyCode(stockCurrency);
+  if (isUKTicker(ticker) && explicitCurrency === 'GBP') {
+    if (!ukGbpCurrencyWarnings.has(ticker)) {
+      console.warn(
+        `[market-data] ${ticker} is a UK ticker with Stock.currency='GBP'; treating live price as GBX pence for GBP normalization. Update region_map.csv/Stock.currency to GBX.`
+      );
+      ukGbpCurrencyWarnings.add(ticker);
+    }
+    return 'GBX';
+  }
+
+  return explicitCurrency || (isUKTicker(ticker) ? 'GBX' : 'USD');
+}
+
 // ── Price Normalization ──
 // Yahoo Finance returns UK stocks (.L) in pence (GBX), not pounds (GBP).
 // Trading 212 also stores UK prices in GBX.
@@ -847,12 +871,9 @@ export async function normalizePriceToGBP(
   ticker: string,
   stockCurrency?: string | null
 ): Promise<number> {
-  // Determine source currency — check explicit currency first
-  const currency = stockCurrency?.toUpperCase() || (isUKTicker(ticker) ? 'GBX' : 'USD');
+  const currency = getGbpNormalizationCurrency(ticker, stockCurrency);
 
-  // UK tickers default to GBX (pence) but respect explicit stockCurrency
-  // e.g. a USD-denominated ETF on LSE would have stockCurrency='USD'
-  if (currency === 'GBX' || currency === 'GBp') {
+  if (currency === 'GBX') {
     return price / 100;
   }
 
@@ -873,11 +894,8 @@ export async function normalizeBatchPricesToGBP(
   const currenciesNeeded = new Set<string>();
 
   for (const [ticker] of Object.entries(prices)) {
-    // Determine effective currency: explicit stockCurrency takes priority,
-    // then fall back to GBX for UK tickers, USD otherwise
-    const currency = stockCurrencies[ticker]?.toUpperCase()
-      || (isUKTicker(ticker) ? 'GBX' : 'USD');
-    if (currency !== 'GBP' && currency !== 'GBX' && currency !== 'GBp') {
+    const currency = getGbpNormalizationCurrency(ticker, stockCurrencies[ticker]);
+    if (currency !== 'GBP' && currency !== 'GBX') {
       currenciesNeeded.add(currency);
     }
   }
@@ -895,11 +913,10 @@ export async function normalizeBatchPricesToGBP(
 
   const normalized: Record<string, number> = {};
   for (const [ticker, price] of Object.entries(prices)) {
-    const currency = stockCurrencies[ticker]?.toUpperCase()
-      || (isUKTicker(ticker) ? 'GBX' : 'USD');
+    const currency = getGbpNormalizationCurrency(ticker, stockCurrencies[ticker]);
     if (currency === 'GBP') {
       normalized[ticker] = price;
-    } else if (currency === 'GBX' || currency === 'GBp') {
+    } else if (currency === 'GBX') {
       normalized[ticker] = price / 100;
     } else {
       normalized[ticker] = price * (fxRates.get(currency) ?? 1);

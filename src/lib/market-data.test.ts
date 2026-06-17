@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import {
   calculateMA,
   calculateEMA,
@@ -9,8 +9,14 @@ import {
   getPriorNDayHigh,
   getActiveProvider,
   getDataFreshness,
+  normalizeBatchPricesToGBP,
+  normalizePriceToGBP,
   shouldSkipStartupPreCache,
 } from './market-data';
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 // ── Helper: generate N bars of OHLCV data sorted newest-first ──
 function makeBars(count: number, base = 100, step = 1) {
@@ -30,6 +36,39 @@ describe('shouldSkipStartupPreCache', () => {
     expect(shouldSkipStartupPreCache({ HYBRIDTURTLE_SKIP_STARTUP_PRECACHE: 'true' })).toBe(true);
     expect(shouldSkipStartupPreCache({ VITEST: 'true' })).toBe(true);
     expect(shouldSkipStartupPreCache({ HYBRIDTURTLE_SKIP_STARTUP_PRECACHE: 'false' })).toBe(false);
+  });
+});
+
+describe('GBP price normalization', () => {
+  it('treats Yahoo .L prices as GBX even when Stock.currency is stale GBP', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const normalized = await normalizeBatchPricesToGBP(
+      { 'AZN.L': 12750, RIO: 70 },
+      { 'AZN.L': 'GBP', RIO: 'GBP' }
+    );
+
+    expect(normalized['AZN.L']).toBe(127.5);
+    expect(normalized.RIO).toBe(70);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("AZN.L is a UK ticker with Stock.currency='GBP'"));
+  });
+
+  it('treats Trading212-style UK tickers as GBX when Stock.currency is stale GBP', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+
+    const normalized = await normalizeBatchPricesToGBP(
+      { AZNl: 12750 },
+      { AZNl: 'GBP' }
+    );
+
+    expect(normalized.AZNl).toBe(127.5);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("AZNl is a UK ticker with Stock.currency='GBP'"));
+  });
+
+  it('preserves exact GBp as pence before canonicalising currency codes', async () => {
+    const normalized = await normalizePriceToGBP(512.4, 'TEST', 'GBp');
+
+    expect(normalized).toBeCloseTo(5.124);
   });
 });
 
