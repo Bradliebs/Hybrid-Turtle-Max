@@ -45,6 +45,7 @@
 
 import 'dotenv/config';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import prisma from '@/lib/prisma';
 import { runFullScan } from '@/lib/scan-engine';
@@ -66,6 +67,8 @@ import { decryptField } from '@/lib/crypto';
 import { isTodayMarketHoliday, isEarlyCloseDay } from '@/lib/market-holidays';
 import { createCronLogger } from '@/lib/cron-logger';
 import { getUKDayOfWeek, getUKTimeString } from '@/lib/uk-time';
+import { groupSkipsByCategory } from '@/lib/skip-reason-category';
+import { acquireAutoTradeLock, releaseAutoTradeLock, AutoTradeLockContentionError, type LockHolder } from '@/lib/auto-trade-lock';
 
 // ── Configuration ────────────────────────────────────────────
 
@@ -939,8 +942,23 @@ async function sendSessionSummary(
 
     if (skipped.length > 0) {
       lines.push('', `<b>Skipped (${skipped.length}):</b>`);
-      for (const s of skipped) {
-        lines.push(`  ⏭ ${s.ticker} — ${s.reason}`);
+      if (skipped.length <= 5) {
+        // Few enough to enumerate — operator gets every reason in full.
+        for (const s of skipped) {
+          lines.push(`  ⏭ ${s.ticker} — ${s.reason}`);
+        }
+      } else {
+        // Group by reason category so the operator sees WHY each cohort was blocked
+        // (the user-facing pain: "Telegram says skipped but I can't see the gate").
+        const groups = groupSkipsByCategory(skipped);
+        for (const g of groups) {
+          const examples = g.exampleTickers.join(', ');
+          const more = g.count > g.exampleTickers.length ? ` +${g.count - g.exampleTickers.length}` : '';
+          lines.push(`  ⏭ <b>${g.label}</b> (${g.count}): ${examples}${more}`);
+          for (const reason of g.exampleReasons) {
+            lines.push(`     · ${reason}`);
+          }
+        }
       }
     }
   }
@@ -1662,21 +1680,132 @@ const args = process.argv.slice(2);
 const sessionArg = args.find(a => a.startsWith('--session='));
 const session = (sessionArg?.split('=')[1] || 'scan') as Session;
 
-if (!SESSION_CONFIGS[session]) {
-  console.error(`Unknown session: ${session}. Use: uk, uk-mid, us, us-mid, us-close, scan`);
-  process.exit(1);
-}
-
-runAutoTrade(session).catch(async (err) => {
-  console.error('Fatal error in auto-trade:', err);
-  // Send throttled Telegram alert on fatal crash (suppresses repeated identical crashes)
+// Run the CLI only when this file is executed directly, not when imported
+// by tests or other modules. Without this gate, importing any named export
+// would trigger a full auto-trade run + lock acquire against the real DB.
+const invokedDirectly = (() => {
   try {
-    const { sendThrottledTelegramAlert: sendThrottled } = await import('@/lib/telegram');
-    const { ALERT_CATEGORY: AC, buildAlertKey: BK } = await import('@/lib/alert-categories');
-    await sendThrottled(
-      { text: `🔥 <b>Auto-Trade CRASHED</b>\n\nSession: ${session}\nError: ${(err as Error).message}\n\nCheck logs immediately.`, parseMode: 'HTML' },
-      BK(AC.AUTO_TRADE_CRASH, session)
-    );
-  } catch { /* never block exit */ }
-  process.exit(1);
-});
+    const entry = process.argv[1];
+    if (!entry) return false;
+    const { pathToFileURL } = require('node:url') as typeof import('node:url');
+    return import.meta.url === pathToFileURL(entry).href;
+  } catch {
+    return false;
+  }
+})();
+
+if (invokedDirectly) {
+  if (!SESSION_CONFIGS[session]) {
+    console.error(`Unknown session: ${session}. Use: uk, uk-mid, us, us-mid, us-close, scan`);
+    process.exit(1);
+  }
+
+  (async () => {
+  // ── Concurrent-run lock ──
+  // Real-money safety: prevent duplicate buy orders if Task Scheduler
+  // double-fires or a manual run races with cron. Acquire BEFORE any
+  // gate checks or scanning so contention is detected instantly.
+  let lockHolder: LockHolder | null = null;
+  try {
+    const acquireResult = await acquireAutoTradeLock({
+      session,
+      pid: process.pid,
+      host: os.hostname(),
+    });
+    lockHolder = acquireResult.holder;
+
+    // Stale-lock reclaim is itself a safety signal: a previous run crashed
+    // without releasing. Surface it so the operator can investigate even
+    // though the current run is allowed to proceed.
+    if (acquireResult.reclaimedFrom) {
+      const prior = acquireResult.reclaimedFrom;
+      const ageStr = acquireResult.reclaimedAgeMinutes?.toFixed(1) ?? '?';
+      console.error(`⚠ Reclaimed stale auto-trade lock from prior crashed run (pid=${prior.pid} host=${prior.host} session=${prior.session} age=${ageStr}m).`);
+      try {
+        await prisma.heartbeat.create({
+          data: {
+            kind: 'AUTO_TRADE',
+            status: 'WARNING',
+            details: JSON.stringify({
+              type: 'auto-trade',
+              session,
+              reason: 'lock-reclaim',
+              reclaimedFrom: prior,
+              reclaimedAgeMinutes: acquireResult.reclaimedAgeMinutes,
+            }),
+          },
+        });
+      } catch { /* never block run */ }
+      try {
+        const { ALERT_CATEGORY: AC, buildAlertKey: BK } = await import('@/lib/alert-categories');
+        await sendThrottledTelegramAlert(
+          { text: `⚠️ <b>Auto-Trade Lock Reclaimed</b>\n\nSession: ${session}\nReclaimed stale lock from prior run:\npid=${prior.pid} host=${prior.host} session=${prior.session}\nage=${ageStr}m\n\nA previous run crashed without releasing. Current run proceeding — investigate prior session logs.`, parseMode: 'HTML' },
+          BK(AC.AUTO_TRADE_BLOCKED, `lock-reclaim:${session}`)
+        );
+      } catch { /* never block run */ }
+    }
+  } catch (err) {
+    if (err instanceof AutoTradeLockContentionError) {
+      const holderInfo = err.holder
+        ? `pid=${err.holder.pid} host=${err.holder.host} session=${err.holder.session} age=${err.ageMinutes?.toFixed(1)}m`
+        : 'unknown holder';
+      console.error(`✗ Auto-trade lock held — another run is in progress (${holderInfo}). Exiting.`);
+      try {
+        await prisma.heartbeat.create({
+          data: {
+            kind: 'AUTO_TRADE',
+            status: 'SKIPPED',
+            details: JSON.stringify({
+              type: 'auto-trade',
+              session,
+              reason: 'lock-contention',
+              holder: err.holder,
+              ageMinutes: err.ageMinutes,
+            }),
+          },
+        });
+      } catch { /* never block exit */ }
+      try {
+        const { ALERT_CATEGORY: AC, buildAlertKey: BK } = await import('@/lib/alert-categories');
+        await sendThrottledTelegramAlert(
+          { text: `⚠️ <b>Auto-Trade Lock Contention</b>\n\nSession: ${session}\nAnother run is in progress (${holderInfo}).\n\nThis run was skipped to prevent duplicate orders.`, parseMode: 'HTML' },
+          BK(AC.AUTO_TRADE_BLOCKED, `lock-contention:${session}`)
+        );
+      } catch { /* never block exit */ }
+      try { await prisma.$disconnect(); } catch { /* never block exit */ }
+      process.exit(2);
+    }
+    // Lock infrastructure failure (DB down, etc) — surface loudly and exit.
+    console.error('Fatal error acquiring auto-trade lock:', err);
+    try { await prisma.$disconnect(); } catch { /* never block exit */ }
+    process.exit(1);
+  }
+
+  try {
+    await runAutoTrade(session);
+  } catch (err) {
+    console.error('Fatal error in auto-trade:', err);
+    // Send throttled Telegram alert on fatal crash (suppresses repeated identical crashes)
+    try {
+      const { sendThrottledTelegramAlert: sendThrottled } = await import('@/lib/telegram');
+      const { ALERT_CATEGORY: AC, buildAlertKey: BK } = await import('@/lib/alert-categories');
+      await sendThrottled(
+        { text: `🔥 <b>Auto-Trade CRASHED</b>\n\nSession: ${session}\nError: ${(err as Error).message}\n\nCheck logs immediately.`, parseMode: 'HTML' },
+        BK(AC.AUTO_TRADE_CRASH, session)
+      );
+    } catch { /* never block exit */ }
+    try { await releaseAutoTradeLock({ holder: lockHolder }); } catch { /* never block exit */ }
+    process.exit(1);
+  }
+
+  // Clean exit path — release lock. (runAutoTrade calls prisma.$disconnect
+  // on its exit paths; Prisma auto-reconnects for the release query.)
+  try {
+    await releaseAutoTradeLock({ holder: lockHolder });
+  } catch (err) {
+    console.error('Warning: failed to release auto-trade lock:', err);
+    // Do not exit non-zero — the trading work itself succeeded. The lock's
+    // stale-recovery (STALE_LOCK_MINUTES) will reclaim it on the next run.
+  }
+  })();
+}

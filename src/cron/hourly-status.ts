@@ -39,6 +39,7 @@ import { RISK_PROFILES, type RiskProfileType, type Sleeve } from '@/types';
 import { getUKDayOfWeek, getUKHour, getUKTimeString } from '@/lib/uk-time';
 import { createCronLogger } from '@/lib/cron-logger';
 import { isEarlyCloseDay } from '@/lib/market-holidays';
+import { summarizeAutoTradeBlocker } from '@/lib/auto-trade-heartbeat-summary';
 
 const log = createCronLogger('hourly-status');
 
@@ -287,6 +288,13 @@ async function runHourlyStatus() {
     } else {
       lines.push(`<b>✅ No blockers — clear to trade</b>`);
     }
+
+    // Always show the last auto-trade run summary when it has anything
+    // diagnostic to say (reason or skipped candidates). Closes the
+    // "blocked but can't see why" gap — the user sees the SPECIFIC gate
+    // the auto-trader hit on its last attempt, not just the category.
+    const autoSummary = summarizeAutoTradeBlocker(lastAutoTrade);
+    if (autoSummary) lines.push(`  ${autoSummary}`);
     lines.push('');
 
     // ── READY candidates ──

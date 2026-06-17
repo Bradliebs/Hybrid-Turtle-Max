@@ -29,6 +29,29 @@ Each entry uses this shape (newest at top of the History section):
 
 ## History
 
+### 2026-06-16 - pending - Concurrent-run lock + skip-grouping in session summary
+
+- File(s):
+  - `src/cron/auto-trade.ts`:
+    - **Top of file**: added `import * as os from 'node:os'` and `import { acquireAutoTradeLock, releaseAutoTradeLock, AutoTradeLockContentionError, type LockHolder } from '@/lib/auto-trade-lock'`.
+    - **`sendSessionSummary`** (visibility, not trading logic): when more than 5 tickers are skipped, the existing flat ticker list is replaced by a category-grouped view via the new `categorizeSkipReason` helper (e.g. `Risk gates (4): AAPL +1; Live-price (2): GOOG, META`). Pure presentation change inside the Telegram summary string — the underlying `skippedTickers` array, decision logic, and order placement are untouched.
+    - **Bottom-of-file IIFE only** (not the `runAutoTrade` function body): added an `invokedDirectly` gate (`import.meta.url === pathToFileURL(process.argv[1])`) so that test files importing this module no longer trigger DB writes. Inside the IIFE, wrapped the existing `runAutoTrade(session)` call in a `try/finally` that (a) calls `acquireAutoTradeLock` BEFORE any work, (b) on `AutoTradeLockContentionError` writes a WARNING `Heartbeat` row, sends a throttled Telegram via `ALERT_CATEGORY.AUTO_TRADE_BLOCKED`, and exits with code 2, (c) when a stale lock is reclaimed (helper returns `reclaimedFrom` non-null) writes a WARNING heartbeat + Telegram alerting the operator that a prior run crashed, (d) on crash releases the lock + exits with code 1, (e) on clean exit releases the lock (release failures are warn-only because the 15-minute stale recovery is the safety net).
+- Why: ORACLE SYSTEM AUDIT identified two real-money risks: (1) Task Scheduler double-fire or a manual run racing with cron could allow two `auto-trade.ts` processes to size and place buy orders against the same ready candidates simultaneously, producing duplicate fills with no DB-side deduplication; (2) operator could not see WHY auto-trade was blocked on a given run — only that it was, with no per-ticker breakdown when 10+ tickers were skipped. The lock closes (1) by serializing entry across the entire process boundary, and the skip-grouping closes (2) by surfacing the specific gate (risk-gates, live-price, stop-distance, etc.) that filtered each batch.
+- Behaviour preserved:
+  - `runAutoTrade` function body is byte-for-byte unchanged. All gates, sizing, stop tiers, account routing, anti-chase, fresh-quote, revalidation, T212 calls, and persistence are untouched.
+  - The lock is acquired in the IIFE BEFORE `runAutoTrade` is invoked. If acquisition fails, `runAutoTrade` never runs — the only effect is exit code 2 + Telegram + heartbeat. This is strictly MORE conservative than the prior behaviour (which could run twice in parallel).
+  - The skip-grouping change in `sendSessionSummary` only reformats the existing string; it does not change which tickers are skipped, how many, or in what order, and it does not affect the heartbeat payload or any downstream consumer.
+  - The `invokedDirectly` gate adds a falsy branch around the IIFE; when invoked as a script (the production path) the gate is true and behaviour is unchanged. When imported (test path) the IIFE no longer runs, which is the desired safety improvement (no spurious DB writes from test imports).
+  - Sacred-file siblings (`stop-manager`, `position-sizer`, `risk-gates`, `regime-detector`, `dual-score`, `scan-engine`) untouched.
+- Tests:
+  - `npx vitest run src/lib/auto-trade-lock.test.ts` — 14/14 pass (clean acquire, fresh contention, stale reclaim with metadata, threshold boundary, custom staleMinutes, anti-stomp release, e2e acquire-fail-release-acquire).
+  - `npx vitest run src/lib/skip-reason-category.test.ts` — 13/13 pass.
+  - `npx vitest run src/lib/auto-trade-heartbeat-summary.test.ts` — 9/9 pass.
+  - Full suite: 1805/1806 (one pre-existing fetch-retry timeout flake in `src/lib/fetch-retry.test.ts:70`, unrelated, file not modified in this commit).
+  - Smoke: `tsx src/cron/auto-trade.ts <bad-session>` exits 1 cleanly (gate works).
+  - Smoke: `tsx scripts/smoke-prisma-reconnect.ts` shows clean reconnect after explicit `$disconnect()`.
+- Author: GitHub Copilot (agent), on user instruction ("I am relying on you to do the best thing" — judgment grant after audit + remediation cycle).
+
 ### 2026-06-16 - pending - Log LIVE_REVAL_SKIP rows for live-revalidation skips
 
 - File(s):
