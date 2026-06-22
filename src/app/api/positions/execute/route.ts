@@ -1,9 +1,10 @@
 /**
  * DEPENDENCIES
  * Consumed by: BuyConfirmationModal.tsx (frontend)
- * Consumes: trading212.ts, trading212-dual.ts, positions/route.ts (POST), prisma (ExecutionLog)
+ * Consumes: trading212.ts, trading212-dual.ts, positions/route.ts (POST), prisma (ExecutionLog),
+ *           place-stop-with-retry.ts, alert-service.ts
  * Risk-sensitive: YES — places real orders on Trading 212
- * Last modified: 2026-02-28
+ * Last modified: 2026-06-02 (F1: stop-placement parity — widen-retry + durable alert)
  * Notes: 4-phase execution: buy → poll → stop → DB position.
  *        Every T212 API call is logged to ExecutionLog for audit trail.
  *        Uses SSE (Server-Sent Events) to stream progress to the modal.
@@ -21,6 +22,8 @@ import { assertSubmissionAllowed, SafetyControlError } from '../../../../../pack
 import { runPreExecutionDryRun } from '@/lib/pre-execution-dry-run';
 import { getMarketRegime } from '@/lib/market-data';
 import { decryptField } from '@/lib/crypto';
+import { placeStopWithRetry } from '@/lib/place-stop-with-retry';
+import { sendAlert } from '@/lib/alert-service';
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -486,6 +489,13 @@ export async function POST(request: NextRequest) {
 
         updatePhase(2, { status: 'running' });
 
+        // Track the stop actually live at T212 so the DB row matches reality.
+        // Defaults to the intended stop: on failure the DB still records the
+        // intended stop so the nightly orphan detector (which keys off
+        // currentStop > 0 with no broker stop) re-places it.
+        let stopPlacedOk = false;
+        let actualStopPrice = stopPrice;
+
         // Safety: stop quantity MUST be negative
         const stopQuantity = -Math.abs(filledQuantity);
         if (stopQuantity >= 0) {
@@ -500,54 +510,81 @@ export async function POST(request: NextRequest) {
           // Still create DB position but flag the stop issue
           send('phase', { phases, currentPhase: 2, warning: errMsg });
         } else {
-          const stopRequest = {
-            quantity: stopQuantity,
-            stopPrice,
-            ticker: resolvedT212Ticker,
-            timeValidity: 'GOOD_TILL_CANCEL' as const,
-          };
+          // F1 (audit 2026): immediate widen-retry tier — parity with the
+          // automated path. Up to 3 attempts (~1.5s) with progressively wider
+          // stops; terminal auth errors abort early. Replaces the previous
+          // single attempt that left positions unprotected on transient 4xx/5xx.
+          const stopResult = await placeStopWithRetry({
+            client,
+            t212Ticker: resolvedT212Ticker,
+            filledPrice,
+            filledQuantity,
+            baseStopPrice: stopPrice,
+          });
 
-          try {
-            const stopOrder = await client.placeStopOrder(stopRequest);
-
+          // Audit-log every attempt (ExecutionLog trail parity with cron).
+          for (const a of stopResult.attempts) {
             await logExecution({
-              ticker, phase: 'STOP_PLACED',
-              orderId: String(stopOrder.id),
-              requestBody: JSON.stringify(stopRequest),
-              responseStatus: 200,
-              responseBody: JSON.stringify(stopOrder),
-              stopPrice,
-              quantity: stopQuantity,
+              ticker,
+              phase: a.orderId ? 'STOP_PLACED' : 'STOP_FAILED',
+              orderId: a.orderId,
+              requestBody: JSON.stringify({
+                quantity: stopQuantity,
+                stopPrice: a.stopPrice,
+                ticker: resolvedT212Ticker,
+                attempt: a.attempt,
+              }),
+              responseStatus: a.orderId ? 200 : (a.statusCode ?? null),
               accountType,
+              error: a.error,
+              stopPrice: a.stopPrice,
+              quantity: stopQuantity,
             });
+          }
 
+          if (stopResult.placed) {
+            stopPlacedOk = true;
+            actualStopPrice = stopResult.stopPrice;
+            const retryNote = stopResult.attempts.length > 1
+              ? ` (after ${stopResult.attempts.length} attempts)`
+              : '';
             updatePhase(2, {
               status: 'success',
-              message: `Stop-loss set @ ${stopPrice.toFixed(4)} (ID: ${stopOrder.id})`,
-              orderId: stopOrder.id,
+              message: `Stop-loss set @ ${actualStopPrice.toFixed(4)}${retryNote} (ID: ${stopResult.orderId})`,
+              orderId: stopResult.orderId ? Number(stopResult.orderId) : undefined,
             });
-          } catch (err) {
-            const msg = err instanceof Trading212Error
-              ? `T212 API error ${err.statusCode}: ${err.message}`
-              : (err as Error).message;
+          } else {
+            const lastErr = stopResult.attempts.at(-1)?.error ?? 'unknown error';
 
-            await logExecution({
-              ticker, phase: 'STOP_FAILED',
-              requestBody: JSON.stringify(stopRequest),
-              responseStatus: err instanceof Trading212Error ? err.statusCode : null,
-              accountType, error: msg, stopPrice,
-              quantity: stopQuantity,
+            // CRITICAL: Stop failed after all retries but shares are bought.
+            updatePhase(2, { status: 'failed', message: `CRITICAL: ${lastErr}` });
+
+            // Durable alert — survives the modal closing (fixes the prior
+            // ephemeral-SSE-only gap). Saved in-app + Telegram (CRITICAL).
+            await sendAlert({
+              type: 'UNPROTECTED_POSITION',
+              title: `Unprotected position: ${ticker}`,
+              message: `Manual buy of ${filledQuantity} ${ticker} @ ${filledPrice.toFixed(4)} filled, but the stop-loss failed to place after ${stopResult.attempts.length} attempt(s)${stopResult.terminal ? ' (terminal auth/permission error)' : ''}. Set a stop @ ~${stopPrice.toFixed(4)} in the T212 app NOW.`,
+              priority: 'CRITICAL',
+              data: {
+                ticker,
+                filledPrice,
+                filledQuantity,
+                intendedStop: stopPrice,
+                accountType,
+                attempts: stopResult.attempts.length,
+                terminal: stopResult.terminal,
+                source: 'manual-execute',
+              },
             });
 
-            // CRITICAL: Stop failed but shares are bought — user MUST set stop manually
-            updatePhase(2, { status: 'failed', message: `CRITICAL: ${msg}` });
-
-            // Don't abort — still create DB position, but send critical warning
+            // Don't abort — still create DB position so the orphan detector can
+            // recover it; send the critical SSE warning for the live modal too.
             send('phase', {
               phases,
               currentPhase: 2,
               critical: true,
-              warning: `CRITICAL: Stop-loss failed to place on T212. You MUST set a stop-loss manually at ${stopPrice.toFixed(4)} immediately. Error: ${msg}`,
+              warning: `CRITICAL: Stop-loss failed after ${stopResult.attempts.length} attempt(s). A durable alert was sent. Set a stop-loss manually at ${stopPrice.toFixed(4)} immediately. Error: ${lastErr}`,
             });
           }
         }
@@ -555,6 +592,33 @@ export async function POST(request: NextRequest) {
         // ════════════════════════════════════════════════════
         //  PHASE D: Create DB Position (reuse existing POST logic)
         // ════════════════════════════════════════════════════
+
+        // Durable alert for a LIVE fill that could not be recorded in the DB.
+        // The buy (and possibly the stop) are already live on T212, so a failure
+        // here leaves a position recorded nowhere. Routed as ORPHAN_T212_FILL so
+        // hourly-status re-surfaces it until the operator reconciles; deduped by
+        // buy order id to match the cron orphan-recovery path. sendAlert never throws.
+        const alertUnrecordedFill = (dbError: string) =>
+          sendAlert({
+            type: 'ORPHAN_T212_FILL',
+            title: `Live fill not recorded: ${ticker}`,
+            message: `Manual buy of ${filledQuantity} ${ticker} @ ${filledPrice.toFixed(4)} (${accountType}) filled on T212, but the position could not be saved to the database. Create it manually. Stop ${stopPlacedOk ? `is live @ ${actualStopPrice.toFixed(4)}` : `is NOT live — set one @ ~${stopPrice.toFixed(4)} too`}.`,
+            priority: 'CRITICAL',
+            notificationDedupeKey: `orphan-${buyOrder.id}`,
+            telegramDedupeKey: `orphan-${buyOrder.id}`,
+            data: {
+              source: 'manual-execute',
+              orderId: buyOrder.id,
+              ticker,
+              t212Ticker,
+              filledPrice,
+              filledQuantity,
+              stopPlaced: stopPlacedOk,
+              stopPrice: stopPlacedOk ? actualStopPrice : stopPrice,
+              accountType,
+              dbError,
+            },
+          });
 
         updatePhase(3, { status: 'running' });
 
@@ -568,7 +632,7 @@ export async function POST(request: NextRequest) {
               stockId: resolvedStockId,
               entryPrice: filledPrice,
               shares: filledQuantity,
-              stopLoss: stopPrice,
+              stopLoss: actualStopPrice,
               atrAtEntry,
               adxAtEntry,
               scanStatus,
@@ -598,6 +662,8 @@ export async function POST(request: NextRequest) {
               accountType, error: errMsg,
             });
 
+            await alertUnrecordedFill(errMsg);
+
             updatePhase(3, { status: 'failed', message: errMsg });
             send('error', {
               error: `Position record failed to save. The trade IS live on T212. Create manually: ${filledQuantity} shares @ ${filledPrice.toFixed(4)}, stop @ ${stopPrice.toFixed(4)}`,
@@ -615,7 +681,7 @@ export async function POST(request: NextRequest) {
             requestBody: JSON.stringify({ positionId: positionData.id }),
             responseStatus: 201,
             responseBody: JSON.stringify(positionData),
-            stopPrice,
+            stopPrice: actualStopPrice,
             quantity: filledQuantity,
             accountType,
           });
@@ -634,12 +700,12 @@ export async function POST(request: NextRequest) {
               t212Ticker,
               filledQuantity,
               filledPrice,
-              stopPrice,
+              stopPrice: actualStopPrice,
               orderId: buyOrder.id,
               accountType,
             },
-            // Flag if stop placement failed (phases[2].status === 'failed')
-            stopFailed: phases[2].status === 'failed',
+            // Flag if stop placement failed (no broker stop is live)
+            stopFailed: !stopPlacedOk,
           });
 
         } catch (err) {
@@ -649,6 +715,8 @@ export async function POST(request: NextRequest) {
             requestBody: JSON.stringify({ filledPrice, filledQuantity }),
             accountType, error: msg,
           });
+
+          await alertUnrecordedFill(msg);
 
           updatePhase(3, { status: 'failed', message: msg });
           send('error', {

@@ -8,6 +8,10 @@ vi.mock('./fetch-retry', async () => {
 
 import { withRetry, YAHOO_RETRY_ENABLED } from './fetch-retry';
 
+// Inject an instant no-op delay so retry tests don't wait through the real
+// exponential backoff (1→2→4→8→16s) and trip Vitest's 5s timeout.
+const noSleep = async () => {};
+
 describe('withRetry', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -26,7 +30,7 @@ describe('withRetry', () => {
       .mockRejectedValueOnce(new Error('HTTP 503 Service Unavailable'))
       .mockResolvedValueOnce({ price: 42 });
 
-    const result = await withRetry(fn, 'test:503-retry');
+    const result = await withRetry(fn, 'test:503-retry', noSleep);
     expect(result).toEqual({ price: 42 });
     expect(fn).toHaveBeenCalledTimes(3);
   });
@@ -36,7 +40,7 @@ describe('withRetry', () => {
       .mockRejectedValueOnce(new Error('429 Too Many Requests'))
       .mockResolvedValueOnce({ data: 'ok' });
 
-    const result = await withRetry(fn, 'test:429');
+    const result = await withRetry(fn, 'test:429', noSleep);
     expect(result).toEqual({ data: 'ok' });
     expect(fn).toHaveBeenCalledTimes(2);
   });
@@ -46,7 +50,7 @@ describe('withRetry', () => {
       .mockRejectedValueOnce(new Error('fetch failed'))
       .mockResolvedValueOnce('ok');
 
-    const result = await withRetry(fn, 'test:network');
+    const result = await withRetry(fn, 'test:network', noSleep);
     expect(result).toBe('ok');
     expect(fn).toHaveBeenCalledTimes(2);
   });
@@ -71,9 +75,9 @@ describe('withRetry', () => {
     const fn = vi.fn()
       .mockRejectedValue(new Error('HTTP 503 Service Unavailable'));
 
-    await expect(withRetry(fn, 'test:exhaust')).rejects.toThrow('503');
-    // MAX_RETRIES = 3, so 3 total attempts
-    expect(fn).toHaveBeenCalledTimes(3);
+    await expect(withRetry(fn, 'test:exhaust', noSleep)).rejects.toThrow('503');
+    // MAX_RETRIES = 5, so 5 total attempts (retries on attempts 0-3, throws on attempt 4)
+    expect(fn).toHaveBeenCalledTimes(5);
   });
 
   it('YAHOO_RETRY_ENABLED is true by default', () => {

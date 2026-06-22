@@ -13,7 +13,7 @@ import type { NextRequest } from 'next/server';
 
 // ── Hoisted Mocks ────────────────────────────────────────────
 
-const { prismaMock, mockClient, mockEnsureDefaultUser, mockAssertSubmissionAllowed, MockSafetyControlError } = vi.hoisted(() => {
+const { prismaMock, mockClient, mockEnsureDefaultUser, mockAssertSubmissionAllowed, MockSafetyControlError, mockSendAlert } = vi.hoisted(() => {
   const mockClient = {
     placeMarketOrder: vi.fn(),
     getOrder: vi.fn(),
@@ -41,6 +41,7 @@ const { prismaMock, mockClient, mockEnsureDefaultUser, mockAssertSubmissionAllow
     mockEnsureDefaultUser: vi.fn().mockResolvedValue('default-user'),
     mockAssertSubmissionAllowed: vi.fn().mockResolvedValue(undefined),
     MockSafetyControlError,
+    mockSendAlert: vi.fn().mockResolvedValue(undefined),
   };
 });
 
@@ -51,6 +52,10 @@ vi.mock('@/lib/prisma', () => ({
 vi.mock('@/lib/default-user', () => ({
   ensureDefaultUser: mockEnsureDefaultUser,
   DEFAULT_USER_ID: 'default-user',
+}));
+
+vi.mock('@/lib/alert-service', () => ({
+  sendAlert: mockSendAlert,
 }));
 
 vi.mock('../../../../../packages/workflow/src', () => ({
@@ -556,6 +561,15 @@ describe('POST /api/positions/execute', () => {
       expect(errorEvent).toBeDefined();
       expect(errorEvent!.data.critical).toBe(true);
       expect(errorEvent!.data.error).toContain('IS live on T212');
+
+      // Durable alert must fire so the live-but-unrecorded fill survives the
+      // modal closing and is re-surfaced by hourly-status until reconciled.
+      expect(mockSendAlert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'ORPHAN_T212_FILL',
+          priority: 'CRITICAL',
+        })
+      );
     }, 30_000);
   });
 

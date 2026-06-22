@@ -257,7 +257,10 @@ export class Trading212Client {
    *   This is the form T212 issues when generating an API key from the mobile app today; many
    *   users only ever see a single token and never receive a separate secret.
    */
-  constructor(apiKey: string, apiSecret: string = '', environment: Trading212Environment = 'live') {
+  // `environment` is REQUIRED (audit F3): a silent default would let a caller
+  // that forgot the argument transact on the wrong account. The live/demo
+  // choice must be an explicit, compile-time-enforced decision at every site.
+  constructor(apiKey: string, apiSecret: string = '', environment: Trading212Environment) {
     this.baseUrl = BASE_URLS[environment];
     if (apiSecret && apiSecret.length > 0) {
       // HTTP Basic Auth: base64(API_KEY:API_SECRET) — the documented key-pair scheme

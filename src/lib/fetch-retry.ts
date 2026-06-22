@@ -53,11 +53,14 @@ function isTransientError(error: unknown): boolean {
  *
  * @param fn        The async function to execute
  * @param label     A descriptive label for logging (e.g. ticker name)
+ * @param sleep     Delay function (ms). Defaults to real setTimeout; injectable so
+ *                  tests can run the backoff loop instantly without real waits.
  * @returns         The result of fn(), or throws after all retries exhausted
  */
 export async function withRetry<T>(
   fn: () => Promise<T>,
-  label: string
+  label: string,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise(resolve => setTimeout(resolve, ms))
 ): Promise<T> {
   if (!YAHOO_RETRY_ENABLED) return fn();
 
@@ -78,7 +81,7 @@ export async function withRetry<T>(
       console.warn(
         `[Retry] ${label} — attempt ${attempt + 1}/${MAX_RETRIES} failed: ${(error as Error).message}. Retrying in ${delay}ms...`
       );
-      await new Promise(resolve => setTimeout(resolve, delay));
+      await sleep(delay);
     }
   }
 
