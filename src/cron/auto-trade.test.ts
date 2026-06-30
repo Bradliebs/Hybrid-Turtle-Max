@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { revalidateLivePrice, evaluateHealthGate, HEALTH_STALE_HOURS } from './auto-trade';
+import { revalidateLivePrice, evaluateHealthGate, HEALTH_STALE_HOURS, detectRoutingLeak, NO_ACCOUNT_SKIP_REASON } from './auto-trade';
 
 /**
  * Auto-trade safety gate tests.
@@ -441,6 +441,51 @@ describe('auto-trade: heartbeat skip-reason logging', () => {
     const json = JSON.stringify({ skipReasons: skipped.map(s => ({ ticker: s.ticker, reason: s.reason })) });
     const back = JSON.parse(json) as { skipReasons: Array<{ ticker: string; reason: string }> };
     expect(back.skipReasons[0]).toEqual(skipped[0]);
+  });
+});
+
+describe('auto-trade: routing-leak silent-failure guard', () => {
+  // Contract: a session that found candidates, passed them through every risk
+  // gate, but executed nothing because no T212 account would route them is a
+  // SILENT failure (heartbeats reported OK while every buy was blocked). The
+  // guard escalates this to PARTIAL + alert. The detector must be targeted so
+  // it never fires on a normal no-trade day or when trades still flow.
+
+  it('fires when a candidate is routing-blocked and nothing executed', () => {
+    const skipped = [{ ticker: 'AAPL', reason: NO_ACCOUNT_SKIP_REASON }];
+    expect(detectRoutingLeak(skipped, 0)).toBe(true);
+  });
+
+  it('fires for multiple routing-blocked candidates with zero executed', () => {
+    const skipped = [
+      { ticker: 'AAPL', reason: NO_ACCOUNT_SKIP_REASON },
+      { ticker: 'MSFT', reason: NO_ACCOUNT_SKIP_REASON },
+    ];
+    expect(detectRoutingLeak(skipped, 0)).toBe(true);
+  });
+
+  it('does NOT fire when at least one trade executed (partial gap, not a leak)', () => {
+    const skipped = [{ ticker: 'AAPL', reason: NO_ACCOUNT_SKIP_REASON }];
+    expect(detectRoutingLeak(skipped, 1)).toBe(false);
+  });
+
+  it('does NOT fire on a normal no-trade day (only benign skips)', () => {
+    const skipped = [
+      { ticker: 'AAPL', reason: 'Price fell back below trigger since scan (live 99.80 < trigger 100.00)' },
+      { ticker: 'MSFT', reason: 'Risk gates: SLEEVE_CAP' },
+      { ticker: 'GSK.L', reason: 'No T212 ticker mapped' },
+    ];
+    expect(detectRoutingLeak(skipped, 0)).toBe(false);
+  });
+
+  it('does NOT fire when nothing was skipped at all', () => {
+    expect(detectRoutingLeak([], 0)).toBe(false);
+  });
+
+  it('keys on the exact reason string emitted at the skip site', () => {
+    // Guards against drift: the detector keys on the shared constant, so the
+    // emit site and the detector can never silently diverge.
+    expect(NO_ACCOUNT_SKIP_REASON.startsWith('No suitable T212 account')).toBe(true);
   });
 });
 

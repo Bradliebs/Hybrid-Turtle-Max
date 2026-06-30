@@ -19,12 +19,12 @@ export const EXPECTED_TASKS = [
   { name: 'HybridTurtle Nightly', requiredPath: 'nightly-task.bat', registerScript: 'register-nightly-task.ps1', expectedTimeLimit: 'PT45M' },
   { name: 'HybridTurtle Watchdog', requiredPath: 'watchdog-task.bat', registerScript: 'register-watchdog-task.bat', expectedTimeLimit: 'PT10M' },
   { name: 'HybridTurtle Midday Sync', requiredPath: 'midday-sync-task.bat', registerScript: 'register-midday-sync.ps1', expectedTimeLimit: 'PT15M' },
-  { name: 'HybridTurtle-Scan', requiredPath: 'auto-trade-task.bat', requiredArgument: 'scan', registerScript: 'register-auto-trade.bat', expectedTimeLimit: 'PT20M' },
-  { name: 'HybridTurtle-Trade-UK', requiredPath: 'auto-trade-task.bat', requiredArgument: 'uk', registerScript: 'register-auto-trade.bat', expectedTimeLimit: 'PT20M' },
-  { name: 'HybridTurtle-Trade-UKM', requiredPath: 'auto-trade-task.bat', requiredArgument: 'uk-mid', registerScript: 'register-auto-trade.bat', expectedTimeLimit: 'PT20M' },
-  { name: 'HybridTurtle-Trade-US', requiredPath: 'auto-trade-task.bat', requiredArgument: 'us', registerScript: 'register-auto-trade.bat', expectedTimeLimit: 'PT20M' },
-  { name: 'HybridTurtle-Trade-USM', requiredPath: 'auto-trade-task.bat', requiredArgument: 'us-mid', registerScript: 'register-auto-trade.bat', expectedTimeLimit: 'PT20M' },
-  { name: 'HybridTurtle-Trade-USC', requiredPath: 'auto-trade-task.bat', requiredArgument: 'us-close', registerScript: 'register-auto-trade.bat', expectedTimeLimit: 'PT20M' },
+  { name: 'HybridTurtle-Scan', requiredPath: 'auto-trade-task.bat', requiredArgument: 'scan', registerScript: 'register-auto-trade.bat', expectedTimeLimit: 'PT30M' },
+  { name: 'HybridTurtle-Trade-UK', requiredPath: 'auto-trade-task.bat', requiredArgument: 'uk', registerScript: 'register-auto-trade.bat', expectedTimeLimit: 'PT30M' },
+  { name: 'HybridTurtle-Trade-UKM', requiredPath: 'auto-trade-task.bat', requiredArgument: 'uk-mid', registerScript: 'register-auto-trade.bat', expectedTimeLimit: 'PT30M' },
+  { name: 'HybridTurtle-Trade-US', requiredPath: 'auto-trade-task.bat', requiredArgument: 'us', registerScript: 'register-auto-trade.bat', expectedTimeLimit: 'PT30M' },
+  { name: 'HybridTurtle-Trade-USM', requiredPath: 'auto-trade-task.bat', requiredArgument: 'us-mid', registerScript: 'register-auto-trade.bat', expectedTimeLimit: 'PT30M' },
+  { name: 'HybridTurtle-Trade-USC', requiredPath: 'auto-trade-task.bat', requiredArgument: 'us-close', registerScript: 'register-auto-trade.bat', expectedTimeLimit: 'PT30M' },
   { name: 'HybridTurtle-HourlyStatus', requiredPath: 'hourly-status-task.bat', registerScript: 'register-auto-trade.bat', expectedTimeLimit: 'PT5M' },
   { name: 'HybridTurtle-MondayBriefing', requiredPath: 'monday-briefing-task.bat', registerScript: 'scripts/register-weekly-tasks.ps1', expectedTimeLimit: 'PT10M' },
   { name: 'HybridTurtle-UKBriefing', requiredPath: 'uk-briefing-task.bat', registerScript: 'scripts/register-weekly-tasks.ps1', expectedTimeLimit: 'PT10M' },
@@ -164,7 +164,7 @@ export function auditScheduledTasks(tasks, options = {}) {
           severity: tradeCritical ? 'ERROR' : 'WARNING',
           taskName,
           reason: 'SCHEDULER_TERMINATED_LAST_RUN',
-          detail: `Last Result is ${lastResult} (SCHED_S_TASK_TERMINATED). Windows Task Scheduler killed the task at its ExecutionTimeLimit before it finished. Re-run npm run tasks:apply-limits (admin) to push the updated PT20M/PT45M limits to live tasks.`,
+          detail: `Last Result is ${lastResult} (SCHED_S_TASK_TERMINATED). Windows Task Scheduler killed the task at its ExecutionTimeLimit before it finished. Re-run npm run tasks:apply-limits (admin) to push the updated PT30M/PT45M limits to live tasks.`,
         });
       } else {
         findings.push({ severity: 'WARNING', taskName, reason: 'NON_ZERO_LAST_RESULT', detail: `Last Result is ${lastResult}` });

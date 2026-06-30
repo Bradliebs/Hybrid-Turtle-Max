@@ -3,11 +3,12 @@ $bat = Join-Path $scriptDir "auto-trade-task.bat"
 $hs  = Join-Path $scriptDir "hourly-status-task.bat"
 
 # Helper: make a task resilient (run on battery, don't stop on idle, catch up if missed)
-# NOTE: PT20M for the auto-trade scan/trade tasks. The full scan over the
+# NOTE: PT30M for the auto-trade scan/trade tasks. The full scan over the
 # ~1149-ticker universe (Yahoo fetches + earnings lookups + grading + T212
 # order placement + stops) routinely exceeds 10 minutes and the scheduler
 # would otherwise terminate the .bat with Last Result = 267014 before any
-# buys are placed. Hourly-status stays at PT5M (it only summarises state).
+# buys are placed (PT20M still hit this on rate-limit days, e.g. 2026-06-30
+# us-mid). Hourly-status stays at PT5M (it only summarises state).
 function Set-TaskResilient($name) {
   $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
   if ($task) {
@@ -15,7 +16,7 @@ function Set-TaskResilient($name) {
     $task.Settings.StopIfGoingOnBatteries = $false
     $task.Settings.IdleSettings.StopOnIdleEnd = $false
     $task.Settings.StartWhenAvailable = $true
-    $task.Settings.ExecutionTimeLimit = "PT20M"
+    $task.Settings.ExecutionTimeLimit = "PT30M"
     Set-ScheduledTask -InputObject $task | Out-Null
   }
 }

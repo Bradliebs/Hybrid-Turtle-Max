@@ -34,7 +34,7 @@ export function checkSchedulerKills(findings: readonly AuditFinding[]): string[]
     lines.push(`  ${tag} ${kill.taskName}`);
   }
   lines.push('');
-  lines.push('No buys/syncs were placed by the killed runs. Run `npm run tasks:apply-limits` (admin) to push the updated PT20M/PT45M ExecutionTimeLimits.');
+  lines.push('No buys/syncs were placed by the killed runs. Run `npm run tasks:apply-limits` (admin) to push the updated PT30M/PT45M ExecutionTimeLimits.');
   return [lines.join('\n')];
 }
 

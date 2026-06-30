@@ -241,6 +241,35 @@ export function evaluateHealthGate(
   return { block: false, reason: '' };
 }
 
+/**
+ * Reason pushed when a candidate passes every risk gate but no connected T212
+ * account will route it (stock not isaEligible and no Invest account, or the
+ * routed account is disconnected). Shared by the skip-emit site and the
+ * routing-leak detector so the two can never drift apart.
+ */
+export const NO_ACCOUNT_SKIP_REASON =
+  'No suitable T212 account (tag stock isaEligible=true to allow ISA routing, or connect Invest account)';
+
+/**
+ * Detects a silent routing leak: candidates passed every gate but the session
+ * executed nothing because no T212 account would accept them. This is the
+ * failure mode that ran undetected (the isaEligible universe was untagged, so
+ * every buy was routed to nowhere while heartbeats still reported OK).
+ *
+ * Targeted by design — returns true ONLY when at least one candidate was
+ * blocked on routing AND zero trades executed. A partial gap where some trades
+ * still flow is not a leak (it already surfaces in skipReasons) and must not
+ * fire, to avoid an over-eager alert.
+ */
+export function detectRoutingLeak(
+  skipped: ReadonlyArray<{ reason: string }>,
+  successCount: number,
+): boolean {
+  if (successCount > 0) return false;
+  return skipped.some(s => s.reason === NO_ACCOUNT_SKIP_REASON);
+}
+
+
 type Session = 'uk' | 'uk-mid' | 'us' | 'us-mid' | 'us-close' | 'scan';
 
 interface SessionConfig {
@@ -1547,7 +1576,7 @@ async function runAutoTrade(session: Session) {
       // Routed account not connected, or stock not isaEligible and no Invest account.
       skipped.push({
         ticker: candidate.ticker,
-        reason: 'No suitable T212 account (tag stock isaEligible=true to allow ISA routing, or connect Invest account)',
+        reason: NO_ACCOUNT_SKIP_REASON,
       });
       continue;
     }
@@ -1648,7 +1677,11 @@ async function runAutoTrade(session: Session) {
   const successCount = tradeResults.filter(r => r.success).length;
   const failCount = tradeResults.filter(r => !r.success).length;
   const unprotectedCount = tradeResults.filter(r => r.success && !r.stopPlaced).length;
-  const heartbeatStatus = failCount > 0 || unprotectedCount > 0 ? 'PARTIAL' : 'OK';
+  // Silent-failure guard: candidates cleared every gate but nothing executed
+  // because no T212 account would route them. Escalate to PARTIAL so this can't
+  // run silently (it previously did, for weeks, while heartbeats said OK).
+  const routingLeak = detectRoutingLeak(skipped, successCount);
+  const heartbeatStatus = failCount > 0 || unprotectedCount > 0 || routingLeak ? 'PARTIAL' : 'OK';
 
   await prisma.heartbeat.create({
     data: {
@@ -1663,12 +1696,27 @@ async function runAutoTrade(session: Session) {
         executed: successCount,
         failed: failCount,
         unprotected: unprotectedCount,
+        routingLeak,
         skipped: skipped.length,
         skipReasons: skipped.map(s => ({ ticker: s.ticker, reason: s.reason })),
         trades: tradeResults.map(r => ({ ticker: r.ticker, success: r.success, stopPlaced: r.stopPlaced })),
       }),
     },
   });
+
+  // Surface the routing leak loudly — throttled so it resurfaces while the leak
+  // persists but does not spam every session. Best-effort: never block completion.
+  if (routingLeak) {
+    const noAccountSkips = skipped.filter(s => s.reason === NO_ACCOUNT_SKIP_REASON).length;
+    console.warn(`\n  ⚠ Routing leak: ${noAccountSkips} candidate(s) passed all gates but no T212 account would route them — 0 executed.`);
+    try {
+      const { ALERT_CATEGORY: AC, buildAlertKey: BK } = await import('@/lib/alert-categories');
+      await sendThrottledTelegramAlert(
+        { text: `⚠️ <b>Auto-Trade Routing Leak</b>\n\nSession: ${session}\n${noAccountSkips} candidate(s) passed all risk gates but no T212 account would accept them — 0 trades executed.\n\nLikely cause: stocks not tagged isaEligible=true, or no T212 account connected. Buys are silently blocked until this is fixed.`, parseMode: 'HTML' },
+        BK(AC.AUTO_TRADE_ROUTING_LEAK, session),
+      );
+    } catch { /* never block run completion */ }
+  }
 
   console.log(`\n  Done: ${successCount} trades executed, ${failCount} failed, ${skipped.length} skipped`);
   await prisma.$disconnect();

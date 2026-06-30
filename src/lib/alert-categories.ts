@@ -20,6 +20,7 @@ export const ALERT_CATEGORY = {
   AUTO_TRADE_CRASH: 'auto-trade:crash',
   AUTO_TRADE_BLOCKED: 'auto-trade:blocked',
   AUTO_TRADE_SCAN_FAIL: 'auto-trade:scan-fail',
+  AUTO_TRADE_ROUTING_LEAK: 'auto-trade:routing-leak',
   HOURLY_STATUS_FAIL: 'hourly-status:fail',
 } as const;
 

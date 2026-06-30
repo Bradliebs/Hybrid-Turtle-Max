@@ -29,7 +29,22 @@ Each entry uses this shape (newest at top of the History section):
 
 ## History
 
-### 2026-06-16 - pending - Concurrent-run lock + skip-grouping in session summary
+### 2026-06-30 — pending — Silent routing-leak guard (advisory-only) alongside ISA-eligibility tagging
+
+- File(s):
+  - `src/cron/auto-trade.ts`:
+    - Added exported `NO_ACCOUNT_SKIP_REASON` constant, shared between the skip-emit site (the `if (!accountType)` branch) and the new detector so the two cannot drift apart. The emit site now references the constant instead of an inline literal (same string value).
+    - Added exported pure helper `detectRoutingLeak(skipped, successCount)` near `evaluateHealthGate`. Returns `true` ONLY when `successCount === 0` AND at least one skip reason equals `NO_ACCOUNT_SKIP_REASON`. Deliberately targeted: a partial gap where some trades still flow does NOT fire.
+    - In the end-of-`runAutoTrade` heartbeat block: compute `routingLeak = detectRoutingLeak(skipped, successCount)`, fold it into `heartbeatStatus` (now `PARTIAL` when `failCount > 0 || unprotectedCount > 0 || routingLeak`), add `routingLeak` to the heartbeat `details` JSON, and when `routingLeak` is true emit a throttled Telegram alert via the new `ALERT_CATEGORY.AUTO_TRADE_ROUTING_LEAK` (wrapped in try/catch — never blocks completion).
+  - `src/lib/alert-categories.ts`: new `AUTO_TRADE_ROUTING_LEAK: 'auto-trade:routing-leak'` category.
+  - `src/cron/auto-trade.test.ts`: +6 unit tests for `detectRoutingLeak` (fires on routing-block + 0 executed; does NOT fire on partial gap, benign-skip no-trade days, or empty skip list).
+  - New scripts (non-sacred, supporting the data fix): `scripts/tag-isa-eligible-shares.ts` (dry-run default, `--apply` to commit, idempotent — tags the tradable universe `isaEligible=true`, excluding only US-listed non-UCITS ETFs), `scripts/analyze-isa-eligibility.ts` and `scripts/diagnose-buy-activity.ts` (read-only diagnostics).
+- Why: The buy pipeline was a closed valve — 0 of 1363 stocks had `isaEligible=true`, so `getAccountTypeForStock` returned `null` for every candidate and every buy was skipped with "No suitable T212 account" while heartbeats still reported `OK`. This ran silently. The real fix is DATA (tag the eligible universe; applied 2026-06-30, 996 rows). This guard ensures the same silent valve-closed condition can never recur undetected: it escalates the heartbeat to `PARTIAL` and alerts.
+- Behaviour preserved: The guard is ADVISORY/observability-only. It does NOT change which trades execute, gate, size, or block anything — it only reads `skipped`/`successCount` already in scope, escalates the heartbeat status string, adds one detail field, and sends one best-effort alert. Order placement, fill detection, stop placement, regime gate, attempt cap, terminal abort, account routing, sizing, FX, and all TradeLog/heartbeat writes are unchanged. The skip-emit edit is a literal→constant swap with identical value. Sacred-file siblings untouched.
+- Tests: `npx vitest run src/cron/auto-trade.test.ts` — 59/59 pass (53 existing + 6 new). `get_errors` clean on `auto-trade.ts`, `auto-trade.test.ts`, `alert-categories.ts`.
+- Author: GitHub Copilot (agent), on user instruction (approved option 2: add the silent-failure guard).
+
+
 
 - File(s):
   - `src/cron/auto-trade.ts`:

@@ -241,6 +241,7 @@ GD
 TDG
 AXON
 LHX
+SPCX
 
 # ========== INDUSTRIALS (additions) ==========
 TT
