@@ -12,6 +12,7 @@ import {
   buildSyncIndex,
   findExistingForSync,
   isExistingStillActive,
+  selectStockForSync,
   shouldSkipForCrossAccountDuplicate,
   type ExistingSyncPosition,
 } from './trading212-sync-merge';
@@ -69,6 +70,26 @@ describe('trading212-sync-merge: findExistingForSync', () => {
     ]);
     const found = findExistingForSync(idx, { ticker: 'UNFI', fullTicker: 'UNFI_US_EQ' });
     expect(found?.id).toBe('full');
+  });
+});
+
+describe('trading212-sync-merge: selectStockForSync', () => {
+  it('prefers the canonical row with the matching full T212 ticker over a bare-ticker stub', () => {
+    const matches = [
+      { id: 'stub', ticker: 'ALVd', t212Ticker: null },
+      { id: 'canonical', ticker: 'ALV', t212Ticker: 'ALVd_EQ' },
+    ];
+
+    expect(selectStockForSync(matches, { ticker: 'ALVd', fullTicker: 'ALVd_EQ' })?.id).toBe('canonical');
+  });
+
+  it('falls back to the exact bare ticker when no full-ticker mapping exists', () => {
+    const matches = [
+      { id: 'other', ticker: 'ALV', t212Ticker: null },
+      { id: 'exact', ticker: 'ALVd', t212Ticker: null },
+    ];
+
+    expect(selectStockForSync(matches, { ticker: 'ALVd', fullTicker: 'ALVd_EQ' })?.id).toBe('exact');
   });
 });
 

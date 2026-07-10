@@ -28,6 +28,7 @@ import {
   buildSyncIndex,
   findExistingForSync,
   isExistingStillActive,
+  selectStockForSync,
   shouldSkipForCrossAccountDuplicate,
 } from '@/lib/trading212-sync-merge';
 import {
@@ -209,11 +210,14 @@ export async function POST(request: NextRequest) {
             // to findUnique.
             const candidates = getCanonicalStockTickerCandidates(pos.ticker);
             const matches = await tx.stock.findMany({
-              where: { ticker: { in: candidates } },
+              where: {
+                OR: [
+                  { t212Ticker: pos.fullTicker },
+                  { ticker: { in: candidates } },
+                ],
+              },
             });
-            // Prefer an exact match on pos.ticker (preserves prior behaviour);
-            // otherwise fall back to the first canonical alternative.
-            let stock = matches.find((s) => s.ticker === pos.ticker) ?? matches[0] ?? null;
+            let stock = selectStockForSync(matches, pos);
 
             if (!stock) {
               stock = await tx.stock.create({

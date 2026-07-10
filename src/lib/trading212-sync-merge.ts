@@ -20,6 +20,11 @@ export interface MappedSyncPosition {
   fullTicker: string;   // T212 ticker, e.g. UNFI_US_EQ
 }
 
+export interface SyncStockCandidate {
+  ticker: string;
+  t212Ticker: string | null;
+}
+
 export interface SyncIndex<T extends ExistingSyncPosition> {
   byFullTicker: Map<string, T>;
   byBareTicker: Map<string, T>;
@@ -52,6 +57,21 @@ export function findExistingForSync<T extends ExistingSyncPosition>(
   pos: MappedSyncPosition,
 ): T | null {
   return index.byFullTicker.get(pos.fullTicker) ?? index.byBareTicker.get(pos.ticker) ?? null;
+}
+
+/**
+ * Select the canonical Stock row for a broker holding. The full T212 ticker
+ * is the strongest key because broker display tickers can differ from the
+ * Yahoo/canonical ticker stored by the scanner (for example ALVd -> ALV).
+ */
+export function selectStockForSync<T extends SyncStockCandidate>(
+  matches: T[],
+  pos: MappedSyncPosition,
+): T | null {
+  return matches.find((stock) => stock.t212Ticker === pos.fullTicker)
+    ?? matches.find((stock) => stock.ticker === pos.ticker)
+    ?? matches[0]
+    ?? null;
 }
 
 /**
