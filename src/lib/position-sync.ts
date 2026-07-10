@@ -51,6 +51,32 @@ export function shouldFetchOrderHistoryForSync(options: {
   return options.hasMissingTrackedPosition || options.detectUntrackedSales;
 }
 
+interface LocalBrokerPosition {
+  accountType: string | null;
+  t212Ticker: string | null;
+  stock: { t212Ticker: string | null };
+}
+
+interface LiveBrokerPosition {
+  accountType: string;
+  fullTicker: string;
+  shares: number;
+}
+
+export function findUntrackedBrokerPositions(
+  localPositions: LocalBrokerPosition[],
+  brokerPositions: LiveBrokerPosition[],
+): LiveBrokerPosition[] {
+  const tracked = new Set(localPositions.map((position) => {
+    const accountType = position.accountType === 'isa' ? 'isa' : 'invest';
+    return `${accountType}:${position.t212Ticker || position.stock.t212Ticker || ''}`;
+  }));
+
+  return brokerPositions.filter((position) => (
+    !tracked.has(`${position.accountType}:${position.fullTicker}`)
+  ));
+}
+
 // ── T212 Price Cache (in-memory) ─────────────────────────────────────
 // Stores last-known T212 prices from the most recent fetch.
 // Primary price source for portfolio display (real-time, not delayed).
@@ -410,10 +436,6 @@ export async function syncClosedPositions(userId: string = 'default-user', optio
     include: { stock: true },
   });
 
-  if (openPositions.length === 0) {
-    return result; // Nothing to sync
-  }
-
   result.checked = openPositions.length;
 
   // 2. Load T212 credentials and fetch live positions
@@ -469,8 +491,31 @@ export async function syncClosedPositions(userId: string = 'default-user', optio
 
   // SAFETY: If T212 returns 0 positions across all accounts, suspect API error
   if (combinedPositions.length === 0) {
+    if (openPositions.length === 0) return result;
     result.errors.push('T212 returned 0 positions — possible API error. No positions auto-closed.');
     return result;
+  }
+
+  const untrackedBrokerPositions = findUntrackedBrokerPositions(openPositions, combinedPositions);
+  for (const position of untrackedBrokerPositions) {
+    const message = `${position.fullTicker} has ${position.shares} share(s) in the ${position.accountType.toUpperCase()} account but no OPEN HybridTurtle position. Reconcile the broker holding and add a protective stop.`;
+    result.errors.push(`Untracked broker position: ${position.accountType}:${position.fullTicker}`);
+    await sendAlert({
+      type: 'ORPHAN_T212_FILL',
+      title: `Untracked T212 position — ${position.fullTicker}`,
+      message,
+      priority: 'CRITICAL',
+      data: {
+        source: 'position-sync',
+        accountType: position.accountType,
+        t212Ticker: position.fullTicker,
+        quantity: position.shares,
+      },
+      notificationDedupeKey: `untracked-position:${position.accountType}:${position.fullTicker}`,
+      notificationThrottleMs: 24 * 60 * 60 * 1000,
+      telegramDedupeKey: `untracked-position:${position.accountType}:${position.fullTicker}`,
+      telegramThrottleMs: 24 * 60 * 60 * 1000,
+    });
   }
 
   // Map: t212Ticker → T212 position data (for price updates)

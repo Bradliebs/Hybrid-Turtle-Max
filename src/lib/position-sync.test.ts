@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Trading212Error, type T212Position } from './trading212';
-import { shouldFetchOrderHistoryForSync } from './position-sync';
+import { findUntrackedBrokerPositions, shouldFetchOrderHistoryForSync } from './position-sync';
 
 const mocks = vi.hoisted(() => ({
   findUnique: vi.fn(),
@@ -319,6 +319,18 @@ describe('shouldFetchOrderHistoryForSync', () => {
   });
 });
 
+describe('findUntrackedBrokerPositions', () => {
+  it('matches positions by account and full T212 ticker', () => {
+    const local = [makeDbPosition('ALV', 'ALVd_EQ')];
+    const broker = [
+      { accountType: 'invest', fullTicker: 'ALVd_EQ', shares: 0.54 },
+      { accountType: 'isa', fullTicker: 'ALVd_EQ', shares: 0.54 },
+    ];
+
+    expect(findUntrackedBrokerPositions(local, broker)).toEqual([broker[1]]);
+  });
+});
+
 describe('syncClosedPositions order-history usage', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -365,6 +377,28 @@ describe('syncClosedPositions order-history usage', () => {
     expect(mocks.positionUpdate).not.toHaveBeenCalled();
   });
 
+  it('alerts when T212 holds a position that has no local OPEN row', async () => {
+    mocks.positionFindMany.mockResolvedValue([]);
+    mocks.getPositions.mockResolvedValue([makePosition('ALV', 423.3)]);
+
+    const { syncClosedPositions } = await import('./position-sync');
+    const result = await syncClosedPositions('default-user', { detectUntrackedSales: false });
+
+    expect(result).toMatchObject({
+      checked: 0,
+      closed: 0,
+      errors: ['Untracked broker position: invest:ALV_UK_EQ'],
+    });
+    expect(mocks.sendAlert).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'ORPHAN_T212_FILL',
+      title: 'Untracked T212 position — ALV_UK_EQ',
+      priority: 'CRITICAL',
+      notificationDedupeKey: 'untracked-position:invest:ALV_UK_EQ',
+      telegramDedupeKey: 'untracked-position:invest:ALV_UK_EQ',
+    }));
+    expect(mocks.getOrderHistory).not.toHaveBeenCalled();
+  });
+
   it('fetches one history page and closes when a tracked position is missing from T212', async () => {
     mocks.positionFindMany.mockResolvedValue([makeDbPosition('VOD')]);
     mocks.getPositions.mockResolvedValue([makePosition('SHEL', 2500)]);
@@ -373,7 +407,13 @@ describe('syncClosedPositions order-history usage', () => {
     const { syncClosedPositions } = await import('./position-sync');
     const result = await syncClosedPositions('default-user', { detectUntrackedSales: false });
 
-    expect(result).toMatchObject({ checked: 1, closed: 1, skipped: 0, updated: 0, errors: [] });
+    expect(result).toMatchObject({
+      checked: 1,
+      closed: 1,
+      skipped: 0,
+      updated: 0,
+      errors: ['Untracked broker position: invest:SHEL_UK_EQ'],
+    });
     expect(mocks.getOrderHistory).toHaveBeenCalledWith('invest-key', 50, { maxPages: 1 });
     expect(mocks.positionUpdate).toHaveBeenCalledWith(expect.objectContaining({
       where: { id: 'position-VOD' },

@@ -69,6 +69,7 @@ import { createCronLogger } from '@/lib/cron-logger';
 import { getUKDayOfWeek, getUKTimeString } from '@/lib/uk-time';
 import { groupSkipsByCategory } from '@/lib/skip-reason-category';
 import { acquireAutoTradeLock, releaseAutoTradeLock, AutoTradeLockContentionError, type LockHolder } from '@/lib/auto-trade-lock';
+import { recoverTimedOutBuy } from '@/lib/buy-timeout-recovery';
 
 // ── Configuration ────────────────────────────────────────────
 
@@ -566,16 +567,36 @@ async function executeTrade(
   }
 
   if (!filled) {
-    await logExecution({
-      ticker, phase: 'BUY_TIMEOUT', orderId: String(buyOrder.id),
-      requestBody: JSON.stringify({ orderId: buyOrder.id, maxPolls: MAX_POLLS }),
-      accountType, error: `Fill not confirmed after ${MAX_POLLS} polls. DO NOT place stop.`,
-    });
-    return {
-      ticker, success: false, stopPlaced: false,
-      error: `Buy order ${buyOrder.id} placed but fill not confirmed after ${(MAX_POLLS * POLL_INTERVAL_MS / 1000).toFixed(0)}s. Check T212 app manually.`,
-      critical: true,
-    };
+    const recovery = await recoverTimedOutBuy(client, buyOrder.id, t212Ticker);
+    if (recovery.status === 'FILLED') {
+      filledQuantity = recovery.filledQuantity;
+      filledPrice = recovery.filledPrice;
+      filled = true;
+      await logExecution({
+        ticker, phase: 'BUY_FILL_RECOVERED', orderId: String(buyOrder.id),
+        requestBody: JSON.stringify({ orderId: buyOrder.id, maxPolls: MAX_POLLS }),
+        responseStatus: 200,
+        responseBody: JSON.stringify(recovery),
+        quantity: filledQuantity,
+        accountType,
+      });
+    } else {
+      const cancelled = recovery.status === 'CANCELLED';
+      const error = cancelled
+        ? `Buy order ${buyOrder.id} was not filled after ${(MAX_POLLS * POLL_INTERVAL_MS / 1000).toFixed(0)}s and was cancelled.`
+        : `Buy order ${buyOrder.id} remains unresolved after timeout: ${recovery.error}. Check T212 app immediately.`;
+      await logExecution({
+        ticker, phase: cancelled ? 'BUY_CANCELLED_AFTER_TIMEOUT' : 'BUY_TIMEOUT', orderId: String(buyOrder.id),
+        requestBody: JSON.stringify({ orderId: buyOrder.id, maxPolls: MAX_POLLS }),
+        accountType,
+        error,
+      });
+      return {
+        ticker, success: false, stopPlaced: false,
+        error,
+        critical: cancelled ? undefined : true,
+      };
+    }
   }
 
   console.log(`    ✓ Filled ${filledQuantity} shares @ ${filledPrice.toFixed(4)}`);

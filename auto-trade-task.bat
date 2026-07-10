@@ -60,8 +60,8 @@ call node scripts/auto-migrate.mjs --quiet 2>nul
 :: Log start timestamp
 echo [%date% %time%] Starting auto-trade session: %SESSION% >> auto-trade.log
 
-:: Run auto-trade — show output in console AND append to log
-call npx tsx src/cron/auto-trade.ts --session=%SESSION% 2>&1 | powershell -NoProfile -Command "$input | Tee-Object -FilePath 'auto-trade.log' -Append"
+:: Run auto-trade — show output in console AND append to log while preserving npx's exit code
+powershell -NoProfile -Command "& { & npx.cmd tsx src/cron/auto-trade.ts --session=%SESSION% 2>&1 | Tee-Object -FilePath 'auto-trade.log' -Append; exit $LASTEXITCODE }"
 
 set EXIT_CODE=%ERRORLEVEL%
 

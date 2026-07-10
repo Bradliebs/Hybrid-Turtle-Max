@@ -29,6 +29,19 @@ Each entry uses this shape (newest at top of the History section):
 
 ## History
 
+### 2026-07-10 — pending — Reconcile timed-out broker buys before returning
+
+- File(s):
+  - `src/cron/auto-trade.ts`: Replaced the unresolved buy-timeout return with cancellation and immediate broker-position reconciliation. A fill that races with cancellation continues through the existing stop-placement and persistence path. Confirmed cancellation returns without claiming live exposure, while an unverifiable outcome remains critical.
+  - `src/lib/buy-timeout-recovery.ts`: Added the isolated cancellation and position-reconciliation helper.
+  - `src/lib/buy-timeout-recovery.test.ts`: Added cancellation, fill-race, cancellation-failure, and position-check-failure coverage.
+  - `src/lib/position-sync.ts` and `src/lib/position-sync.test.ts`: Added account-aware broker-only holding detection and durable orphan alerts as a secondary recovery layer.
+  - `auto-trade-task.bat`: Preserved the child process exit code through the logging pipeline so Task Scheduler receives failures.
+- Why: A live ALV buy timed out locally, filled later at Trading 212, and remained absent from the local database without a protective stop. The prior timeout branch neither cancelled nor reconciled the broker order, and scheduled sync only compared local positions against broker holdings.
+- Behaviour preserved: Candidate selection, market regime, health and risk gates, position sizing, account routing, order construction, fill polling, protective-stop calculation and retries, persistence, and maximum-trade limits are unchanged. The new branch activates only after existing fill polling times out and is fail-closed when broker state cannot be verified.
+- Tests: `npm run typecheck` passed. Focused auto-trade and recovery tests passed 88/88. Position-sync tests passed 10/10. Full suite passed 1825/1825 across 126 files. The batch pipeline probe returned the child exit code 7 while retaining logged output.
+- Author: GitHub Copilot (agent), on user instruction following the whole-system audit.
+
 ### 2026-06-30 — pending — Silent routing-leak guard (advisory-only) alongside ISA-eligibility tagging
 
 - File(s):
