@@ -1,8 +1,8 @@
-import type { T212Position } from './trading212';
+import type { T212HistoricalOrder } from './trading212';
 
 interface BuyTimeoutClient {
   cancelOrder(orderId: number): Promise<void>;
-  getPositions(): Promise<T212Position[]>;
+  getOrderHistory(limit?: number, options?: { maxPages?: number }): Promise<T212HistoricalOrder[]>;
 }
 
 export type BuyTimeoutRecovery =
@@ -10,10 +10,22 @@ export type BuyTimeoutRecovery =
   | { status: 'FILLED'; filledQuantity: number; filledPrice: number }
   | { status: 'UNRESOLVED'; error: string };
 
+export function getHistoricalFill(
+  orders: T212HistoricalOrder[],
+  orderId: number,
+): Extract<BuyTimeoutRecovery, { status: 'FILLED' }> | null {
+  const order = orders.find(candidate => candidate.id === orderId);
+  if (!order || order.filledQuantity <= 1e-8) return null;
+  const filledPrice = order.filledValue > 0
+    ? order.filledValue / order.filledQuantity
+    : (order.fills?.[0]?.price ?? 0);
+  if (filledPrice <= 0) return null;
+  return { status: 'FILLED', filledQuantity: order.filledQuantity, filledPrice };
+}
+
 export async function recoverTimedOutBuy(
   client: BuyTimeoutClient,
   orderId: number,
-  t212Ticker: string,
 ): Promise<BuyTimeoutRecovery> {
   let cancelError: string | null = null;
 
@@ -24,22 +36,21 @@ export async function recoverTimedOutBuy(
   }
 
   try {
-    const positions = await client.getPositions();
-    const position = positions.find((candidate) => candidate.instrument.ticker === t212Ticker);
-    if (position && position.quantity > 0) {
-      return {
-        status: 'FILLED',
-        filledQuantity: position.quantity,
-        filledPrice: position.averagePricePaid,
-      };
-    }
+    const orders = await client.getOrderHistory(50, { maxPages: 2 });
+    const fill = getHistoricalFill(orders, orderId);
+    if (fill) return fill;
+    const order = orders.find(candidate => candidate.id === orderId);
+    const terminalNoFill = order
+      && ['CANCELLED', 'CANCELED', 'REJECTED'].includes(order.status.toUpperCase())
+      && order.filledQuantity <= 1e-8;
+    if (terminalNoFill) return { status: 'CANCELLED' };
   } catch (error) {
-    const positionError = (error as Error).message;
+    const historyError = (error as Error).message;
     return {
       status: 'UNRESOLVED',
       error: cancelError
-        ? `Cancel failed: ${cancelError}; position check failed: ${positionError}`
-        : `Order cancellation was not independently verified: ${positionError}`,
+        ? `Cancel failed: ${cancelError}; order history check failed: ${historyError}`
+        : `Order cancellation was not independently verified: ${historyError}`,
     };
   }
 
@@ -47,5 +58,5 @@ export async function recoverTimedOutBuy(
     return { status: 'UNRESOLVED', error: `Cancel failed: ${cancelError}` };
   }
 
-  return { status: 'CANCELLED' };
+  return { status: 'UNRESOLVED', error: `Order ${orderId} is not yet terminal in broker history` };
 }

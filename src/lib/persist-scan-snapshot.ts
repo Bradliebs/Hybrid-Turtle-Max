@@ -23,7 +23,7 @@ import { classifyCandidates, type GradingContext } from '@/lib/candidate-grade';
 import { getLatestScoresByTicker } from '@/lib/score-lookup';
 import { saveFilterAttributions } from '@/lib/filter-attribution';
 import { saveCandidateOutcomes } from '@/lib/candidate-outcome';
-import { getDataFreshness } from '@/lib/market-data';
+import { getDataFreshness, getTickerDataFreshness } from '@/lib/market-data';
 import type { ScanCandidate } from '@/types';
 
 type ScanRunResult = Awaited<ReturnType<typeof runFullScan>>;
@@ -147,7 +147,16 @@ export async function persistScanSnapshot(params: {
     // ── Candidate Outcome: research-grade dataset for every candidate ──
     try {
       const freshness = getDataFreshness();
-      const coResult = await saveCandidateOutcomes(gradedCandidates, scan.id, scanResult.regime, freshness.source);
+      const provenanceByTicker = new Map(
+        gradedCandidates.map(candidate => [candidate.ticker, getTickerDataFreshness(candidate.ticker)]),
+      );
+      const coResult = await saveCandidateOutcomes(
+        gradedCandidates,
+        scan.id,
+        scanResult.regime,
+        freshness.source,
+        provenanceByTicker,
+      );
       console.log(`[CandidateOutcome] Saved ${coResult.saved}, errors: ${coResult.errors}`);
     } catch (coError) {
       console.warn('[CandidateOutcome] Failed:', (coError as Error).message);

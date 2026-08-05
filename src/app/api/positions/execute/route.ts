@@ -20,10 +20,20 @@ import { ensureDefaultUser } from '@/lib/default-user';
 import { z } from 'zod';
 import { assertSubmissionAllowed, SafetyControlError } from '../../../../../packages/workflow/src';
 import { runPreExecutionDryRun } from '@/lib/pre-execution-dry-run';
-import { getMarketRegime } from '@/lib/market-data';
+import { getFXRate, getMarketRegime } from '@/lib/market-data';
 import { decryptField } from '@/lib/crypto';
 import { placeStopWithRetry } from '@/lib/place-stop-with-retry';
 import { sendAlert } from '@/lib/alert-service';
+import { getHistoricalFill, recoverTimedOutBuy } from '@/lib/buy-timeout-recovery';
+import { validatePreOrderRiskGates } from '@/lib/pre-order-risk-gates';
+import {
+  claimExecutionIntent,
+  hashExecutionPayload,
+  updateExecutionIntent,
+} from '@/lib/execution-intent';
+import { reconcileExecutionIntent } from '@/lib/execution-reconciliation';
+import { calculatePositionSize } from '@/lib/position-sizer';
+import { RISK_PROFILES, type RiskProfileType, type Sleeve } from '@/types';
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -39,6 +49,7 @@ interface ExecutionPhase {
 // ── Zod Schema ───────────────────────────────────────────────
 
 const executeSchema = z.object({
+  operationId: z.string().uuid(),
   userId: z.string().trim().min(1),
   stockId: z.string().trim().min(1),
   ticker: z.string().trim().min(1),           // Yahoo format
@@ -144,7 +155,15 @@ async function validateSafetyAssertions(
   stopPrice: number,
   quantity: number,
   accountType: T212AccountType
-): Promise<{ ok: boolean; error?: string; resolvedT212Ticker?: string; resolvedStockId?: string }> {
+): Promise<{
+  ok: boolean;
+  error?: string;
+  resolvedT212Ticker?: string;
+  resolvedStockId?: string;
+  stockTicker?: string;
+  stockSleeve?: string;
+  stockCurrency?: string | null;
+}> {
   // 1. stopPrice > 0
   if (stopPrice <= 0) {
     return { ok: false, error: 'ABORT: stopPrice must be > 0' };
@@ -159,13 +178,13 @@ async function validateSafetyAssertions(
   // Support both Prisma cuid (from auto-trade) and ticker string (from BuyConfirmationModal)
   let stock = await prisma.stock.findUnique({
     where: { id: stockId },
-    select: { id: true, t212Ticker: true, isaEligible: true, ticker: true },
+    select: { id: true, t212Ticker: true, isaEligible: true, ticker: true, sleeve: true, currency: true },
   });
   if (!stock) {
     // Fallback: try looking up by ticker (frontend sends candidate.ticker as stockId)
     stock = await prisma.stock.findUnique({
       where: { ticker: stockId },
-      select: { id: true, t212Ticker: true, isaEligible: true, ticker: true },
+      select: { id: true, t212Ticker: true, isaEligible: true, ticker: true, sleeve: true, currency: true },
     });
   }
 
@@ -185,7 +204,14 @@ async function validateSafetyAssertions(
     return { ok: false, error: `ABORT: ${stock.ticker} is not ISA eligible — cannot buy on ISA account` };
   }
 
-  return { ok: true, resolvedT212Ticker: stock.t212Ticker, resolvedStockId: stock.id };
+  return {
+    ok: true,
+    resolvedT212Ticker: stock.t212Ticker,
+    resolvedStockId: stock.id,
+    stockTicker: stock.ticker,
+    stockSleeve: stock.sleeve,
+    stockCurrency: stock.currency,
+  };
 }
 
 // ── SSE Helpers ──────────────────────────────────────────────
@@ -222,7 +248,7 @@ export async function POST(request: NextRequest) {
   }
 
   const {
-    userId, stockId, ticker, t212Ticker, quantity, stopPrice,
+    operationId, userId, stockId, ticker, t212Ticker, quantity, stopPrice,
     entryPrice, currentPrice, entryTrigger, accountType, atrAtEntry, adxAtEntry, scanStatus,
     bqsScore, fwsScore, ncsScore, dualScoreAction, rankScore,
     entryType, notes,
@@ -289,6 +315,66 @@ export async function POST(request: NextRequest) {
         const resolvedT212Ticker = safety.resolvedT212Ticker || t212Ticker;
         const resolvedStockId = safety.resolvedStockId || stockId;
 
+        // ── SERVER-AUTHORITATIVE QUANTITY CAP ──
+        try {
+          const sizingUser = await prisma.user.findUnique({
+            where: { id: resolvedUserId },
+            select: { equity: true, riskProfile: true },
+          });
+          if (!sizingUser || sizingUser.equity <= 0) {
+            throw new Error('Account equity is unavailable');
+          }
+          if (!(sizingUser.riskProfile in RISK_PROFILES)) {
+            throw new Error(`Unknown risk profile: ${sizingUser.riskProfile}`);
+          }
+
+          const currency = (safety.stockCurrency || 'USD').toUpperCase();
+          const stockTicker = safety.stockTicker || ticker;
+          const isUkInstrument = stockTicker.endsWith('.L') || /^[A-Z]{2,5}l$/.test(stockTicker);
+          const fxToGbp = isUkInstrument || currency === 'GBX'
+            ? 0.01
+            : currency === 'GBP'
+              ? 1
+              : await getFXRate(currency, 'GBP');
+          const serverSizing = calculatePositionSize({
+            equity: sizingUser.equity,
+            riskProfile: sizingUser.riskProfile as RiskProfileType,
+            entryPrice,
+            stopPrice,
+            sleeve: (safety.stockSleeve || 'CORE') as Sleeve,
+            fxToGbp,
+            allowFractional: true,
+          });
+
+          if (serverSizing.shares <= 0 || quantity > serverSizing.shares + 0.000_001) {
+            const failureMsg = serverSizing.shares <= 0
+              ? 'Server sizing permits no shares for this trade.'
+              : `Requested quantity ${quantity} exceeds the server maximum ${serverSizing.shares}.`;
+            await logExecution({
+              ticker,
+              phase: 'SIZING_CAP_EXCEEDED',
+              requestBody: JSON.stringify(body),
+              accountType,
+              error: failureMsg,
+            });
+            send('error', { error: failureMsg, phase: 'SIZING_CAP_EXCEEDED' });
+            controller.close();
+            return;
+          }
+        } catch (error) {
+          const failureMsg = `Server sizing could not be evaluated: ${(error as Error).message}`;
+          await logExecution({
+            ticker,
+            phase: 'SIZING_UNAVAILABLE',
+            requestBody: JSON.stringify(body),
+            accountType,
+            error: failureMsg,
+          });
+          send('error', { error: failureMsg, phase: 'SIZING_UNAVAILABLE' });
+          controller.close();
+          return;
+        }
+
         // ── PRE-EXECUTION DRY RUN ──
         const regime = await getMarketRegime().catch(() => undefined);
         const dryRun = await runPreExecutionDryRun({
@@ -322,6 +408,147 @@ export async function POST(request: NextRequest) {
           return;
         }
 
+        try {
+          const portfolioGates = await validatePreOrderRiskGates({
+            userId: resolvedUserId,
+            stockId: resolvedStockId,
+            entryPrice,
+            stopPrice,
+            shares: quantity,
+          });
+          if (!portfolioGates.passed) {
+            const failureMsg = portfolioGates.failedGates
+              .map((gate) => `${gate.gate}: ${gate.message}`)
+              .join('; ');
+            await logExecution({
+              ticker,
+              phase: 'RISK_GATES_FAILED',
+              requestBody: JSON.stringify(body),
+              accountType,
+              error: failureMsg,
+            });
+            send('error', {
+              error: `Position blocked by portfolio risk gates: ${failureMsg}`,
+              phase: 'RISK_GATES_FAILED',
+            });
+            controller.close();
+            return;
+          }
+        } catch (error) {
+          const failureMsg = (error as Error).message;
+          await logExecution({
+            ticker,
+            phase: 'RISK_GATES_UNAVAILABLE',
+            requestBody: JSON.stringify(body),
+            accountType,
+            error: failureMsg,
+          });
+          send('error', {
+            error: `Portfolio risk gates could not be evaluated: ${failureMsg}`,
+            phase: 'RISK_GATES_UNAVAILABLE',
+          });
+          controller.close();
+          return;
+        }
+
+        const canonicalPayloadHash = hashExecutionPayload({
+          userId: resolvedUserId,
+          stockId: resolvedStockId,
+          t212Ticker: resolvedT212Ticker,
+          quantity,
+          stopPrice,
+          accountType,
+        });
+        let intentClaim: Awaited<ReturnType<typeof claimExecutionIntent>>;
+        try {
+          intentClaim = await claimExecutionIntent({
+            operationId,
+            userId: resolvedUserId,
+            payloadHash: canonicalPayloadHash,
+            stockId: resolvedStockId,
+            ticker: resolvedT212Ticker,
+            accountType,
+            requestedQuantity: quantity,
+            stopPrice,
+          });
+        } catch (error) {
+          send('error', {
+            error: `Execution safety ledger unavailable: ${(error as Error).message}`,
+            phase: 'IDEMPOTENCY_UNAVAILABLE',
+          });
+          controller.close();
+          return;
+        }
+
+        if (!intentClaim.claimed) {
+          let completed = intentClaim.sameOperation
+            && !intentClaim.payloadMismatch
+            && (intentClaim.status === 'COMPLETED'
+              || intentClaim.status === 'COMPLETED_WITH_WARNING'
+              || intentClaim.status === 'COMPLETED_RECONCILED');
+          let conflictStatus = intentClaim.status;
+          let conflictMessage: string | null = null;
+          let reconciledPositionId = intentClaim.positionId;
+          let reconciledOrderId = intentClaim.orderId;
+
+          const retainedUncertain = intentClaim.sameOperation
+            && !intentClaim.payloadMismatch
+            && (intentClaim.status === 'BROKER_OUTCOME_UNKNOWN'
+              || intentClaim.status === 'RECONCILIATION_REQUIRED');
+          if (retainedUncertain) {
+            try {
+              const reconciliationClient = await getT212Client(resolvedUserId, accountType);
+              const reconciliation = await reconcileExecutionIntent(
+                intentClaim.operationId,
+                reconciliationClient,
+              );
+              conflictStatus = reconciliation.status;
+              conflictMessage = reconciliation.message;
+              if (reconciliation.status === 'COMPLETED_RECONCILED') {
+                completed = true;
+                reconciledPositionId = reconciliation.positionId;
+                reconciledOrderId = reconciliation.orderId;
+              } else if (reconciliation.released) {
+                send('error', {
+                  error: `${reconciliation.message} No broker side effect remains; submit again to start a new trade attempt.`,
+                  phase: 'EXECUTION_RECONCILED_NO_EFFECT',
+                  operationId: intentClaim.operationId,
+                  retainOperationId: false,
+                  status: reconciliation.status,
+                  critical: false,
+                });
+                controller.close();
+                return;
+              }
+            } catch (error) {
+              conflictMessage = `Reconciliation could not complete: ${(error as Error).message}`;
+            }
+          }
+
+          send(completed ? 'complete' : 'error', {
+            error: conflictMessage ?? (intentClaim.payloadMismatch
+              ? 'Operation ID was already used with different trade details.'
+              : intentClaim.sameOperation
+                ? `This trade attempt was already accepted (${conflictStatus}). No second order was submitted.`
+                : `An equivalent trade is already active (${conflictStatus}). Reconcile it before retrying.`),
+            phase: 'IDEMPOTENCY_CONFLICT',
+            operationId: intentClaim.operationId,
+            retainOperationId: !completed && !intentClaim.payloadMismatch,
+            status: conflictStatus,
+            position: completed ? {
+              id: reconciledPositionId,
+              ticker,
+              t212Ticker: resolvedT212Ticker,
+              orderId: reconciledOrderId ? Number(reconciledOrderId) : undefined,
+              accountType,
+            } : undefined,
+            stopFailed: conflictStatus === 'COMPLETED_WITH_WARNING',
+            critical: !completed && !intentClaim.payloadMismatch,
+          });
+          controller.close();
+          return;
+        }
+
         // ── Get T212 Client ──
         let client: Trading212Client;
         try {
@@ -332,6 +559,11 @@ export async function POST(request: NextRequest) {
             ticker, phase: 'CLIENT_ERROR', requestBody: JSON.stringify(body),
             accountType, error: msg,
           });
+          await updateExecutionIntent(operationId, {
+            status: 'FAILED_PRE_SUBMISSION',
+            error: msg,
+            release: true,
+          }).catch(() => undefined);
           send('error', { error: msg, phase: 'CLIENT_ERROR' });
           controller.close();
           return;
@@ -343,11 +575,51 @@ export async function POST(request: NextRequest) {
 
         updatePhase(0, { status: 'running' });
 
+        let baselinePosition = { quantity: 0, averagePricePaid: 0 };
+        try {
+          const positions = await client.getPositions();
+          const existing = positions.find(position => position.instrument.ticker === resolvedT212Ticker);
+          if (existing) {
+            baselinePosition = {
+              quantity: existing.quantity,
+              averagePricePaid: existing.averagePricePaid,
+            };
+          }
+        } catch (err) {
+          const msg = `Unable to capture pre-order broker position: ${(err as Error).message}`;
+          await logExecution({
+            ticker, phase: 'POSITION_SNAPSHOT_FAILED', requestBody: JSON.stringify(body),
+            accountType, error: msg,
+          });
+          updatePhase(0, { status: 'failed', message: msg });
+          await updateExecutionIntent(operationId, {
+            status: 'FAILED_PRE_SUBMISSION',
+            error: msg,
+            release: true,
+          }).catch(() => undefined);
+          send('error', { error: msg, phase: 'POSITION_SNAPSHOT_FAILED', critical: false });
+          controller.close();
+          return;
+        }
+
         let buyOrder: T212PendingOrder;
         const buyRequest = { quantity, ticker: resolvedT212Ticker };
 
         try {
+          await updateExecutionIntent(operationId, {
+            status: 'BROKER_SUBMITTING',
+            baselineQuantity: baselinePosition.quantity,
+            baselineAveragePrice: baselinePosition.averagePricePaid,
+            markBrokerSubmitted: true,
+          });
           buyOrder = await client.placeMarketOrder(buyRequest);
+
+          await updateExecutionIntent(operationId, {
+            status: 'BROKER_SUBMITTED',
+            orderId: String(buyOrder.id),
+          }).catch((error) => {
+            console.error('[ExecutionIntent] Failed to record submitted order:', error);
+          });
 
           await logExecution({
             ticker, phase: 'BUY_PLACED',
@@ -376,9 +648,25 @@ export async function POST(request: NextRequest) {
             accountType, error: msg,
           });
 
-          // Phase A failure → ABORT ENTIRELY
+          const definiteRejection = err instanceof Trading212Error
+            && err.statusCode >= 400
+            && err.statusCode < 500
+            && err.statusCode !== 408;
+          const outcomeUnknown = !definiteRejection;
+          await updateExecutionIntent(operationId, {
+            status: outcomeUnknown ? 'BROKER_OUTCOME_UNKNOWN' : 'FAILED_PRE_SUBMISSION',
+            error: msg,
+            release: !outcomeUnknown,
+          }).catch(() => undefined);
+
           updatePhase(0, { status: 'failed', message: msg });
-          send('error', { error: msg, phase: 'BUY_FAILED', critical: false });
+          send('error', {
+            error: outcomeUnknown
+              ? `${msg}. Broker acceptance is unknown; reconcile T212 before retrying.`
+              : msg,
+            phase: outcomeUnknown ? 'BROKER_OUTCOME_UNKNOWN' : 'BUY_FAILED',
+            critical: outcomeUnknown,
+          });
           controller.close();
           return;
         }
@@ -429,13 +717,13 @@ export async function POST(request: NextRequest) {
           } catch (err) {
             // 404 on getOrder often means the order was already filled and removed from pending
             if (err instanceof Trading212Error && err.statusCode === 404) {
-              // Order filled and no longer pending — check positions for the fill
+              // Order left the pending endpoint — require exact order history for attribution.
               try {
-                const positions = await client.getPositions();
-                const pos = positions.find(p => p.instrument.ticker === t212Ticker);
-                if (pos) {
-                  filledQuantity = pos.quantity;
-                  filledPrice = pos.averagePricePaid;
+                const history = await client.getOrderHistory(50, { maxPages: 2 });
+                const fill = getHistoricalFill(history, buyOrder.id);
+                if (fill) {
+                  filledQuantity = fill.filledQuantity;
+                  filledPrice = fill.filledPrice;
                   filledOrder = buyOrder; // Use the original order reference
                   break;
                 }
@@ -449,31 +737,56 @@ export async function POST(request: NextRequest) {
         }
 
         if (!filledOrder || filledQuantity === 0) {
-          // Timeout — order may still fill later
+          const recovery = await recoverTimedOutBuy(
+            client,
+            buyOrder.id,
+          );
+
+          if (recovery.status === 'FILLED') {
+            filledOrder = buyOrder;
+            filledQuantity = recovery.filledQuantity;
+            filledPrice = recovery.filledPrice;
+          } else {
+            const unresolved = recovery.status === 'UNRESOLVED';
+            const recoveryMessage = unresolved
+              ? ` Exposure is unresolved: ${recovery.error}`
+              : ' The pending order was cancelled and no broker position was found.';
+
+            await updateExecutionIntent(operationId, {
+              status: unresolved ? 'RECONCILIATION_REQUIRED' : 'CANCELLED',
+              orderId: String(buyOrder.id),
+              error: unresolved ? recovery.error : undefined,
+              release: !unresolved,
+            }).catch(() => undefined);
+
           await logExecution({
             ticker, phase: 'BUY_TIMEOUT',
             orderId: String(buyOrder.id),
             requestBody: JSON.stringify({ orderId: buyOrder.id, maxPolls: MAX_POLLS }),
             accountType,
-            error: `Fill not confirmed after ${MAX_POLLS} polls (${MAX_POLLS * POLL_INTERVAL_MS / 1000}s). Order may still fill. Do NOT place stop.`,
+              error: `Fill not confirmed after ${MAX_POLLS} polls (${MAX_POLLS * POLL_INTERVAL_MS / 1000}s).${recoveryMessage}`,
           });
 
           updatePhase(1, {
             status: 'failed',
-            message: `Fill not confirmed after ${MAX_POLLS * POLL_INTERVAL_MS / 1000}s — check T212 app manually`,
+              message: unresolved
+                ? `Fill not confirmed and exposure unresolved — check T212 immediately`
+                : `Fill not confirmed — order cancelled with no position found`,
           });
-          // Phase C skipped — DO NOT place stop without confirmed fill
           updatePhase(2, { status: 'skipped', message: 'Skipped — fill not confirmed' });
           updatePhase(3, { status: 'skipped', message: 'Skipped — fill not confirmed' });
 
           send('error', {
-            error: `Buy order ${buyOrder.id} placed but fill not confirmed after ${MAX_POLLS * POLL_INTERVAL_MS / 1000}s. Check the T212 app. Do NOT manually place a stop until the fill is confirmed.`,
+              error: unresolved
+                ? `Buy order ${buyOrder.id} timed out and could not be reconciled. Check T212 immediately before taking any further action. ${recovery.error}`
+                : `Buy order ${buyOrder.id} timed out, was cancelled, and no broker position was found.`,
             phase: 'BUY_TIMEOUT',
-            critical: false,
+              critical: unresolved,
             orderId: buyOrder.id,
           });
           controller.close();
           return;
+          }
         }
 
         updatePhase(1, {
@@ -494,6 +807,7 @@ export async function POST(request: NextRequest) {
         // intended stop so the nightly orphan detector (which keys off
         // currentStop > 0 with no broker stop) re-places it.
         let stopPlacedOk = false;
+        let protectiveStopOrderId: string | null = null;
         let actualStopPrice = stopPrice;
 
         // Safety: stop quantity MUST be negative
@@ -544,7 +858,14 @@ export async function POST(request: NextRequest) {
 
           if (stopResult.placed) {
             stopPlacedOk = true;
+            protectiveStopOrderId = stopResult.orderId ?? null;
             actualStopPrice = stopResult.stopPrice;
+            await updateExecutionIntent(operationId, {
+              status: 'STOP_PLACED',
+              stopOrderId: protectiveStopOrderId ?? undefined,
+            }).catch((error) => {
+              console.error('[ExecutionIntent] Failed to record protective stop:', error);
+            });
             const retryNote = stopResult.attempts.length > 1
               ? ` (after ${stopResult.attempts.length} attempts)`
               : '';
@@ -624,9 +945,13 @@ export async function POST(request: NextRequest) {
 
         try {
           // Call the existing position creation endpoint internally
+          const cookie = request.headers.get('cookie');
           const positionResponse = await fetch(new URL('/api/positions', request.url), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+              'Content-Type': 'application/json',
+              ...(cookie ? { Cookie: cookie } : {}),
+            },
             body: JSON.stringify({
               userId: resolvedUserId,
               stockId: resolvedStockId,
@@ -663,6 +988,11 @@ export async function POST(request: NextRequest) {
             });
 
             await alertUnrecordedFill(errMsg);
+            await updateExecutionIntent(operationId, {
+              status: 'RECONCILIATION_REQUIRED',
+              orderId: String(buyOrder.id),
+              error: errMsg,
+            }).catch(() => undefined);
 
             updatePhase(3, { status: 'failed', message: errMsg });
             send('error', {
@@ -685,6 +1015,59 @@ export async function POST(request: NextRequest) {
             quantity: filledQuantity,
             accountType,
           });
+
+          try {
+            if (!stopPlacedOk || !protectiveStopOrderId) {
+              const protectionError = 'Position saved, but no protective broker stop was verified.';
+              await updateExecutionIntent(operationId, {
+                status: 'RECONCILIATION_REQUIRED',
+                orderId: String(buyOrder.id),
+                positionId: positionData.id,
+                error: protectionError,
+              });
+              send('error', {
+                error: `${protectionError} Set and verify the stop in T212 before retrying this trade.`,
+                phase: 'UNPROTECTED_POSITION',
+                critical: true,
+                retainOperationId: true,
+                operationId,
+                orderId: buyOrder.id,
+                positionId: positionData.id,
+              });
+              controller.close();
+              return;
+            }
+
+            await updateExecutionIntent(operationId, {
+              status: 'COMPLETED',
+              orderId: String(buyOrder.id),
+              stopOrderId: protectiveStopOrderId,
+              positionId: positionData.id,
+              release: true,
+            });
+          } catch (error) {
+            const ledgerError = `Position saved, but execution ledger completion failed: ${(error as Error).message}`;
+            await sendAlert({
+              type: 'ORPHAN_T212_FILL',
+              title: `Execution ledger incomplete: ${ticker}`,
+              message: `${ledgerError}. Order ${buyOrder.id}, position ${positionData.id}. Reconcile before retrying this trade.`,
+              priority: 'CRITICAL',
+              notificationDedupeKey: `ledger-${operationId}`,
+              telegramDedupeKey: `ledger-${operationId}`,
+              data: { operationId, orderId: buyOrder.id, positionId: positionData.id, ticker },
+            });
+            send('error', {
+              error: ledgerError,
+              phase: 'EXECUTION_LEDGER_INCOMPLETE',
+              critical: true,
+              retainOperationId: true,
+              operationId,
+              orderId: buyOrder.id,
+              positionId: positionData.id,
+            });
+            controller.close();
+            return;
+          }
 
           updatePhase(3, {
             status: 'success',
@@ -717,6 +1100,11 @@ export async function POST(request: NextRequest) {
           });
 
           await alertUnrecordedFill(msg);
+          await updateExecutionIntent(operationId, {
+            status: 'RECONCILIATION_REQUIRED',
+            orderId: String(buyOrder.id),
+            error: msg,
+          }).catch(() => undefined);
 
           updatePhase(3, { status: 'failed', message: msg });
           send('error', {

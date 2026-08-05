@@ -493,6 +493,31 @@ model ExecutionLog {
   @@index([phase])
 }
 
+model ExecutionIntent {
+  operationId       String   @id
+  userId            String
+  payloadHash       String
+  activePayloadHash String?  @unique
+  stockId           String?
+  ticker            String
+  accountType       String
+  requestedQuantity Float?
+  stopPrice         Float?
+  baselineQuantity  Float?
+  baselineAveragePrice Float?
+  brokerSubmittedAt DateTime?
+  status            String   @default("IN_PROGRESS")
+  orderId           String?
+  stopOrderId       String?
+  positionId        String?
+  error              String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
 model Notification {
   id        Int       @id @default(autoincrement())
   createdAt DateTime  @default(now())
@@ -738,6 +763,9 @@ model CandidateOutcome {
 
   // ── Data quality ──
   dataFreshness       String?  // LIVE / CACHE / STALE_CACHE
+  dataSource          String?  // Per-ticker LIVE / CACHE / STALE_CACHE / UNKNOWN
+  dataAgeMinutes      Float?
+  dataAsOf            DateTime?
 
   // ── Trade linkage (populated when trade is placed) ──
   tradePlaced         Boolean  @default(false)

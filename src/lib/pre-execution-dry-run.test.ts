@@ -4,6 +4,8 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 const mockHealthCheckFindFirst = vi.fn();
 const mockHeartbeatFindFirst = vi.fn();
 const mockUserFindUnique = vi.fn();
+const mockListBackups = vi.fn();
+const mockIsBackupValid = vi.fn();
 
 vi.mock('./prisma', () => ({
   default: {
@@ -11,6 +13,11 @@ vi.mock('./prisma', () => ({
     user: { findUnique: (...args: unknown[]) => mockUserFindUnique(...args) },
     heartbeat: { findFirst: (...args: unknown[]) => mockHeartbeatFindFirst(...args) },
   },
+}));
+
+vi.mock('./db-backup', () => ({
+  listBackups: () => mockListBackups(),
+  isBackupValid: (...args: unknown[]) => mockIsBackupValid(...args),
 }));
 
 // Mock safety-controls (kill switch)
@@ -63,9 +70,16 @@ function setupDefaults() {
   // Heartbeat: recent, OK
   mockHeartbeatFindFirst.mockResolvedValue({
     timestamp: new Date(),
-    status: 'OK',
+    status: 'SUCCESS',
     details: null,
   });
+
+  mockListBackups.mockReturnValue([{
+    filename: 'dev.db.backup-test',
+    sizeBytes: 1024,
+    createdAt: new Date().toISOString(),
+  }]);
+  mockIsBackupValid.mockReturnValue(true);
 
   // User with equity and T212 connected
   mockUserFindUnique.mockResolvedValue({
@@ -258,12 +272,12 @@ describe('pre-execution-dry-run', () => {
     expect(result.checks).toHaveLength(14);
   });
 
-  it('soft warnings do not cause failure', async () => {
+  it('soft heartbeat warnings do not cause failure', async () => {
     // Heartbeat stale (26h+) is a soft warning
     const staleDate = new Date(Date.now() - 30 * 60 * 60 * 1000); // 30 hours ago
     mockHeartbeatFindFirst.mockResolvedValue({
       timestamp: staleDate,
-      status: 'OK',
+      status: 'SUCCESS',
       details: null,
     });
 
@@ -323,11 +337,11 @@ describe('pre-execution-dry-run', () => {
 
   it('hard-blocks when backup is older than 48 hours', async () => {
     const staleDate = new Date(Date.now() - 50 * 60 * 60 * 1000); // 50 hours ago
-    mockHeartbeatFindFirst.mockResolvedValue({
-      timestamp: staleDate,
-      status: 'OK',
-      details: null,
-    });
+    mockListBackups.mockReturnValue([{
+      filename: 'dev.db.backup-stale',
+      sizeBytes: 1024,
+      createdAt: staleDate.toISOString(),
+    }]);
 
     const result = await runPreExecutionDryRun(baseInput);
 
@@ -336,5 +350,15 @@ describe('pre-execution-dry-run', () => {
     expect(backupCheck).toBeDefined();
     expect(backupCheck?.severity).toBe('HARD_BLOCK');
     expect(backupCheck?.message).toContain('blocked');
+  });
+
+  it('hard-blocks when the latest backup fails its integrity check', async () => {
+    mockIsBackupValid.mockReturnValue(false);
+
+    const result = await runPreExecutionDryRun(baseInput);
+
+    expect(result.passed).toBe(false);
+    const backupCheck = result.hardFailures.find(c => c.id === 'BACKUP');
+    expect(backupCheck?.message).toContain('integrity check');
   });
 });

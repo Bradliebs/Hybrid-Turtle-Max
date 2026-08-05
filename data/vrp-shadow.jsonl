@@ -1,0 +1,7 @@
+{"timestamp":"2026-07-29T20:13:09.954Z","vix":20.37,"realisedVol10dAnnualised":11.048637596550941,"vrp":9.32136240344906,"state":"NORMAL","approximatePercentile":85}
+{"timestamp":"2026-07-30T20:13:36.914Z","vix":17.43,"realisedVol10dAnnualised":14.530085558159723,"vrp":2.899914441840277,"state":"NORMAL","approximatePercentile":29}
+{"timestamp":"2026-07-31T20:10:53.231Z","vix":15.91,"realisedVol10dAnnualised":14.177035089314332,"vrp":1.7329649106856682,"state":"NORMAL","approximatePercentile":21}
+{"timestamp":"2026-08-01T20:11:09.298Z","vix":15.99,"realisedVol10dAnnualised":14.198967813556147,"vrp":1.7910321864438536,"state":"NORMAL","approximatePercentile":22}
+{"timestamp":"2026-08-02T20:10:16.022Z","vix":15.99,"realisedVol10dAnnualised":14.198967813556147,"vrp":1.7910321864438536,"state":"NORMAL","approximatePercentile":22}
+{"timestamp":"2026-08-03T20:10:29.557Z","vix":15.75,"realisedVol10dAnnualised":15.520036535446119,"vrp":0.22996346455388128,"state":"NORMAL","approximatePercentile":14}
+{"timestamp":"2026-08-04T20:12:33.778Z","vix":16.42,"realisedVol10dAnnualised":17.055768244680742,"vrp":-0.6357682446807402,"state":"INVERTED","approximatePercentile":10}

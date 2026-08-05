@@ -48,7 +48,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import prisma from '@/lib/prisma';
-import { runFullScan } from '@/lib/scan-engine';
+import { runFullScan, runTechnicalFilters } from '@/lib/scan-engine';
 import { persistScanSnapshot } from '@/lib/persist-scan-snapshot';
 import { calculatePositionSize } from '@/lib/position-sizer';
 import { validateRiskGates } from '@/lib/risk-gates';
@@ -57,19 +57,19 @@ import type { T212AccountType } from '@/lib/trading212-dual';
 import { sendTelegramMessage, sendThrottledTelegramAlert } from '@/lib/telegram';
 import { sendAlert } from '@/lib/alert-service';
 import { assertSubmissionAllowed, SafetyControlError, isAutoTradingEnabled } from '../../packages/workflow/src';
-import { getBatchPrices, normalizeBatchPricesToGBP, getFXRate, getMarketRegime } from '@/lib/market-data';
+import { getBatchPrices, getTechnicalData, normalizeBatchPricesToGBP, getFXRate, getMarketRegime } from '@/lib/market-data';
 import { fetchT212LivePrices } from '@/lib/position-sync';
 import { classifyCandidate, DEFAULT_GRADE_THRESHOLDS, type GradingContext, type CandidateGrade, type GradeThresholds } from '@/lib/candidate-grade';
 import { getLatestScoresByTicker } from '@/lib/score-lookup';
 import { NO_CHASE_ATR_BOUND } from '@/lib/entry-quality-engine';
-import { RISK_PROFILES, type RiskProfileType, type Sleeve, type MarketRegime, OPERATING_MODES, type OperatingMode } from '@/types';
+import { RISK_PROFILES, type RiskProfileType, type Sleeve, type MarketRegime, type TechnicalData, OPERATING_MODES, type OperatingMode } from '@/types';
 import { decryptField } from '@/lib/crypto';
 import { isTodayMarketHoliday, isEarlyCloseDay } from '@/lib/market-holidays';
 import { createCronLogger } from '@/lib/cron-logger';
 import { getUKDayOfWeek, getUKTimeString } from '@/lib/uk-time';
 import { groupSkipsByCategory } from '@/lib/skip-reason-category';
 import { acquireAutoTradeLock, releaseAutoTradeLock, AutoTradeLockContentionError, type LockHolder } from '@/lib/auto-trade-lock';
-import { recoverTimedOutBuy } from '@/lib/buy-timeout-recovery';
+import { getHistoricalFill, recoverTimedOutBuy } from '@/lib/buy-timeout-recovery';
 
 // ── Configuration ────────────────────────────────────────────
 
@@ -177,6 +177,32 @@ export function revalidateLivePrice(
     }
   }
   return { action: 'KEEP' };
+}
+
+export function revalidateExecutionTechnicals(
+  livePrice: number,
+  technicals: TechnicalData | null,
+  sleeve: Sleeve,
+  minVolumeRatio: number,
+): LiveRevalidationDecision {
+  if (!technicals) {
+    return { action: 'SKIP', reason: 'Fresh technical data unavailable' };
+  }
+
+  const filters = runTechnicalFilters(livePrice, technicals, sleeve);
+  const failed: string[] = [];
+  if (!filters.priceAboveMa200) failed.push('price below MA200');
+  if (!filters.adxAbove20) failed.push('ADX below 20');
+  if (!filters.plusDIAboveMinusDI) failed.push('+DI not above -DI');
+  if (!filters.atrPercentBelow8) failed.push('ATR% above sleeve cap');
+  if (!filters.dataQuality) failed.push('technical data quality failed');
+  if (technicals.volumeRatio < minVolumeRatio) {
+    failed.push(`volume ratio ${technicals.volumeRatio.toFixed(2)} below ${minVolumeRatio.toFixed(2)}`);
+  }
+
+  return failed.length > 0
+    ? { action: 'SKIP', reason: `Execution-time technical revalidation failed: ${failed.join(', ')}` }
+    : { action: 'KEEP' };
 }
 
 /** M-3 (2026-05-17): realised gate footprint for a just-filled trade.
@@ -515,6 +541,24 @@ async function executeTrade(
     return { ticker, success: false, stopPlaced: false, error: msg };
   }
 
+  let baselinePosition = { quantity: 0, averagePricePaid: 0 };
+  try {
+    const positions = await client.getPositions();
+    const existing = positions.find(position => position.instrument.ticker === t212Ticker);
+    if (existing) {
+      baselinePosition = {
+        quantity: existing.quantity,
+        averagePricePaid: existing.averagePricePaid,
+      };
+    }
+  } catch (err) {
+    const msg = `Unable to capture pre-order broker position: ${(err as Error).message}`;
+    await logExecution({
+      ticker, phase: 'POSITION_SNAPSHOT_FAILED', requestBody: JSON.stringify(candidate), accountType, error: msg,
+    });
+    return { ticker, success: false, stopPlaced: false, error: msg };
+  }
+
   let buyOrder: T212PendingOrder;
   try {
     buyOrder = await client.placeMarketOrder({ quantity: shares, ticker: t212Ticker });
@@ -553,11 +597,11 @@ async function executeTrade(
       if (err instanceof Trading212Error && err.statusCode === 404) {
         // Order filled and removed from pending — check positions
         try {
-          const positions = await client.getPositions();
-          const pos = positions.find(p => p.instrument.ticker === t212Ticker);
-          if (pos) {
-            filledQuantity = pos.quantity;
-            filledPrice = pos.averagePricePaid;
+          const history = await client.getOrderHistory(50, { maxPages: 2 });
+          const fill = getHistoricalFill(history, buyOrder.id);
+          if (fill) {
+            filledQuantity = fill.filledQuantity;
+            filledPrice = fill.filledPrice;
             filled = true;
             break;
           }
@@ -567,7 +611,7 @@ async function executeTrade(
   }
 
   if (!filled) {
-    const recovery = await recoverTimedOutBuy(client, buyOrder.id, t212Ticker);
+    const recovery = await recoverTimedOutBuy(client, buyOrder.id);
     if (recovery.status === 'FILLED') {
       filledQuantity = recovery.filledQuantity;
       filledPrice = recovery.filledPrice;
@@ -1299,13 +1343,29 @@ async function runAutoTrade(session: Session) {
   const liveRevalidationSkipped: Array<{ ticker: string; reason: string }> = [];
   if (session !== 'scan' && readyCandidates.length > 0) {
     const tickers = readyCandidates.map(c => c.ticker);
-    const livePrices = await getBatchPrices(tickers, /* forceRefresh */ true).catch((err) => {
-      console.warn(`    [LIVE REVALIDATION] Batch fetch failed: ${(err as Error).message}`);
-      return {} as Record<string, number>;
-    });
+    const [livePrices, refreshedTechnicals] = await Promise.all([
+      getBatchPrices(tickers, /* forceRefresh */ true).catch((err) => {
+        console.warn(`    [LIVE REVALIDATION] Batch fetch failed: ${(err as Error).message}`);
+        return {} as Record<string, number>;
+      }),
+      Promise.all(readyCandidates.map(async candidate => [
+        candidate.ticker,
+        await getTechnicalData(candidate.ticker, true).catch(() => null),
+      ] as const)).then(entries => new Map(entries)),
+    ]);
     for (let i = readyCandidates.length - 1; i >= 0; i--) {
       const c = readyCandidates[i];
-      const decision = revalidateLivePrice(c.price, c.entryTrigger, livePrices[c.ticker], c.technicals?.atr);
+      const refreshed = refreshedTechnicals.get(c.ticker) ?? null;
+      const priceDecision = revalidateLivePrice(c.price, c.entryTrigger, livePrices[c.ticker], refreshed?.atr);
+      const technicalDecision = priceDecision.action === 'KEEP'
+        ? revalidateExecutionTechnicals(
+          livePrices[c.ticker],
+          refreshed,
+          c.sleeve,
+          sessionThresholds.minVolumeRatio,
+        )
+        : priceDecision;
+      const decision = priceDecision.action === 'SKIP' ? priceDecision : technicalDecision;
       if (decision.action === 'SKIP') {
         liveRevalidationSkipped.push({ ticker: c.ticker, reason: decision.reason });
         readyCandidates.splice(i, 1);
@@ -1319,7 +1379,8 @@ async function runAutoTrade(session: Session) {
             scanPrice: c.price,
             entryTrigger: c.entryTrigger,
             livePrice: livePrices[c.ticker] ?? null,
-            atr: c.technicals?.atr ?? null,
+            atr: refreshed?.atr ?? null,
+            technicals: refreshed,
             session,
           }),
           accountType: 'N/A',

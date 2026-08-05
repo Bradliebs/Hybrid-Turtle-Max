@@ -5,7 +5,7 @@ import {
   mapT212Position,
   mapT212AccountSummary,
 } from './trading212';
-import type { T212Position, T212AccountSummary } from './trading212';
+import type { T212Position, T212AccountSummary, T212PendingOrder } from './trading212';
 
 // ── isStopTooFar ──
 
@@ -103,6 +103,27 @@ describe('Trading212Client error diagnostic hints', () => {
     await expect(client.getPositions()).rejects.toMatchObject({
       message: expect.stringContaining('check the accountType on the position'),
     });
+  });
+
+  it('attaches the instrument-disabled hint when T212 returns the canonical body', async () => {
+    // The exact body shape from the 29 July 2026 CCRN trailing-stop failure:
+    //   "Trading 212 API error 400: Error while placing the order
+    //    (/api-errors/instrument-disabled)"
+    stubErrorResponse(400, {
+      title: 'Error while placing the order',
+      type: '/api-errors/instrument-disabled',
+    });
+    const client = new Trading212Client('key', '', 'demo');
+    let caught: Trading212Error | undefined;
+    try {
+      await client.getPositions();
+    } catch (err) {
+      caught = err as Trading212Error;
+    }
+    expect(caught).toBeInstanceOf(Trading212Error);
+    expect(caught?.statusCode).toBe(400);
+    expect(caught?.message).toContain('disabled trading on this instrument');
+    expect(caught?.message).toContain('may now have NO stop at the broker');
   });
 
   it('attaches the 404 entity-not-found hint when T212 returns the canonical body', async () => {
@@ -268,6 +289,78 @@ describe('Trading212Client auth scheme', () => {
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     const headers = init.headers as Record<string, string>;
     expect(headers['Authorization']).toBe('soloToken');
+  });
+});
+
+describe('Trading212Client.setStopLoss', () => {
+  function makeStop(id: number, stopPrice: number, quantity = -10): T212PendingOrder {
+    return {
+      id,
+      createdAt: '2026-08-04T10:00:00Z',
+      currency: 'USD',
+      extendedHours: false,
+      filledQuantity: 0,
+      filledValue: 0,
+      initiatedFrom: 'API',
+      instrument: { currency: 'USD', isin: 'US1', name: 'Apple', ticker: 'AAPL_US_EQ' },
+      quantity,
+      side: 'SELL',
+      status: 'NEW',
+      stopPrice,
+      strategy: 'QUANTITY',
+      ticker: 'AAPL_US_EQ',
+      timeInForce: 'GOOD_TILL_CANCEL',
+      type: 'STOP',
+      value: 0,
+    };
+  }
+
+  it('restores the exact prior stop when replacement placement fails', async () => {
+    const client = new Trading212Client('key', 'secret', 'demo');
+    const oldStop = makeStop(10, 175, -10);
+    vi.spyOn(client, 'getPendingOrders').mockResolvedValue([oldStop]);
+    vi.spyOn(client, 'cancelOrder').mockResolvedValue(undefined);
+    const placeStop = vi.spyOn(client, 'placeStopOrder')
+      .mockRejectedValueOnce(new Trading212Error('replacement rejected', 422))
+      .mockResolvedValueOnce(makeStop(11, 175, -10));
+
+    await expect(client.setStopLoss('AAPL_US_EQ', 10, 180, 190))
+      .rejects.toThrow('Previous stop protection was restored');
+    expect(placeStop).toHaveBeenNthCalledWith(2, {
+      quantity: -10,
+      stopPrice: 175,
+      ticker: 'AAPL_US_EQ',
+      timeValidity: 'GOOD_TILL_CANCEL',
+    });
+  });
+
+  it('raises a critical error when replacement and rollback both fail', async () => {
+    const client = new Trading212Client('key', 'secret', 'demo');
+    vi.spyOn(client, 'getPendingOrders').mockResolvedValue([makeStop(10, 175)]);
+    vi.spyOn(client, 'cancelOrder').mockResolvedValue(undefined);
+    vi.spyOn(client, 'placeStopOrder')
+      .mockRejectedValueOnce(new Trading212Error('replacement rejected', 422))
+      .mockRejectedValueOnce(new Trading212Error('restore rejected', 422));
+
+    await expect(client.setStopLoss('AAPL_US_EQ', 10, 180, 190))
+      .rejects.toThrow('CRITICAL: stop replacement failed');
+  });
+
+  it('restores already-cancelled stops when a later cancellation fails', async () => {
+    const client = new Trading212Client('key', 'secret', 'demo');
+    vi.spyOn(client, 'getPendingOrders').mockResolvedValue([
+      makeStop(10, 175, -6),
+      makeStop(11, 176, -4),
+    ]);
+    vi.spyOn(client, 'cancelOrder')
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Trading212Error('cancel unavailable', 503));
+    const placeStop = vi.spyOn(client, 'placeStopOrder').mockResolvedValue(makeStop(12, 175, -6));
+
+    await expect(client.setStopLoss('AAPL_US_EQ', 10, 180, 190))
+      .rejects.toThrow('Previous stop protection was restored');
+    expect(placeStop).toHaveBeenCalledOnce();
+    expect(placeStop).toHaveBeenCalledWith(expect.objectContaining({ quantity: -6, stopPrice: 175 }));
   });
 });
 

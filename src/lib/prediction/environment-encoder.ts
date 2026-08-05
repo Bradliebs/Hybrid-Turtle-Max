@@ -32,11 +32,13 @@ export type EnvironmentVector = number[];
 // ── Feature Ranges for Normalisation ─────────────────────────
 // Each feature is mapped to [0, 1] using known historical extremes.
 
-const FEATURE_RANGES: Array<{ min: number; max: number }> = [
+export const FEATURE_RANGES: Array<{ min: number; max: number }> = [
   { min: 9, max: 80 },      // vix: 9 (extreme calm) to 80 (March 2020 peak)
   { min: -30, max: 100 },   // vixChange5d: % change over 5 days
   { min: -20, max: 15 },    // spyMomentum20d: 20-day return %
-  { min: 0.3, max: 5 },     // spyVolatilityRealised10d: annualised vol %
+  { min: 5, max: 90 },      // spyVolatilityRealised10d: ANNUALISED vol %, matching
+                            // buildCurrentEnvironment's sqrt(var*252)*100. SPY sits
+                            // ~7% (calm) to ~15% (typical); March 2020 peaked ~90%.
   { min: 0, max: 100 },     // drsScore: regime score from 0–100
   { min: 0, max: 1 },       // averagePortfolioCorrelation: 0–1
   { min: 0, max: 30 },      // daysInCurrentRegime: 0–30+
@@ -91,7 +93,7 @@ export async function buildCurrentEnvironment(): Promise<MarketEnvironment> {
   let vix = 20;
   let vixChange5d = 0;
   let spyMomentum20d = 0;
-  let spyVolRealised = 1.5;
+  let spyVolRealised = 15; // annualised %, matching the computation below
   let drsScore = 50;
   let avgCorrelation = 0.3;
   let daysInRegime = 5;

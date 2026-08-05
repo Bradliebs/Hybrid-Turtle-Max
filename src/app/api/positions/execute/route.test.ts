@@ -13,12 +13,14 @@ import type { NextRequest } from 'next/server';
 
 // ── Hoisted Mocks ────────────────────────────────────────────
 
-const { prismaMock, mockClient, mockEnsureDefaultUser, mockAssertSubmissionAllowed, MockSafetyControlError, mockSendAlert } = vi.hoisted(() => {
+const { prismaMock, mockClient, mockEnsureDefaultUser, mockAssertSubmissionAllowed, MockSafetyControlError, mockSendAlert, mockReconcileExecutionIntent, mockGetFXRate } = vi.hoisted(() => {
   const mockClient = {
     placeMarketOrder: vi.fn(),
     getOrder: vi.fn(),
     placeStopOrder: vi.fn(),
     getPositions: vi.fn(),
+    getOrderHistory: vi.fn(),
+    cancelOrder: vi.fn(),
   };
 
   class MockSafetyControlError extends Error {
@@ -30,6 +32,8 @@ const { prismaMock, mockClient, mockEnsureDefaultUser, mockAssertSubmissionAllow
 
   return {
     prismaMock: {
+      $executeRaw: vi.fn(),
+      $queryRaw: vi.fn(),
       executionLog: { create: vi.fn() },
       stock: { findUnique: vi.fn() },
       user: { findUnique: vi.fn() },
@@ -42,11 +46,18 @@ const { prismaMock, mockClient, mockEnsureDefaultUser, mockAssertSubmissionAllow
     mockAssertSubmissionAllowed: vi.fn().mockResolvedValue(undefined),
     MockSafetyControlError,
     mockSendAlert: vi.fn().mockResolvedValue(undefined),
+    mockReconcileExecutionIntent: vi.fn(),
+    mockGetFXRate: vi.fn().mockResolvedValue(0.8),
   };
 });
 
 vi.mock('@/lib/prisma', () => ({
   default: prismaMock,
+}));
+
+const mockValidatePreOrderRiskGates = vi.fn();
+vi.mock('@/lib/pre-order-risk-gates', () => ({
+  validatePreOrderRiskGates: (...args: unknown[]) => mockValidatePreOrderRiskGates(...args),
 }));
 
 vi.mock('@/lib/default-user', () => ({
@@ -56,6 +67,10 @@ vi.mock('@/lib/default-user', () => ({
 
 vi.mock('@/lib/alert-service', () => ({
   sendAlert: mockSendAlert,
+}));
+
+vi.mock('@/lib/execution-reconciliation', () => ({
+  reconcileExecutionIntent: (...args: unknown[]) => mockReconcileExecutionIntent(...args),
 }));
 
 vi.mock('../../../../../packages/workflow/src', () => ({
@@ -99,14 +114,17 @@ vi.mock('@/lib/pre-execution-dry-run', () => ({
 // Mock market data to avoid DB calls
 vi.mock('@/lib/market-data', () => ({
   getMarketRegime: vi.fn().mockResolvedValue('BULLISH'),
+  getFXRate: (...args: unknown[]) => mockGetFXRate(...args),
 }));
 
 import { POST } from './route';
+import { hashExecutionPayload } from '@/lib/execution-intent';
 
 // ── Test Fixtures ────────────────────────────────────────────
 
 function makeRequest(overrides: Record<string, unknown> = {}): NextRequest {
   const body = {
+    operationId: '11111111-1111-4111-8111-111111111111',
     userId: 'default-user',
     stockId: 'stock-abc-123',
     ticker: 'AAPL',
@@ -121,6 +139,7 @@ function makeRequest(overrides: Record<string, unknown> = {}): NextRequest {
   return {
     json: vi.fn().mockResolvedValue(body),
     url: 'http://localhost:3000/api/positions/execute',
+    headers: new Headers(),
   } as unknown as NextRequest;
 }
 
@@ -190,6 +209,8 @@ function setupUserMock() {
     t212IsaApiKey: 'test-isa-key',
     t212IsaApiSecret: 'test-isa-secret',
     t212IsaConnected: true,
+    equity: 10_000,
+    riskProfile: 'BALANCED',
   });
 }
 
@@ -199,6 +220,8 @@ function setupStockMock(t212Ticker = 'AAPL_US_EQ', isaEligible: boolean | null =
     t212Ticker,
     isaEligible,
     ticker: 'AAPL',
+    sleeve: 'CORE',
+    currency: 'USD',
   });
 }
 
@@ -242,8 +265,18 @@ describe('POST /api/positions/execute', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    prismaMock.$executeRaw.mockResolvedValue(1);
+    prismaMock.$queryRaw.mockResolvedValue([]);
     prismaMock.executionLog.create.mockResolvedValue({ id: 1 });
     mockAssertSubmissionAllowed.mockResolvedValue(undefined);
+    mockValidatePreOrderRiskGates.mockResolvedValue({ passed: true, failedGates: [] });
+    mockReconcileExecutionIntent.mockResolvedValue({
+      released: false,
+      status: 'RECONCILIATION_REQUIRED',
+      message: 'Broker evidence remains unresolved.',
+    });
+    mockClient.getPositions.mockResolvedValue([]);
+    mockClient.getOrderHistory.mockResolvedValue([]);
     setupUserMock();
     setupStockMock();
 
@@ -296,6 +329,147 @@ describe('POST /api/positions/execute', () => {
       const response = await POST(req);
       expect(response.status).toBe(400);
     });
+
+    it('blocks a quantity above the server-calculated maximum before broker access', async () => {
+      const response = await POST(makeRequest({ quantity: 100 }));
+      const events = await parseSSEResponse(response);
+
+      expect(events.find(event => event.event === 'error')?.data.phase).toBe('SIZING_CAP_EXCEEDED');
+      expect(mockClient.placeMarketOrder).not.toHaveBeenCalled();
+      expect(mockClient.getPositions).not.toHaveBeenCalled();
+      expect(prismaMock.$executeRaw).not.toHaveBeenCalled();
+    });
+
+    it('fails closed when authoritative sizing inputs are unavailable', async () => {
+      prismaMock.user.findUnique
+        .mockResolvedValueOnce({ equity: 0, riskProfile: 'BALANCED' });
+
+      const response = await POST(makeRequest());
+      const events = await parseSSEResponse(response);
+
+      expect(events.find(event => event.event === 'error')?.data.phase).toBe('SIZING_UNAVAILABLE');
+      expect(mockClient.placeMarketOrder).not.toHaveBeenCalled();
+    });
+
+    it('rejects a duplicate operation before any broker call', async () => {
+      prismaMock.$executeRaw.mockResolvedValueOnce(0);
+      prismaMock.$queryRaw.mockResolvedValueOnce([{
+        operationId: '11111111-1111-4111-8111-111111111111',
+        payloadHash: 'different-payload',
+        status: 'BROKER_SUBMITTED',
+        orderId: '12345',
+        positionId: null,
+      }]);
+
+      const response = await POST(makeRequest());
+      const events = await parseSSEResponse(response);
+
+      expect(events.find(event => event.event === 'error')?.data.phase).toBe('IDEMPOTENCY_CONFLICT');
+      expect(mockClient.placeMarketOrder).not.toHaveBeenCalled();
+      expect(mockClient.getPositions).not.toHaveBeenCalled();
+    });
+
+    it('fails closed when the execution safety ledger is unavailable', async () => {
+      prismaMock.$executeRaw.mockRejectedValueOnce(new Error('database locked'));
+
+      const response = await POST(makeRequest());
+      const events = await parseSSEResponse(response);
+
+      expect(events.find(event => event.event === 'error')?.data.phase).toBe('IDEMPOTENCY_UNAVAILABLE');
+      expect(mockClient.placeMarketOrder).not.toHaveBeenCalled();
+      expect(mockClient.getPositions).not.toHaveBeenCalled();
+    });
+
+    it('replays a completed matching operation without a second broker call', async () => {
+      prismaMock.$executeRaw.mockResolvedValueOnce(0);
+      prismaMock.$queryRaw.mockResolvedValueOnce([{
+        operationId: '11111111-1111-4111-8111-111111111111',
+        payloadHash: hashExecutionPayload({
+          userId: 'default-user',
+          stockId: 'stock-abc-123',
+          t212Ticker: 'AAPL_US_EQ',
+          quantity: 10,
+          stopPrice: 175,
+          accountType: 'invest',
+        }),
+        status: 'COMPLETED',
+        orderId: '12345',
+        positionId: 'position-1',
+      }]);
+
+      const response = await POST(makeRequest());
+      const events = await parseSSEResponse(response);
+
+      expect(events.find(event => event.event === 'complete')).toBeDefined();
+      expect(mockClient.placeMarketOrder).not.toHaveBeenCalled();
+      expect(mockClient.getPositions).not.toHaveBeenCalled();
+    });
+
+    it('releases a retained operation only after broker reconciliation proves no side effect', async () => {
+      prismaMock.$executeRaw.mockResolvedValueOnce(0);
+      prismaMock.$queryRaw.mockResolvedValueOnce([{
+        operationId: '11111111-1111-4111-8111-111111111111',
+        payloadHash: hashExecutionPayload({
+          userId: 'default-user',
+          stockId: 'stock-abc-123',
+          t212Ticker: 'AAPL_US_EQ',
+          quantity: 10,
+          stopPrice: 175,
+          accountType: 'invest',
+        }),
+        status: 'BROKER_OUTCOME_UNKNOWN',
+        orderId: null,
+        positionId: null,
+      }]);
+      mockReconcileExecutionIntent.mockResolvedValueOnce({
+        released: true,
+        status: 'CANCELLED',
+        message: 'No broker side effect was found.',
+      });
+
+      const response = await POST(makeRequest());
+      const events = await parseSSEResponse(response);
+
+      const errorEvent = events.find(event => event.event === 'error');
+      expect(errorEvent?.data.phase).toBe('EXECUTION_RECONCILED_NO_EFFECT');
+      expect(errorEvent?.data.critical).toBe(false);
+      expect(errorEvent?.data.retainOperationId).toBe(false);
+      expect(mockClient.placeMarketOrder).not.toHaveBeenCalled();
+    });
+
+    it('replays completion after reconciliation verifies a managed broker fill', async () => {
+      prismaMock.$executeRaw.mockResolvedValueOnce(0);
+      prismaMock.$queryRaw.mockResolvedValueOnce([{
+        operationId: '11111111-1111-4111-8111-111111111111',
+        payloadHash: hashExecutionPayload({
+          userId: 'default-user',
+          stockId: 'stock-abc-123',
+          t212Ticker: 'AAPL_US_EQ',
+          quantity: 10,
+          stopPrice: 175,
+          accountType: 'invest',
+        }),
+        status: 'RECONCILIATION_REQUIRED',
+        orderId: '12345',
+        positionId: null,
+      }]);
+      mockReconcileExecutionIntent.mockResolvedValueOnce({
+        released: true,
+        status: 'COMPLETED_RECONCILED',
+        message: 'Fill and protection verified.',
+        orderId: '12345',
+        positionId: 'position-1',
+      });
+
+      const response = await POST(makeRequest());
+      const events = await parseSSEResponse(response);
+
+      expect(events.find(event => event.event === 'complete')?.data.position).toMatchObject({
+        id: 'position-1',
+        orderId: 12345,
+      });
+      expect(mockClient.placeMarketOrder).not.toHaveBeenCalled();
+    });
   });
 
   // ── Safety Assertions ──
@@ -313,6 +487,20 @@ describe('POST /api/positions/execute', () => {
       const errorEvent = events.find(e => e.event === 'error');
       expect(errorEvent).toBeDefined();
       expect(errorEvent!.data.phase).toBe('KILL_SWITCH_BLOCK');
+      expect(mockClient.placeMarketOrder).not.toHaveBeenCalled();
+      expect(mockClient.placeStopOrder).not.toHaveBeenCalled();
+    });
+
+    it('aborts before broker calls when a portfolio risk gate fails', async () => {
+      mockValidatePreOrderRiskGates.mockResolvedValue({
+        passed: false,
+        failedGates: [{ gate: 'OPEN_RISK', passed: false, message: 'Open risk cap exceeded' }],
+      });
+
+      const response = await POST(makeRequest());
+      const events = await parseSSEResponse(response);
+
+      expect(events.find((event) => event.event === 'error')?.data.phase).toBe('RISK_GATES_FAILED');
       expect(mockClient.placeMarketOrder).not.toHaveBeenCalled();
       expect(mockClient.placeStopOrder).not.toHaveBeenCalled();
     });
@@ -427,6 +615,42 @@ describe('POST /api/positions/execute', () => {
         ticker: 'AAPL_US_EQ',
       });
     }, 30_000);
+
+    it('treats a network error during submission as an unknown broker outcome', async () => {
+      mockClient.placeMarketOrder.mockRejectedValue(new Error('connection reset'));
+
+      const response = await POST(makeRequest());
+      const events = await parseSSEResponse(response);
+
+      const errorEvent = events.find(event => event.event === 'error');
+      expect(errorEvent?.data.phase).toBe('BROKER_OUTCOME_UNKNOWN');
+      expect(errorEvent?.data.critical).toBe(true);
+      expect(prismaMock.$executeRaw).toHaveBeenCalledTimes(3);
+      expect(mockClient.placeStopOrder).not.toHaveBeenCalled();
+    });
+
+    it('treats a broker 503 during submission as an unknown outcome', async () => {
+      const { Trading212Error } = await import('@/lib/trading212');
+      mockClient.placeMarketOrder.mockRejectedValue(new Trading212Error('Unavailable', 503));
+
+      const response = await POST(makeRequest());
+      const events = await parseSSEResponse(response);
+
+      const errorEvent = events.find(event => event.event === 'error');
+      expect(errorEvent?.data.phase).toBe('BROKER_OUTCOME_UNKNOWN');
+      expect(errorEvent?.data.critical).toBe(true);
+    });
+
+    it('releases the operation after a definite broker 4xx rejection', async () => {
+      const { Trading212Error } = await import('@/lib/trading212');
+      mockClient.placeMarketOrder.mockRejectedValue(new Trading212Error('Insufficient funds', 400));
+
+      const response = await POST(makeRequest());
+      const events = await parseSSEResponse(response);
+
+      expect(events.find(event => event.event === 'error')?.data.phase).toBe('BUY_FAILED');
+      expect(prismaMock.$executeRaw).toHaveBeenCalledTimes(3);
+    });
   });
 
   // ── Phase B: Polling ──
@@ -445,18 +669,21 @@ describe('POST /api/positions/execute', () => {
       expect(completeEvent!.data.position).toBeDefined();
     }, 30_000);
 
-    it('handles 404 on getOrder by checking positions (fill detected)', async () => {
+    it('handles 404 on getOrder by requiring exact historical fill evidence', async () => {
       const { Trading212Error } = await import('@/lib/trading212');
       mockClient.placeMarketOrder.mockResolvedValue(makePendingOrder({ filledQuantity: 0 }));
       mockClient.getOrder.mockRejectedValue(new Trading212Error('Not found', 404));
-      mockClient.getPositions.mockResolvedValue([{
-        averagePricePaid: 185.50,
+      mockClient.getOrderHistory.mockResolvedValue([{
+        id: 12345,
+        ticker: 'AAPL_US_EQ',
+        type: 'MARKET',
+        side: 'BUY',
+        status: 'FILLED',
         quantity: 10,
-        instrument: { ticker: 'AAPL_US_EQ', name: 'Apple', isin: 'US0378331005', currencyCode: 'USD' },
-        currentPrice: 186,
-        createdAt: '2026-02-28T10:00:00Z',
-        quantityAvailableForTrading: 10,
-        quantityInPies: 0,
+        filledQuantity: 10,
+        filledValue: 1855,
+        dateCreated: '2026-02-28T10:00:00Z',
+        dateExecuted: '2026-02-28T10:00:01Z',
       }]);
       mockClient.placeStopOrder.mockResolvedValue(makeStopOrder());
       mockFetchForPositionCreation();
@@ -514,10 +741,11 @@ describe('POST /api/positions/execute', () => {
       expect(criticalPhase!.data.warning).toContain('CRITICAL');
       expect(criticalPhase!.data.warning).toContain('175');
 
-      // Should STILL get a complete event (position saved to DB despite stop failure)
-      const completeEvent = events.find(e => e.event === 'complete');
-      expect(completeEvent).toBeDefined();
-      expect(completeEvent!.data.stopFailed).toBe(true);
+      expect(events.find(e => e.event === 'complete')).toBeUndefined();
+      const errorEvent = events.find(e => e.event === 'error' && e.data.phase === 'UNPROTECTED_POSITION');
+      expect(errorEvent).toBeDefined();
+      expect(errorEvent!.data.critical).toBe(true);
+      expect(errorEvent!.data.retainOperationId).toBe(true);
     }, 30_000);
   });
 
@@ -597,6 +825,25 @@ describe('POST /api/positions/execute', () => {
       expect(position.ticker).toBe('AAPL');
       expect(position.filledQuantity).toBe(10);
       expect(position.accountType).toBe('invest');
+    }, 30_000);
+
+    it('does not emit complete when the terminal ledger update fails', async () => {
+      setupFullExecution();
+      mockFetchForPositionCreation({ id: 'pos-final' });
+      prismaMock.$executeRaw
+        .mockResolvedValueOnce(1)
+        .mockResolvedValueOnce(1)
+        .mockResolvedValueOnce(1)
+        .mockResolvedValueOnce(1)
+        .mockRejectedValueOnce(new Error('database locked'));
+
+      const response = await POST(makeRequest());
+      const events = await parseSSEResponse(response);
+
+      expect(events.find(event => event.event === 'complete')).toBeUndefined();
+      const errorEvent = events.find(event => event.event === 'error');
+      expect(errorEvent?.data.phase).toBe('EXECUTION_LEDGER_INCOMPLETE');
+      expect(errorEvent?.data.critical).toBe(true);
     }, 30_000);
   });
 
@@ -680,6 +927,8 @@ describe('POST /api/positions/execute', () => {
         t212IsaApiKey: null,
         t212IsaApiSecret: null,
         t212IsaConnected: false,
+        equity: 10_000,
+        riskProfile: 'BALANCED',
       });
 
       const req = makeRequest({ accountType: 'isa' });

@@ -49,6 +49,10 @@ describe('acquireAutoTradeLock', () => {
     stub = makeStub();
   });
 
+  it('keeps the stale threshold beyond the 30-minute scheduler limit', () => {
+    expect(STALE_LOCK_MINUTES).toBeGreaterThan(30);
+  });
+
   it('acquires when no existing lock', async () => {
     const result = await acquireAutoTradeLock({
       session: 'uk',

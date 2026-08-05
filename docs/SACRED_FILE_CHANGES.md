@@ -29,6 +29,16 @@ Each entry uses this shape (newest at top of the History section):
 
 ## History
 
+### 2026-08-05 — pending — Revalidate entries and make stop updates atomic
+
+- File(s):
+  - `src/cron/auto-trade.ts`: Added forced-fresh technical revalidation before live execution using the scanner-owned MA200, ADX, DI, ATR percentage, data-quality, and session-volume filters. Candidates fail closed when fresh technical data is unavailable or no longer passes.
+  - `src/lib/stop-manager.ts`: Moved stop read, monotonic comparison, update, and history creation into one transaction. The update uses compare-and-swap against the observed prior stop so a stale concurrent writer cannot lower protection.
+- Why: Execution could rely on stale scan technicals, and concurrent stop writers could both pass an out-of-transaction comparison before the lower update committed. Both paths affect real-money entry and protection decisions.
+- Behaviour preserved: Scanner thresholds, ranking, regime gates, position-sizing formulas, stop formulas, protection thresholds, stop-level inference, and the rule that stops never move downward are unchanged. The changes only refresh existing entry filters and enforce the existing monotonic stop invariant atomically.
+- Tests: Added technical revalidation and atomic stop concurrency coverage. Full suite passed 1,906/1,906 tests across 134 files. Full ESLint, strict TypeScript, production build, Prisma migration status, schema verification, and SQLite `quick_check` passed. Live health and readiness returned GREEN and READY.
+- Author: GitHub Copilot (agent), on user instruction following the whole-system audit and hardening cycle.
+
 ### 2026-07-10 — pending — Reconcile timed-out broker buys before returning
 
 - File(s):

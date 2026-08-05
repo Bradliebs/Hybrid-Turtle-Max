@@ -195,6 +195,20 @@ async function runMiddaySync() {
     const msg = (error as Error).message;
     log.error('Midday sync failed', { error: msg });
 
+    process.exitCode = 1;
+
+    try {
+      await prisma.heartbeat.create({
+        data: {
+          kind: 'MIDDAY_SYNC',
+          status: 'FAILED',
+          details: JSON.stringify({ error: msg, failedAt: new Date().toISOString() }),
+        },
+      });
+    } catch (heartbeatError) {
+      console.error('  Could not write failed midday heartbeat:', (heartbeatError as Error).message);
+    }
+
     // Send alert on failure so the user knows
     try {
       await sendAlert({

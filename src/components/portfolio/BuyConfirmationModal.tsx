@@ -123,6 +123,7 @@ export default function BuyConfirmationModal({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
+  const operationIdRef = useRef<{ storageKey: string; operationId: string } | null>(null);
 
   // ── Checklist Gate State ──
   // Phase 1 = checklist, Phase 2 = confirmation (existing trade details)
@@ -323,10 +324,24 @@ export default function BuyConfirmationModal({
     abortRef.current = controller;
 
     try {
+      const operationStorageKey = [
+        'hybridturtle:execution',
+        candidate.ticker,
+        accountType,
+        adjustedShares,
+        candidate.scanStopPrice,
+      ].join(':');
+      if (operationIdRef.current?.storageKey !== operationStorageKey) {
+        const persistedOperationId = sessionStorage.getItem(operationStorageKey);
+        const operationId = persistedOperationId ?? crypto.randomUUID();
+        sessionStorage.setItem(operationStorageKey, operationId);
+        operationIdRef.current = { storageKey: operationStorageKey, operationId };
+      }
       const response = await fetch('/api/positions/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          operationId: operationIdRef.current.operationId,
           userId: DEFAULT_USER_ID,
           stockId: candidate.ticker,                              // Yahoo ticker — resolved to stockId in execute route
           ticker: candidate.yahooTicker || candidate.ticker,      // Yahoo format for logging
@@ -388,6 +403,10 @@ export default function BuyConfirmationModal({
                   setCriticalWarning(data.warning);
                 }
               } else if (eventType === 'complete') {
+                if (operationIdRef.current) {
+                  sessionStorage.removeItem(operationIdRef.current.storageKey);
+                  operationIdRef.current = null;
+                }
                 setPhases(data.phases || []);
                 setExecutionResult({
                   orderId: data.position?.orderId,
@@ -402,6 +421,16 @@ export default function BuyConfirmationModal({
                 }
                 setSuccess(true);
               } else if (eventType === 'error') {
+                if (data.retainOperationId && data.operationId && operationIdRef.current) {
+                  sessionStorage.setItem(operationIdRef.current.storageKey, data.operationId);
+                  operationIdRef.current = {
+                    storageKey: operationIdRef.current.storageKey,
+                    operationId: data.operationId,
+                  };
+                } else if (!data.critical && operationIdRef.current) {
+                  sessionStorage.removeItem(operationIdRef.current.storageKey);
+                  operationIdRef.current = null;
+                }
                 if (data.critical) {
                   setCriticalWarning(data.error);
                 } else {

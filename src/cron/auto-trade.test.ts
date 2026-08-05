@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { revalidateLivePrice, evaluateHealthGate, HEALTH_STALE_HOURS, detectRoutingLeak, NO_ACCOUNT_SKIP_REASON } from './auto-trade';
+import { revalidateExecutionTechnicals, revalidateLivePrice, evaluateHealthGate, HEALTH_STALE_HOURS, detectRoutingLeak, NO_ACCOUNT_SKIP_REASON } from './auto-trade';
+import type { TechnicalData } from '@/types';
 
 /**
  * Auto-trade safety gate tests.
@@ -336,6 +337,48 @@ describe('auto-trade: live-price revalidation', () => {
       expect(decision.reason).toContain('120.50');
       expect(decision.reason).toContain('121.00');
     }
+  });
+});
+
+describe('auto-trade: execution-time technical revalidation', () => {
+  const technicals: TechnicalData = {
+    currentPrice: 105,
+    ma200: 90,
+    adx: 25,
+    plusDI: 30,
+    minusDI: 15,
+    atr: 3,
+    atr20DayAgo: 3,
+    atrSpiking: false,
+    medianAtr14: 3,
+    atrPercent: 2.86,
+    twentyDayHigh: 100,
+    efficiency: 45,
+    relativeStrength: 60,
+    volumeRatio: 1.2,
+    failedBreakoutAt: null,
+  };
+
+  it('keeps a candidate when fresh hard filters and volume still pass', () => {
+    expect(revalidateExecutionTechnicals(105, technicals, 'CORE', 0.8)).toEqual({ action: 'KEEP' });
+  });
+
+  it.each([
+    ['MA200', { ma200: 110 }],
+    ['ADX', { adx: 19 }],
+    ['DI', { plusDI: 10, minusDI: 20 }],
+    ['ATR', { atrPercent: 8 }],
+    ['volume', { volumeRatio: 0.7 }],
+  ])('skips when fresh %s validation fails', (_label, overrides) => {
+    const decision = revalidateExecutionTechnicals(105, { ...technicals, ...overrides }, 'CORE', 0.8);
+    expect(decision.action).toBe('SKIP');
+  });
+
+  it('fails closed when fresh technical data is unavailable', () => {
+    expect(revalidateExecutionTechnicals(105, null, 'CORE', 0.8)).toEqual({
+      action: 'SKIP',
+      reason: 'Fresh technical data unavailable',
+    });
   });
 });
 

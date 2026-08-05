@@ -3,7 +3,7 @@
 :: HybridTurtle — Watchdog (Missed Heartbeat Detection)
 :: ============================================================
 :: Checks if nightly/midday tasks ran. Sends Telegram alert if not.
-:: Schedule via Task Scheduler to run daily at 10:05 AM.
+:: Schedule via Task Scheduler every 3 hours from 10:05 AM to 10:05 PM.
 :: ============================================================
 
 title HybridTurtle Watchdog

@@ -3,37 +3,42 @@
  * Consumed by: threat-library.ts, /api/prediction/danger-level/route.ts
  * Consumes: environment-encoder.ts (types only)
  * Risk-sensitive: NO — pure math, no DB or position changes
- * Last modified: 2026-03-07
- * Notes: Cosine similarity between environment vectors.
+ * Last modified: 2026-07-29
+ * Notes: Per-feature closeness between environment vectors.
  *        Danger score = max similarity across top-K closest threats,
  *        weighted by threat severity.
  */
 
 import type { EnvironmentVector } from './environment-encoder';
 
-// ── Cosine Similarity ────────────────────────────────────────
+// ── Environment Similarity ───────────────────────────────────
 
 /**
- * Compute cosine similarity between two vectors.
- * Returns value in [-1, 1], where 1 = identical direction.
+ * How closely does one market environment resemble another?
+ *
+ * Both vectors are already normalised to [0, 1] per feature by
+ * environment-encoder.ts, so for each reading `1 - |a - b|` is the fraction
+ * of the way from "opposite extremes" to "identical". Averaging across the
+ * seven readings gives a plain-English number: 1.0 means today matches that
+ * environment exactly, 0.0 means it is the opposite on every single reading.
+ *
+ * This replaced cosine similarity (removed 29 July 2026). Cosine compares the
+ * DIRECTION of two vectors and ignores how far apart they actually are, which
+ * inflated the middle of the range: measured against the March-2020 fingerprint,
+ * a mildly choppy market (VIX 18, flat trend) scored 53 and a moderately
+ * stressed one scored 79 — over the 75 immune-alert line. The badge cried wolf.
+ * The same environments score 47 and 62 under absolute per-feature distance,
+ * which is also far easier to explain to a human.
  */
-export function cosineSimilarity(a: EnvironmentVector, b: EnvironmentVector): number {
+export function environmentSimilarity(a: EnvironmentVector, b: EnvironmentVector): number {
   if (a.length !== b.length || a.length === 0) return 0;
 
-  let dotProduct = 0;
-  let normA = 0;
-  let normB = 0;
-
+  let closenessSum = 0;
   for (let i = 0; i < a.length; i++) {
-    dotProduct += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
+    closenessSum += 1 - Math.abs(a[i] - b[i]);
   }
 
-  const denom = Math.sqrt(normA) * Math.sqrt(normB);
-  if (denom === 0) return 0;
-
-  return dotProduct / denom;
+  return closenessSum / a.length;
 }
 
 // ── Danger Score Computation ─────────────────────────────────
@@ -50,7 +55,12 @@ export interface ThreatMatch {
 export interface DangerResult {
   dangerScore: number;        // 0–100: overall danger level
   immuneAlert: boolean;       // true if dangerScore > 75
-  riskTightening: number;     // 0–0.2: fraction to reduce max open risk by
+  /**
+   * 0–0.2: SUGGESTED fraction to reduce max open risk by.
+   * Advisory only — no caller applies this. risk-gates.ts and position-sizer.ts
+   * never read it. Displayed in the danger drawer as a manual prompt.
+   */
+  riskTightening: number;
   topMatches: ThreatMatch[];  // top-5 closest threats
 }
 
@@ -77,7 +87,7 @@ export function computeDangerScore(
 
   // Compute similarity with each threat
   const matches: ThreatMatch[] = threats.map(t => {
-    const similarity = cosineSimilarity(currentVec, t.vector);
+    const similarity = environmentSimilarity(currentVec, t.vector);
     // Severity weights the match: a high-severity threat matching at 0.6 is worse
     // than a low-severity threat matching at 0.8
     const severityWeight = 0.5 + (t.severity / 100) * 0.5; // range 0.5–1.0

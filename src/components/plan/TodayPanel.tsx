@@ -605,6 +605,7 @@ function TimeToActCard({ candidate, regime, advancedView, getIntervalForNCS, fmD
               immuneAlert={dangerData.immuneAlert}
               riskTighteningPercent={dangerData.riskTighteningPercent}
               topMatches={dangerData.topMatches}
+              varianceRiskPremium={dangerData.varianceRiskPremium}
             />
           )}
 

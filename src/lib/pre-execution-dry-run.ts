@@ -9,6 +9,7 @@
  */
 
 import prisma from './prisma';
+import { isBackupValid, listBackups } from './db-backup';
 import { getCurrentExecutionMode } from './execution-mode';
 import { getKillSwitchSettings } from '../../packages/workflow/src';
 import { OPERATING_MODES, type OperatingMode } from '@/types';
@@ -75,8 +76,12 @@ export async function runPreExecutionDryRun(input: DryRunInput): Promise<DryRunR
       },
     }).catch(() => null),
     prisma.heartbeat.findFirst({
+      where: {
+        kind: 'NIGHTLY',
+        status: { in: ['SUCCESS', 'PARTIAL'] },
+      },
       orderBy: { timestamp: 'desc' as const },
-      select: { timestamp: true, details: true },
+      select: { timestamp: true, status: true, details: true },
     }).catch(() => null),
   ]);
 
@@ -114,7 +119,7 @@ export async function runPreExecutionDryRun(input: DryRunInput): Promise<DryRunR
   checks.push(checkDataFreshness(heartbeatData));
 
   // 12. Backup status
-  checks.push(checkBackupStatus(heartbeatData));
+  checks.push(checkBackupStatus());
 
   // 13. FWS Auto-No check
   checks.push(checkFWSAutoNo(input.fwsScore, input.dualScoreAction));
@@ -191,7 +196,7 @@ async function checkSystemHealth(userId: string): Promise<DryRunCheck> {
         id: 'SYSTEM_HEALTH',
         label: 'System Health',
         passed: false,
-        severity: 'SOFT_WARNING',
+        severity: 'HARD_BLOCK',
         message: 'No health check has been run yet. Run the nightly process first.',
         recovery: 'Run nightly or trigger a health check from the dashboard.',
       };
@@ -215,7 +220,7 @@ async function checkSystemHealth(userId: string): Promise<DryRunCheck> {
         id: 'SYSTEM_HEALTH',
         label: 'System Health',
         passed: false,
-        severity: 'SOFT_WARNING',
+        severity: 'HARD_BLOCK',
         message: `Health check is ${ageHours.toFixed(0)}h old — may be stale.`,
         recovery: 'Run the nightly process to refresh the health check.',
       };
@@ -233,7 +238,7 @@ async function checkSystemHealth(userId: string): Promise<DryRunCheck> {
       id: 'SYSTEM_HEALTH',
       label: 'System Health',
       passed: false,
-      severity: 'SOFT_WARNING',
+      severity: 'HARD_BLOCK',
       message: 'Unable to check system health.',
       recovery: 'Run the nightly process.',
     };
@@ -458,6 +463,7 @@ function checkBrokerConnectivity(user: UserData | null, accountType: 'invest' | 
 
 interface HeartbeatData {
   timestamp: Date;
+  status: string;
   details: string | null;
 }
 
@@ -541,19 +547,44 @@ function checkDataFreshness(heartbeat: HeartbeatData | null): DryRunCheck {
   };
 }
 
-function checkBackupStatus(heartbeat: HeartbeatData | null): DryRunCheck {
-  if (!heartbeat) {
+function checkBackupStatus(): DryRunCheck {
+  let latestBackup: ReturnType<typeof listBackups>[number] | undefined;
+  try {
+    latestBackup = listBackups()[0];
+  } catch {
     return {
       id: 'BACKUP',
       label: 'Database Backup',
       passed: false,
-      severity: 'SOFT_WARNING',
-      message: 'No backup status available.',
-      recovery: 'Run the nightly process (includes backup).',
+      severity: 'HARD_BLOCK',
+      message: 'Unable to inspect database backups.',
+      recovery: 'Check backup directory access and run the nightly process.',
     };
   }
 
-  const ageHours = (Date.now() - heartbeat.timestamp.getTime()) / (1000 * 60 * 60);
+  if (!latestBackup) {
+    return {
+      id: 'BACKUP',
+      label: 'Database Backup',
+      passed: false,
+      severity: 'HARD_BLOCK',
+      message: 'No database backup exists.',
+      recovery: 'Run the nightly process to create a backup before trading.',
+    };
+  }
+
+  if (!isBackupValid(latestBackup.filename)) {
+    return {
+      id: 'BACKUP',
+      label: 'Database Backup',
+      passed: false,
+      severity: 'HARD_BLOCK',
+      message: 'Latest database backup failed its integrity check.',
+      recovery: 'Run the nightly process to create a valid backup before trading.',
+    };
+  }
+
+  const ageHours = (Date.now() - new Date(latestBackup.createdAt).getTime()) / (1000 * 60 * 60);
 
   if (ageHours > 48) {
     return {
@@ -571,7 +602,7 @@ function checkBackupStatus(heartbeat: HeartbeatData | null): DryRunCheck {
     label: 'Database Backup',
     passed: true,
     severity: 'SOFT_WARNING',
-    message: `Nightly backup: ${ageHours.toFixed(1)}h ago.`,
+    message: `Database backup: ${ageHours.toFixed(1)}h ago.`,
   };
 }
 

@@ -53,6 +53,7 @@ vi.mock('@/lib/candidate-outcome', () => ({
 
 vi.mock('@/lib/market-data', () => ({
   getDataFreshness: () => ({ source: 'YAHOO' }),
+  getTickerDataFreshness: (ticker: string) => ({ source: 'LIVE', ageMinutes: 2, asOf: new Date(`2026-08-04T20:00:00Z`) }),
 }));
 
 const { persistScanSnapshot } = await import('./persist-scan-snapshot');
@@ -121,6 +122,8 @@ describe('persistScanSnapshot', () => {
     expect(scanCreate).toHaveBeenCalledTimes(1);
     expect(saveFilterAttributions).toHaveBeenCalledTimes(1);
     expect(saveCandidateOutcomes).toHaveBeenCalledTimes(1);
+    const provenance = saveCandidateOutcomes.mock.calls[0][4] as Map<string, { source: string; ageMinutes: number }>;
+    expect(provenance.get('AAPL')).toMatchObject({ source: 'LIVE', ageMinutes: 2 });
   });
 
   it('forwards modelLayerEnabled into the model layer', async () => {

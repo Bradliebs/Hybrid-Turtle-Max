@@ -11,6 +11,12 @@
 import type { ScanCandidate, CandidateOutcomeRecord, CandidateStage } from '@/types';
 import prisma from './prisma';
 
+export interface CandidateDataProvenance {
+  source: string;
+  ageMinutes: number | null;
+  asOf: Date | null;
+}
+
 // ── Pure extraction ─────────────────────────────────────────────────
 
 /**
@@ -74,7 +80,8 @@ export function extractCandidateOutcome(
   candidate: ScanCandidate,
   scanId: string,
   regime: string,
-  dataFreshness?: string | null
+  dataFreshness?: string | null,
+  dataProvenance?: CandidateDataProvenance,
 ): CandidateOutcomeRecord {
   const stageReached = resolveStageReached(candidate);
   const blockedReasons = collectBlockedReasons(candidate);
@@ -144,6 +151,9 @@ export function extractCandidateOutcome(
       .join(', ') || null,
 
     dataFreshness: dataFreshness ?? null,
+    dataSource: dataProvenance?.source ?? null,
+    dataAgeMinutes: dataProvenance?.ageMinutes ?? null,
+    dataAsOf: dataProvenance?.asOf ?? null,
 
     tradePlaced: false,
     tradeLogId: null,
@@ -174,7 +184,8 @@ export async function saveCandidateOutcomes(
   candidates: ScanCandidate[],
   scanId: string,
   regime: string,
-  dataFreshness?: string | null
+  dataFreshness?: string | null,
+  dataProvenanceByTicker?: ReadonlyMap<string, CandidateDataProvenance>,
 ): Promise<{ saved: number; errors: number }> {
   let saved = 0;
   let errors = 0;
@@ -184,7 +195,13 @@ export async function saveCandidateOutcomes(
   for (let i = 0; i < candidates.length; i += CHUNK) {
     const chunk = candidates.slice(i, i + CHUNK);
     for (const c of chunk) {
-      const record = extractCandidateOutcome(c, scanId, regime, dataFreshness);
+      const record = extractCandidateOutcome(
+        c,
+        scanId,
+        regime,
+        dataFreshness,
+        dataProvenanceByTicker?.get(c.ticker),
+      );
       try {
         await prisma.candidateOutcome.upsert({
           where: {
@@ -237,6 +254,9 @@ export async function saveCandidateOutcomes(
             daysToEarnings: record.daysToEarnings,
             riskGatesFailed: record.riskGatesFailed,
             dataFreshness: record.dataFreshness,
+            dataSource: record.dataSource,
+            dataAgeMinutes: record.dataAgeMinutes,
+            dataAsOf: record.dataAsOf,
             priceAtScan: record.priceAtScan,
           },
           update: {

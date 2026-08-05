@@ -1,6 +1,6 @@
 @echo off
 :: Registers HybridTurtle Watchdog scheduled task (self-elevates)
-:: Runs daily at 10:05 AM to check for missed nightly/midday heartbeats.
+:: Runs every 3 hours from 10:05 AM to check all time-gated health conditions.
 :: Staggered from 10:00 to avoid SQLite/CPU contention with Midday Sync.
 
 net session >nul 2>&1
@@ -19,12 +19,13 @@ echo.
 :: Delete existing task
 schtasks /delete /tn "HybridTurtle Watchdog" /f >nul 2>&1
 
-:: Register: runs daily at 10:05 AM (staggered from Midday Sync at 10:00)
-schtasks /create /tn "HybridTurtle Watchdog" /tr "\"%~dp0watchdog-task.bat\"" /sc daily /st 10:05 /rl highest /f
+:: Register: 10:05, 13:05, 16:05, 19:05, 22:05 daily.
+:: The later runs make the 13:00 midday and 16:00 zero-trades checks reachable.
+schtasks /create /tn "HybridTurtle Watchdog" /tr "\"%~dp0watchdog-task.bat\"" /sc daily /st 10:05 /ri 180 /du 12:00 /rl highest /f
 
 if %errorlevel% equ 0 (
     echo.
-    echo  [OK] Task "HybridTurtle Watchdog" registered — runs daily at 10:05 AM
+    echo  [OK] Task "HybridTurtle Watchdog" registered — runs every 3 hours from 10:05 AM to 10:05 PM
     echo  Applying battery/idle/limit settings...
     powershell -NoProfile -Command ^
       "$t = Get-ScheduledTask -TaskName 'HybridTurtle Watchdog';" ^

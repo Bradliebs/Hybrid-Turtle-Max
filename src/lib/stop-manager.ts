@@ -173,36 +173,42 @@ export async function updateStopLoss(
   reason: string,
   level?: ProtectionLevel
 ): Promise<void> {
-  const position = await prisma.position.findUnique({
-    where: { id: positionId },
-  });
+  await prisma.$transaction(async (tx) => {
+    const position = await tx.position.findUnique({
+      where: { id: positionId },
+    });
 
-  if (!position) {
-    throw new StopLossError(`Position ${positionId} not found`);
-  }
+    if (!position) {
+      throw new StopLossError(`Position ${positionId} not found`);
+    }
+    if (position.status === 'CLOSED') {
+      throw new StopLossError('Cannot update stop on a closed position');
+    }
+    if (newStop < position.currentStop) {
+      throw new StopLossError(
+        `Stop-loss can only be moved UP. Current: $${position.currentStop.toFixed(2)}, Attempted: $${newStop.toFixed(2)}`
+      );
+    }
+    if (newStop === position.currentStop) return;
 
-  if (position.status === 'CLOSED') {
-    throw new StopLossError('Cannot update stop on a closed position');
-  }
+    const newLevel = level ?? inferLevelFromStop(newStop, position.entryPrice, position.initialRisk);
+    const updated = await tx.position.updateMany({
+      where: {
+        id: positionId,
+        status: 'OPEN',
+        currentStop: position.currentStop,
+      },
+      data: {
+        currentStop: newStop,
+        stopLoss: newStop,
+        protectionLevel: newLevel,
+      },
+    });
+    if (updated.count !== 1) {
+      throw new StopLossError('Stop changed concurrently; reload before applying this recommendation');
+    }
 
-  // ❌ CRITICAL: MONOTONIC ENFORCEMENT
-  if (newStop < position.currentStop) {
-    throw new StopLossError(
-      `Stop-loss can only be moved UP. Current: $${position.currentStop.toFixed(2)}, Attempted: $${newStop.toFixed(2)}`
-    );
-  }
-
-  // No-op if same
-  if (newStop === position.currentStop) return;
-
-  // Infer level from stop position (not price R-multiple) if caller doesn't pass one.
-  // getProtectionLevel() takes the current price R-multiple, which we don't have here —
-  // using the stop value directly gives a correct label (e.g. trailing ATR stops).
-  const newLevel = level ?? inferLevelFromStop(newStop, position.entryPrice, position.initialRisk);
-
-  // Atomic: both writes must succeed or neither does
-  await prisma.$transaction([
-    prisma.stopHistory.create({
+    await tx.stopHistory.create({
       data: {
         positionId,
         oldStop: position.currentStop,
@@ -210,16 +216,8 @@ export async function updateStopLoss(
         level: newLevel,
         reason,
       },
-    }),
-    prisma.position.update({
-      where: { id: positionId },
-      data: {
-        currentStop: newStop,
-        stopLoss: newStop,
-        protectionLevel: newLevel,
-      },
-    }),
-  ]);
+    });
+  });
 }
 
 /**

@@ -39,8 +39,8 @@ echo.
 :: Log start timestamp
 echo [%date% %time%] Starting midday sync... >> midday-sync.log
 
-:: Run midday sync — show output in console AND save to log
-call npx tsx src/cron/midday-sync.ts 2>&1 | powershell -NoProfile -Command "$input | Tee-Object -FilePath 'midday-sync.log' -Append"
+:: Run midday sync — show output in console AND save to log while preserving npx's exit code
+powershell -NoProfile -Command "& { & npx.cmd tsx src/cron/midday-sync.ts 2>&1 | Tee-Object -FilePath 'midday-sync.log' -Append; exit $LASTEXITCODE }"
 
 set EXIT_CODE=%ERRORLEVEL%
 
@@ -58,3 +58,4 @@ echo  Full log saved to: midday-sync.log
 echo.
 :: Only pause when running interactively (not from Task Scheduler)
 if /i NOT "%~1"=="--scheduled" pause
+exit /b %EXIT_CODE%

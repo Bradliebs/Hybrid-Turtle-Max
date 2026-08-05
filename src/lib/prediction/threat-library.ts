@@ -33,8 +33,13 @@ export interface ThreatEntry {
 // ── Bootstrap Threat Entries ─────────────────────────────────
 // Pre-populated from known historical crisis environments.
 // Vectors are manually encoded from public data.
+//
+// spyVolatilityRealised10d is ANNUALISED % (sqrt(var*252)*100), matching
+// buildCurrentEnvironment. The values below are ESTIMATES of SPY 10-day
+// realised vol at each event, not exact measurements. Phase 2 calibration
+// (scripts/calibrate-danger-score.ts) recomputes them from actual price data.
 
-const BOOTSTRAP_THREATS: Array<{
+export const BOOTSTRAP_THREATS: Array<{
   label: string;
   environment: MarketEnvironment;
   severity: number;
@@ -46,7 +51,7 @@ const BOOTSTRAP_THREATS: Array<{
       vix: 65,
       vixChange5d: 80,
       spyMomentum20d: -15,
-      spyVolatilityRealised10d: 4.5,
+      spyVolatilityRealised10d: 80,
       drsScore: 15,
       averagePortfolioCorrelation: 0.85,
       daysInCurrentRegime: 1,
@@ -60,7 +65,7 @@ const BOOTSTRAP_THREATS: Array<{
       vix: 40,
       vixChange5d: 60,
       spyMomentum20d: -8,
-      spyVolatilityRealised10d: 3.0,
+      spyVolatilityRealised10d: 35,
       drsScore: 25,
       averagePortfolioCorrelation: 0.70,
       daysInCurrentRegime: 2,
@@ -74,7 +79,7 @@ const BOOTSTRAP_THREATS: Array<{
       vix: 33,
       vixChange5d: 20,
       spyMomentum20d: -12,
-      spyVolatilityRealised10d: 2.5,
+      spyVolatilityRealised10d: 28,
       drsScore: 20,
       averagePortfolioCorrelation: 0.65,
       daysInCurrentRegime: 8,
@@ -88,7 +93,7 @@ const BOOTSTRAP_THREATS: Array<{
       vix: 36,
       vixChange5d: 40,
       spyMomentum20d: -10,
-      spyVolatilityRealised10d: 2.8,
+      spyVolatilityRealised10d: 30,
       drsScore: 18,
       averagePortfolioCorrelation: 0.60,
       daysInCurrentRegime: 3,
@@ -102,7 +107,7 @@ const BOOTSTRAP_THREATS: Array<{
       vix: 28,
       vixChange5d: 30,
       spyMomentum20d: -5,
-      spyVolatilityRealised10d: 2.0,
+      spyVolatilityRealised10d: 22,
       drsScore: 30,
       averagePortfolioCorrelation: 0.55,
       daysInCurrentRegime: 4,

@@ -1151,7 +1151,7 @@ All prediction phases operate as **post-processing layers** on top of the core N
 - Causal invariance filter (IRM) identifies which signals are stable across all regimes vs regime-dependent.
 
 **Market Context:**
-- Immune system matches current market conditions against historical crisis fingerprints (March 2020, flash crash, rate shock). High danger tightens risk.
+- Immune system matches current market conditions against historical crisis fingerprints (March 2020, flash crash, rate shock). High danger raises an advisory alert and a suggested risk reduction — it does not change risk gates or sizing automatically.
 - Lead-lag graph detects upstream asset movements that historically precede ticker price action.
 - GNN (GraphSAGE) learns cross-asset signal propagation patterns.
 - VPIN order flow measures buying vs selling pressure as a leading momentum indicator.

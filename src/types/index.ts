@@ -1270,6 +1270,9 @@ export interface CandidateOutcomeRecord {
 
   // ── Data quality ──
   dataFreshness: string | null;
+  dataSource: string | null;
+  dataAgeMinutes: number | null;
+  dataAsOf: Date | null;
 
   // ── Trade linkage ──
   tradePlaced: boolean;

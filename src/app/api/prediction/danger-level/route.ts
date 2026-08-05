@@ -12,6 +12,7 @@ import { NextResponse } from 'next/server';
 import { apiError } from '@/lib/api-response';
 import { assessDangerLevel, seedThreatLibrary } from '@/lib/prediction/threat-library';
 import { IMMUNE_ALERT_THRESHOLD } from '@/lib/prediction/danger-matcher';
+import { computeVrp, describeVrp } from '@/lib/prediction/variance-risk-premium';
 import { sendAlert } from '@/lib/alert-service';
 import { prisma } from '@/lib/prisma';
 
@@ -23,6 +24,9 @@ const DANGER_ALERT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 export async function GET() {
   try {
     const result = await assessDangerLevel();
+
+    // Advisory only — displayed in the drawer, feeds no gate and no sizing.
+    const vrp = computeVrp(result.environment.vix, result.environment.spyVolatilityRealised10d);
 
     // Fire notification if danger crosses threshold — but only once per 24h
     if (result.dangerScore > IMMUNE_ALERT_THRESHOLD * 100 && result.topMatches.length > 0) {
@@ -61,6 +65,12 @@ export async function GET() {
         riskTighteningPercent: Math.round(result.riskTightening * 100),
         topMatches: result.topMatches,
         environment: result.environment,
+        varianceRiskPremium: {
+          vrp: Math.round(vrp.vrp * 100) / 100,
+          state: vrp.state,
+          approximatePercentile: vrp.approximatePercentile,
+          description: describeVrp(vrp),
+        },
       },
     });
   } catch (error) {

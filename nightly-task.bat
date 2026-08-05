@@ -41,8 +41,8 @@ call node scripts/auto-migrate.mjs --quiet
 :: Log start timestamp
 echo [%date% %time%] Starting nightly process... >> nightly.log
 
-:: Run nightly task — show output in console AND append to log
-call npx tsx src/cron/nightly.ts --run-now 2>&1 | powershell -NoProfile -Command "$input | Tee-Object -FilePath 'nightly.log' -Append"
+:: Run nightly task — show output in console AND append to log while preserving npx's exit code
+powershell -NoProfile -Command "& { & npx.cmd tsx src/cron/nightly.ts --run-now 2>&1 | Tee-Object -FilePath 'nightly.log' -Append; exit $LASTEXITCODE }"
 
 set EXIT_CODE=%ERRORLEVEL%
 
@@ -60,3 +60,4 @@ echo  Full log saved to: nightly.log
 echo.
 :: Only pause when running interactively (not from Task Scheduler)
 if /i NOT "%~1"=="--scheduled" pause
+exit /b %EXIT_CODE%

@@ -59,7 +59,7 @@ import { sendAlert } from '@/lib/alert-service';
 import { selectStopHitTriggerPrice } from '@/lib/stop-hit-detection';
 import { backupDatabase } from '@/lib/db-backup';
 import { isAutoTradingEnabled } from '../../packages/workflow/src';
-import { Trading212Client } from '@/lib/trading212';
+import { Trading212Client, Trading212Error } from '@/lib/trading212';
 import type { T212AccountType } from '@/lib/trading212-dual';
 import { decryptField } from '@/lib/crypto';
 import { isEnabled } from '@/lib/feature-flags';
@@ -72,7 +72,12 @@ import { runFullCalibration } from '@/lib/prediction/bootstrap-calibration';
 import { runTraining as runMetaModelTraining } from '@/lib/prediction/meta-model-trainer';
 import { recomputeLeadLagGraph } from '@/lib/prediction/lead-lag-graph';
 import { runGNNTraining } from '@/lib/prediction/gnn/gnn-trainer';
+import { buildCurrentEnvironment } from '@/lib/prediction/environment-encoder';
+import { computeVrp } from '@/lib/prediction/variance-risk-premium';
 import { RISK_PROFILES, EQUITY_REVIEW_THRESHOLDS, type RiskProfileType, type Sleeve } from '@/types';
+import { randomUUID } from 'node:crypto';
+import { claimExecutionIntent, hashExecutionPayload, hasActiveBrokerSubmissionLease, updateExecutionIntent } from '@/lib/execution-intent';
+import { getHistoricalFill, recoverTimedOutBuy } from '@/lib/buy-timeout-recovery';
 
 // Track which (accountType) decrypt failures have already alerted this
 // process so we send exactly one CRITICAL alert per account per nightly run,
@@ -1617,10 +1622,105 @@ async function runNightlyProcess() {
               continue;
             }
 
-            // Place market buy order for the add
+            // Claim durable intent before any broker mutation. The payload-level
+            // uniqueness prevents a second process from submitting the same add.
             try {
-              const buyOrder = await client.placeMarketOrder({ quantity: pa.addShares, ticker: t212Ticker });
-              console.log(`  [6-auto] ${pa.ticker}: pyramid add placed (order ${buyOrder.id}, ${pa.addShares} shares)`);
+              const payloadHash = hashExecutionPayload({
+                type: 'PYRAMID_ADD',
+                userId,
+                positionId: pos.id,
+                stockId: pos.stockId,
+                addNumber: pa.addNumber,
+                quantity: pa.addShares,
+                stopPrice: pos.currentStop,
+                accountType: acctType,
+              });
+              const activePayloadHash = hashExecutionPayload({
+                type: 'PYRAMID_ADD',
+                userId,
+                positionId: pos.id,
+                accountType: acctType,
+              });
+              const requestedOperationId = randomUUID();
+              const intentClaim = await claimExecutionIntent({
+                operationId: requestedOperationId,
+                userId,
+                payloadHash,
+                activePayloadHash,
+                stockId: pos.stockId,
+                ticker: t212Ticker,
+                accountType: acctType,
+                requestedQuantity: pa.addShares,
+                stopPrice: pos.currentStop,
+              });
+              const operationId = intentClaim.claimed ? requestedOperationId : intentClaim.operationId;
+              let buyOrderId: number;
+              let pyramidFilledQty = 0;
+              let pyramidFilledPrice = 0;
+              let pyramidFilled = false;
+
+              if (intentClaim.claimed) {
+                await updateExecutionIntent(operationId, {
+                  status: 'PYRAMID_BROKER_SUBMITTING',
+                  positionId: pos.id,
+                  baselineQuantity: pos.shares,
+                  markBrokerSubmitted: true,
+                });
+                try {
+                  const buyOrder = await client.placeMarketOrder({ quantity: pa.addShares, ticker: t212Ticker });
+                  buyOrderId = buyOrder.id;
+                  await updateExecutionIntent(operationId, {
+                    status: 'PYRAMID_BROKER_SUBMITTED',
+                    orderId: String(buyOrderId),
+                  });
+                  console.log(`  [6-auto] ${pa.ticker}: pyramid add placed (order ${buyOrderId}, ${pa.addShares} shares)`);
+                } catch (submitError) {
+                  const definiteRejection = submitError instanceof Trading212Error
+                    && submitError.statusCode >= 400
+                    && submitError.statusCode < 500
+                    && submitError.statusCode !== 408;
+                  await updateExecutionIntent(operationId, {
+                    status: definiteRejection ? 'PYRAMID_FAILED_PRE_SUBMISSION' : 'PYRAMID_BROKER_OUTCOME_UNKNOWN',
+                    error: (submitError as Error).message,
+                    release: definiteRejection,
+                  });
+                  throw submitError;
+                }
+              } else {
+                if (hasActiveBrokerSubmissionLease(intentClaim.status, intentClaim.brokerSubmittedAt)) {
+                  console.warn(`  [6-auto] ${pa.ticker}: pyramid intent ${operationId} is still owned by an active submitter; retained without cancellation`);
+                  pyramidsFailed++;
+                  continue;
+                }
+                if (!intentClaim.orderId) {
+                  console.warn(`  [6-auto] ${pa.ticker}: existing pyramid intent ${operationId} has no exact broker order ID; retained for review`);
+                  pyramidsFailed++;
+                  continue;
+                }
+                buyOrderId = Number(intentClaim.orderId);
+                const recovery = await recoverTimedOutBuy(client, buyOrderId);
+                if (recovery.status === 'CANCELLED') {
+                  await updateExecutionIntent(operationId, {
+                    status: 'PYRAMID_CANCELLED',
+                    error: 'Exact broker history confirmed terminal cancellation with zero fill',
+                    release: true,
+                  });
+                  pyramidsFailed++;
+                  continue;
+                }
+                if (recovery.status === 'UNRESOLVED') {
+                  await updateExecutionIntent(operationId, {
+                    status: 'PYRAMID_RECONCILIATION_REQUIRED',
+                    error: recovery.error,
+                  });
+                  console.warn(`  [6-auto] ${pa.ticker}: retained pyramid order ${buyOrderId}: ${recovery.error}`);
+                  pyramidsFailed++;
+                  continue;
+                }
+                pyramidFilledQty = recovery.filledQuantity;
+                pyramidFilledPrice = recovery.filledPrice;
+                pyramidFilled = true;
+              }
 
               // ── H-2 fix (2026-05-17) ─────────────────────────────
               // Poll for fill before mutating DB / placing oversized stop.
@@ -1634,13 +1734,10 @@ async function runNightlyProcess() {
               // will be re-evaluated on the next nightly during market hours.
               const PYRAMID_POLL_MAX = 12;       // 12 × 5s = 60s — bounded
               const PYRAMID_POLL_INTERVAL = 5000;
-              let pyramidFilledQty = 0;
-              let pyramidFilledPrice = 0;
-              let pyramidFilled = false;
-              for (let attempt = 1; attempt <= PYRAMID_POLL_MAX; attempt++) {
+              for (let attempt = 1; !pyramidFilled && attempt <= PYRAMID_POLL_MAX; attempt++) {
                 await new Promise(r => setTimeout(r, PYRAMID_POLL_INTERVAL));
                 try {
-                  const order = await client.getOrder(buyOrder.id);
+                  const order = await client.getOrder(buyOrderId);
                   if (order.filledQuantity > 0 && order.filledQuantity >= pa.addShares * 0.99) {
                     pyramidFilledQty = order.filledQuantity;
                     pyramidFilledPrice = order.filledValue > 0 ? order.filledValue / order.filledQuantity : pa.currentPrice;
@@ -1648,15 +1745,16 @@ async function runNightlyProcess() {
                     break;
                   }
                 } catch (pollErr) {
-                  // 404 → order completed and removed from pending; check positions
+                  // 404 means the order left the pending collection. Attribute a
+                  // fill only from exact order history, never ticker-level growth.
                   const isNotFound = pollErr instanceof Error && /404/.test(pollErr.message);
                   if (isNotFound) {
                     try {
-                      const t212Positions = await client.getPositions();
-                      const matchedPos = t212Positions.find(p => p.instrument?.ticker === t212Ticker);
-                      if (matchedPos && matchedPos.quantity >= pos.shares + pa.addShares * 0.99) {
-                        pyramidFilledQty = matchedPos.quantity - pos.shares;
-                        pyramidFilledPrice = matchedPos.averagePricePaid;
+                      const history = await client.getOrderHistory(50, { maxPages: 2 });
+                      const fill = getHistoricalFill(history, buyOrderId);
+                      if (fill && fill.filledQuantity >= pa.addShares * 0.99) {
+                        pyramidFilledQty = fill.filledQuantity;
+                        pyramidFilledPrice = fill.filledPrice;
                         pyramidFilled = true;
                         break;
                       }
@@ -1666,57 +1764,97 @@ async function runNightlyProcess() {
               }
 
               if (!pyramidFilled) {
-                // Buy is queued (market closed) — cancel to avoid unattended Monday-open fill,
-                // and DO NOT mutate DB. Re-evaluate on next nightly.
-                let cancelMsg = 'cancelled';
-                try {
-                  await client.cancelOrder(buyOrder.id);
-                } catch (cancelErr) {
-                  cancelMsg = `cancel failed: ${(cancelErr as Error).message}`;
-                }
-                console.warn(`  [6-auto] ${pa.ticker}: pyramid buy not filled within ${(PYRAMID_POLL_MAX * PYRAMID_POLL_INTERVAL / 1000).toFixed(0)}s — order ${cancelMsg}; DB not updated`);
-                alerts.push(`⚠ Pyramid ${pa.ticker} queued — ${cancelMsg}. Will re-evaluate next nightly.`);
+                const recovery = await recoverTimedOutBuy(client, buyOrderId);
+                if (recovery.status === 'FILLED') {
+                  pyramidFilledQty = recovery.filledQuantity;
+                  pyramidFilledPrice = recovery.filledPrice;
+                  pyramidFilled = true;
+                } else {
+                  const released = recovery.status === 'CANCELLED';
+                  const recoveryMessage = released
+                    ? 'Exact broker history confirmed terminal cancellation with zero fill'
+                    : recovery.error;
+                  await updateExecutionIntent(operationId, {
+                    status: released ? 'PYRAMID_CANCELLED' : 'PYRAMID_RECONCILIATION_REQUIRED',
+                    error: recoveryMessage,
+                    release: released,
+                  });
+                  console.warn(`  [6-auto] ${pa.ticker}: pyramid buy not filled within ${(PYRAMID_POLL_MAX * PYRAMID_POLL_INTERVAL / 1000).toFixed(0)}s — ${recoveryMessage}; DB not updated`);
+                  alerts.push(`⚠ Pyramid ${pa.ticker} queued — ${recoveryMessage}.`);
                 await prisma.executionLog.create({
                   data: {
                     ticker: pa.ticker,
                     phase: 'PYRAMID_BUY_QUEUED',
-                    orderId: String(buyOrder.id),
-                    requestBody: JSON.stringify({ shares: pa.addShares, t212Ticker, addNumber: pa.addNumber, polled: PYRAMID_POLL_MAX, cancelResult: cancelMsg }),
+                      orderId: String(buyOrderId),
+                      requestBody: JSON.stringify({ shares: pa.addShares, t212Ticker, addNumber: pa.addNumber, polled: PYRAMID_POLL_MAX, recovery: recovery.status }),
                     responseStatus: null,
                     quantity: pa.addShares,
                     accountType: acctType,
-                    error: 'Pyramid buy did not fill within poll window — market likely closed; order cancelled to avoid unattended weekend fill',
+                      error: recoveryMessage,
                   },
                 });
                 await sendAlert({
                   type: 'PYRAMID_ADD',
-                  title: `⚠ Pyramid ${pa.ticker} did not fill — cancelled`,
-                  message: `Buy order ${buyOrder.id} did not confirm within ${(PYRAMID_POLL_MAX * PYRAMID_POLL_INTERVAL / 1000).toFixed(0)}s. Order ${cancelMsg}. No DB change. Will re-evaluate next nightly when market is open.`,
-                  data: { ticker: pa.ticker, addNumber: pa.addNumber, orderId: String(buyOrder.id), cancel: cancelMsg },
+                    title: `⚠ Pyramid ${pa.ticker} did not confirm`,
+                    message: `Buy order ${buyOrderId} did not confirm within ${(PYRAMID_POLL_MAX * PYRAMID_POLL_INTERVAL / 1000).toFixed(0)}s. ${recoveryMessage}. No DB change.`,
+                    data: { ticker: pa.ticker, addNumber: pa.addNumber, orderId: String(buyOrderId), recovery: recovery.status },
                   priority: 'WARNING',
                   telegramDedupeKey: `nightly:pyramid-queued:${pa.ticker}:${pa.addNumber}`,
                   telegramThrottleMs: 24 * 60 * 60 * 1000,
                 });
                 pyramidsFailed++;
                 continue;
+                }
               }
 
               // Note: entryPrice now uses actual filledPrice (post H-2). Slippage on
               // the add is small relative to R and the position already has a stop.
 
               // Fix 4: Update position shares in DB so next nightly uses correct count
-              const newTotalShares = pos.shares + pyramidFilledQty;
-              await prisma.position.update({
-                where: { id: pos.id },
-                data: { shares: newTotalShares },
+              const finalization = await prisma.$transaction(async (tx) => {
+                const existingAdd = await tx.tradeLog.findUnique({
+                  where: { t212OrderId: String(buyOrderId) },
+                });
+                if (existingAdd) {
+                  const currentPosition = await tx.position.findUniqueOrThrow({ where: { id: pos.id } });
+                  return { newTotalShares: currentPosition.shares, alreadyFinalized: true };
+                }
+                const updatedPosition = await tx.position.update({
+                  where: { id: pos.id },
+                  data: { shares: { increment: pyramidFilledQty } },
+                });
+                await tx.tradeLog.create({
+                  data: {
+                    userId,
+                    positionId: pos.id,
+                    ticker: pa.ticker,
+                    tradeDate: new Date(),
+                    tradeType: 'ADD',
+                    entryPrice: pyramidFilledPrice,
+                    shares: pyramidFilledQty,
+                    decision: 'AUTO_PYRAMID',
+                    decisionReason: `Auto pyramid add #${pa.addNumber} at ${pa.rMultiple.toFixed(1)}R`,
+                    t212OrderId: String(buyOrderId),
+                    t212Ticker,
+                    fillPrice: pyramidFilledPrice,
+                  },
+                });
+                return { newTotalShares: updatedPosition.shares, alreadyFinalized: false };
               });
+              const newTotalShares = finalization.newTotalShares;
 
               // Fix 2: Place protective stop for the full position (original + added shares)
               // This ensures the added shares are covered by the existing stop on T212.
+              let pyramidStopCovered = true;
+              let pyramidStopOrderId: string | undefined;
+              let pyramidStopError: string | undefined;
               try {
-                await client.setStopLoss(t212Ticker, newTotalShares, pos.currentStop);
+                const stopOrder = await client.setStopLoss(t212Ticker, newTotalShares, pos.currentStop);
+                pyramidStopOrderId = stopOrder ? String(stopOrder.id) : undefined;
                 console.log(`  [6-auto] ${pa.ticker}: stop updated for ${newTotalShares.toFixed(2)} total shares`);
               } catch (stopErr) {
+                pyramidStopCovered = false;
+                pyramidStopError = (stopErr as Error).message;
                 console.warn(`  [6-auto] ${pa.ticker}: stop update after pyramid failed — ${(stopErr as Error).message}`);
                 alerts.push(`⚠ ${pa.ticker}: pyramid bought but stop may not cover new shares — check T212`);
               }
@@ -1726,7 +1864,7 @@ async function runNightlyProcess() {
                 data: {
                   ticker: pa.ticker,
                   phase: 'PYRAMID_ADD',
-                  orderId: String(buyOrder.id),
+                  orderId: String(buyOrderId),
                   requestBody: JSON.stringify({ shares: pyramidFilledQty, requested: pa.addShares, t212Ticker, addNumber: pa.addNumber, newTotalShares, filledPrice: pyramidFilledPrice }),
                   responseStatus: 200,
                   quantity: pyramidFilledQty,
@@ -1734,31 +1872,36 @@ async function runNightlyProcess() {
                 },
               });
 
-              // Log to TradeLog as ADD type — uses ACTUAL filled price/qty (post H-2)
-              await prisma.tradeLog.create({
-                data: {
-                  userId,
-                  positionId: pos.id,
-                  ticker: pa.ticker,
-                  tradeDate: new Date(),
-                  tradeType: 'ADD',
-                  entryPrice: pyramidFilledPrice,
-                  shares: pyramidFilledQty,
-                  decision: 'AUTO_PYRAMID',
-                  decisionReason: `Auto pyramid add #${pa.addNumber} at ${pa.rMultiple.toFixed(1)}R`,
-                },
+              await updateExecutionIntent(operationId, {
+                status: pyramidStopCovered ? 'PYRAMID_COMPLETED' : 'PYRAMID_RECONCILIATION_REQUIRED',
+                positionId: pos.id,
+                orderId: String(buyOrderId),
+                stopOrderId: pyramidStopOrderId,
+                error: pyramidStopError,
+                release: pyramidStopCovered,
               });
 
-              // Send alert
-              await sendAlert({
-                type: 'PYRAMID_ADD',
-                title: `✅ Auto pyramid: ${pa.ticker} add #${pa.addNumber}`,
-                message: `Bought ${pyramidFilledQty.toFixed(2)} shares @ ${pyramidFilledPrice.toFixed(2)} (${pa.rMultiple.toFixed(1)}R). Total: ${newTotalShares.toFixed(2)} shares. Stop covers full position.`,
-                priority: 'INFO',
-              });
+              if (pyramidStopCovered) {
+                await sendAlert({
+                  type: 'PYRAMID_ADD',
+                  title: `✅ Auto pyramid: ${pa.ticker} add #${pa.addNumber}`,
+                  message: `Bought ${pyramidFilledQty.toFixed(2)} shares @ ${pyramidFilledPrice.toFixed(2)} (${pa.rMultiple.toFixed(1)}R). Total: ${newTotalShares.toFixed(2)} shares. Stop covers full position.`,
+                  priority: 'INFO',
+                });
+              } else {
+                await sendAlert({
+                  type: 'PYRAMID_ADD',
+                  title: `🚨 ${pa.ticker} pyramid filled — stop unconfirmed`,
+                  message: `Bought ${pyramidFilledQty.toFixed(2)} shares @ ${pyramidFilledPrice.toFixed(2)}, but full-position stop protection was not confirmed. Check T212 immediately.`,
+                  data: { ticker: pa.ticker, addNumber: pa.addNumber, orderId: String(buyOrderId), error: pyramidStopError },
+                  priority: 'CRITICAL',
+                });
+              }
 
               pyramidsExecuted++;
-              alerts.push(`✅ Pyramid ${pa.ticker}: ${pyramidFilledQty.toFixed(2)} shares @ ${pyramidFilledPrice.toFixed(2)} (${pa.rMultiple.toFixed(1)}R)`);
+              alerts.push(pyramidStopCovered
+                ? `✅ Pyramid ${pa.ticker}: ${pyramidFilledQty.toFixed(2)} shares @ ${pyramidFilledPrice.toFixed(2)} (${pa.rMultiple.toFixed(1)}R)`
+                : `🚨 Pyramid ${pa.ticker} filled but stop protection is unconfirmed`);
             } catch (err) {
               console.error(`  [6-auto] ${pa.ticker}: pyramid buy failed — ${(err as Error).message}`);
               alerts.push(`⚠ Pyramid ${pa.ticker} FAILED: ${(err as Error).message}`);
@@ -2238,6 +2381,33 @@ async function runNightlyProcess() {
       }
     }
 
+    // Step 7f: Variance risk premium shadow log (advisory only — nothing reads it)
+    console.log('  [7f] Logging variance risk premium (shadow)...');
+    try {
+      const vrpEnv = await buildCurrentEnvironment();
+      const vrpResult = computeVrp(vrpEnv.vix, vrpEnv.spyVolatilityRealised10d);
+      const { appendFileSync, mkdirSync } = await import('node:fs');
+      const { join } = await import('node:path');
+      const dir = join(process.cwd(), 'data');
+      mkdirSync(dir, { recursive: true });
+      appendFileSync(
+        join(dir, 'vrp-shadow.jsonl'),
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          vix: vrpEnv.vix,
+          realisedVol10dAnnualised: vrpEnv.spyVolatilityRealised10d,
+          vrp: vrpResult.vrp,
+          state: vrpResult.state,
+          approximatePercentile: vrpResult.approximatePercentile,
+        }) + '\n',
+        'utf8'
+      );
+      console.log(`        VRP ${vrpResult.vrp.toFixed(2)} (${vrpResult.state})`);
+    } catch (error) {
+      // Non-critical — shadow logging must never affect the pipeline
+      console.warn('  [7f] VRP shadow log failed:', (error as Error).message);
+    }
+
     // Step 8: Send Telegram summary (isolated — failure doesn't block heartbeat)
     console.log('  [8/9] Sending Telegram summary...');
     startStep('8', 'Telegram alert');
@@ -2380,6 +2550,7 @@ async function runNightlyProcess() {
     console.log('========================================');
   } catch (error) {
     console.error('[HybridTurtle] Nightly process error:', error);
+    process.exitCode = 1;
 
     // Still write heartbeat on failure
     try {
@@ -2394,7 +2565,10 @@ async function runNightlyProcess() {
   } finally {
     // Safety net: if latest heartbeat is still RUNNING, mark as FAILED
     try {
-      const latest = await prisma.heartbeat.findFirst({ orderBy: { timestamp: 'desc' } });
+      const latest = await prisma.heartbeat.findFirst({
+        where: { kind: 'NIGHTLY' },
+        orderBy: { timestamp: 'desc' },
+      });
       if (latest?.status === 'RUNNING') {
         await prisma.heartbeat.create({
           data: {
@@ -2415,5 +2589,5 @@ const args = process.argv.slice(2);
 
 if (args.includes('--run-now')) {
   console.log('[HybridTurtle] Running nightly process immediately (--run-now)');
-  runNightlyProcess().then(() => process.exit(0));
+  runNightlyProcess().then(() => process.exit(process.exitCode ?? 0));
 }

@@ -15,7 +15,7 @@
 import defaultPrisma from './prisma';
 
 export const AUTO_TRADE_LOCK_KEY = 'auto-trade.run-lock';
-export const STALE_LOCK_MINUTES = 15;
+export const STALE_LOCK_MINUTES = 35;
 
 export interface LockHolder {
   pid: number;

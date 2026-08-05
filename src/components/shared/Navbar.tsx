@@ -304,6 +304,7 @@ function NavDangerBadge() {
       immuneAlert={dangerData.immuneAlert}
       riskTighteningPercent={dangerData.riskTighteningPercent}
       topMatches={dangerData.topMatches}
+      varianceRiskPremium={dangerData.varianceRiskPremium}
       compact
     />
   );

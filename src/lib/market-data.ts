@@ -119,6 +119,7 @@ interface YahooFinanceInstance {
 interface CacheEntry<T> {
   data: T;
   expiry: number;
+  fetchedAt?: number;
 }
 
 // Use globalThis to survive Next.js dev-mode hot-reloads (same pattern as prisma.ts)
@@ -129,11 +130,13 @@ const globalForCache = globalThis as unknown as {
   __hybridTurtlePreCacheStarted?: boolean;
   __hybridTurtleIndicesCache?: { data: MarketIndex[]; expiry: number } | null;
   __hybridTurtleFxCache?: Map<string, CacheEntry<number>>;
+  __hybridTurtleTickerFreshness?: Map<string, TickerFreshnessInfo>;
 };
 
 const quoteCache = globalForCache.__hybridTurtleQuoteCache ??= new Map();
 const historicalCache = globalForCache.__hybridTurtleHistoricalCache ??= new Map();
 const weeklyCache = globalForCache.__hybridTurtleWeeklyCache ??= new Map();
+const tickerFreshness = globalForCache.__hybridTurtleTickerFreshness ??= new Map();
 const QUOTE_TTL = 5 * 60_000;      // 5 minutes — real-money portfolio display demands fresh prices
 const HISTORICAL_TTL = 86_400_000; // 24 hours (daily bars don't change intraday)
 const FX_TTL = 30 * 60_000;        // 30 minutes — FX rates move slowly
@@ -147,6 +150,12 @@ interface FreshnessInfo {
   source: DataSource;
   lastFetchTimestamp: number;
   ageMinutes: number;
+}
+
+export interface TickerFreshnessInfo {
+  source: DataSource | 'UNKNOWN';
+  asOf: Date | null;
+  ageMinutes: number | null;
 }
 
 let lastLiveFetchTimestamp = 0;
@@ -183,6 +192,23 @@ export function getDataFreshness(): FreshnessInfo {
     lastFetchTimestamp: lastLiveFetchTimestamp,
     ageMinutes: Math.round(age),
   };
+}
+
+export function getTickerDataFreshness(ticker: string): TickerFreshnessInfo {
+  const freshness = tickerFreshness.get(ticker);
+  if (!freshness?.asOf) return { source: 'UNKNOWN', asOf: null, ageMinutes: null };
+  return {
+    ...freshness,
+    ageMinutes: Math.max(0, Math.round((Date.now() - freshness.asOf.getTime()) / 60_000)),
+  };
+}
+
+function recordTickerFreshness(ticker: string, source: DataSource, asOfMs: number): void {
+  tickerFreshness.set(ticker, {
+    source,
+    asOf: new Date(asOfMs),
+    ageMinutes: Math.max(0, Math.round((Date.now() - asOfMs) / 60_000)),
+  });
 }
 
 // ── Rate-limited chart queue ──
@@ -285,12 +311,19 @@ export async function getDailyPrices(
   forceRefresh = false
 ): Promise<DailyBar[]> {
   // Route to EODHD if configured
-  if (isEodhd()) return eodhd.getDailyPrices(ticker, outputSize);
+  if (isEodhd()) {
+    const bars = await eodhd.getDailyPrices(ticker, outputSize);
+    if (bars.length > 0) recordTickerFreshness(ticker, 'LIVE', Date.now());
+    return bars;
+  }
 
   const cacheKey = `${ticker}:${outputSize}`;
   if (!forceRefresh) {
     const cached = historicalCache.get(cacheKey);
-    if (cached && cached.expiry > Date.now()) return cached.data;
+    if (cached && cached.expiry > Date.now()) {
+      recordTickerFreshness(ticker, 'CACHE', cached.fetchedAt ?? cached.expiry - HISTORICAL_TTL);
+      return cached.data;
+    }
   }
 
   try {
@@ -345,7 +378,9 @@ export async function getDailyPrices(
         volume: bar.volume,
       }));
 
-    historicalCache.set(cacheKey, { data: bars, expiry: Date.now() + HISTORICAL_TTL });
+    const fetchedAt = Date.now();
+    historicalCache.set(cacheKey, { data: bars, expiry: fetchedAt + HISTORICAL_TTL, fetchedAt });
+    recordTickerFreshness(ticker, 'LIVE', fetchedAt);
     recordLiveFetch();
     return bars;
   } catch (error) {
@@ -353,6 +388,7 @@ export async function getDailyPrices(
     // Serve stale cache if available
     const stale = historicalCache.get(cacheKey);
     if (stale) {
+      recordTickerFreshness(ticker, 'STALE_CACHE', stale.fetchedAt ?? stale.expiry - HISTORICAL_TTL);
       recordStaleCacheServed();
       return stale.data;
     }
@@ -566,10 +602,10 @@ export function getPriorNDayHigh(data: { high: number }[], n: number): number {
 }
 
 // ---- Full Technical Data ----
-export async function getTechnicalData(ticker: string): Promise<TechnicalData | null> {
+export async function getTechnicalData(ticker: string, forceRefresh = false): Promise<TechnicalData | null> {
   // Batch daily + weekly fetch together — single await per ticker
   const [dailyData, weeklyData] = await Promise.all([
-    getDailyPrices(ticker, 'full'),
+    getDailyPrices(ticker, 'full', forceRefresh),
     getWeeklyPrices(ticker),
   ]);
   if (dailyData.length < 200) {

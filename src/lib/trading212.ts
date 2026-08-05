@@ -343,6 +343,14 @@ export class Trading212Client {
         if (errorDetail.includes('selling-equity-not-owned')) {
           errorDetail += '. T212 says you don\'t own this equity on this account. This usually means the position is in a different account (ISA vs Invest) — check the accountType on the position matches where the shares are actually held.';
         }
+        // T212 refuses ALL orders on this instrument — it is suspended, delisted, or
+        // otherwise withdrawn from trading (corporate action, acquisition, halt).
+        // No stop price will work; retrying is pointless. Critically, setStopLoss
+        // cancels the existing stop BEFORE placing the new one, so a failure here can
+        // leave the position with no stop at the broker at all.
+        if (errorDetail.includes('instrument-disabled')) {
+          errorDetail += '. T212 has disabled trading on this instrument entirely (suspension, delisting, or a corporate action) — no stop price will be accepted and retrying will not help. IMPORTANT: the previous stop order was cancelled before this placement was attempted, so this position may now have NO stop at the broker. Check the pending orders for this ticker in the T212 app and manage the position manually.';
+        }
         // 404 "entity not found" on order endpoints almost always means the
         // instrument identifier we sent (the Stock.t212Ticker) does not match
         // any T212 instrument. Diagnosed during the 11 May 2026 RBOT incident
@@ -696,28 +704,63 @@ export class Trading212Client {
       return existingStops[0]; // Already set — no change needed
     }
 
-    // 3. Cancel existing stop orders
-    for (const old of existingStops) {
-      try {
+    const cancelledStops: T212PendingOrder[] = [];
+    try {
+      // 3. Cancel existing stop orders. A cancellation failure aborts the
+      // replacement so we never continue from an unknown protection state.
+      for (const old of existingStops) {
         await this.cancelOrder(old.id);
+        cancelledStops.push(old);
         await new Promise((r) => setTimeout(r, 250));
-      } catch {
-        // Ignore if already cancelled/filled
       }
-    }
 
-    // 4. Wait a moment after cancellations
-    if (existingStops.length > 0) {
-      await new Promise((r) => setTimeout(r, 500));
-    }
+      // 4. Wait a moment after cancellations
+      if (cancelledStops.length > 0) {
+        await new Promise((r) => setTimeout(r, 500));
+      }
 
-    // 5. Place new stop order (negative quantity = sell)
-    return this.placeStopOrder({
-      quantity: -shares,
-      stopPrice,
-      ticker: t212Ticker,
-      timeValidity: 'GOOD_TILL_CANCEL',
-    });
+      // 5. Place new stop order (negative quantity = sell)
+      return await this.placeStopOrder({
+        quantity: -shares,
+        stopPrice,
+        ticker: t212Ticker,
+        timeValidity: 'GOOD_TILL_CANCEL',
+      });
+    } catch (replacementError) {
+      const restoreErrors: string[] = [];
+      for (const old of cancelledStops) {
+        if (!old.stopPrice || old.stopPrice <= 0) {
+          restoreErrors.push(`stop ${old.id} has no valid stop price`);
+          continue;
+        }
+        try {
+          await this.placeStopOrder({
+            quantity: -Math.abs(old.quantity),
+            stopPrice: old.stopPrice,
+            ticker: t212Ticker,
+            timeValidity: 'GOOD_TILL_CANCEL',
+          });
+        } catch (restoreError) {
+          restoreErrors.push(`stop ${old.id}: ${(restoreError as Error).message}`);
+        }
+      }
+
+      const replacementMessage = (replacementError as Error).message;
+      if (restoreErrors.length > 0) {
+        throw new Trading212Error(
+          `CRITICAL: stop replacement failed (${replacementMessage}) and previous protection could not be fully restored (${restoreErrors.join('; ')}). Check T212 immediately.`,
+          replacementError instanceof Trading212Error ? replacementError.statusCode : 500,
+        );
+      }
+
+      const restoredMessage = cancelledStops.length > 0
+        ? ' Previous stop protection was restored.'
+        : '';
+      throw new Trading212Error(
+        `Stop replacement failed: ${replacementMessage}.${restoredMessage}`,
+        replacementError instanceof Trading212Error ? replacementError.statusCode : 500,
+      );
+    }
   }
 
   /**

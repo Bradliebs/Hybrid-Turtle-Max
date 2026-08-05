@@ -67,6 +67,20 @@ function makeMockCandidate(overrides?: Partial<ScanCandidate>): ScanCandidate {
 }
 
 describe('candidate-outcome', () => {
+  it('captures per-ticker data provenance separately from legacy freshness', () => {
+    const asOf = new Date('2026-08-04T20:00:00Z');
+    const record = extractCandidateOutcome(makeMockCandidate(), 'scan-1', 'BULLISH', 'PARTIAL', {
+      source: 'STALE_CACHE',
+      ageMinutes: 95,
+      asOf,
+    });
+
+    expect(record.dataFreshness).toBe('PARTIAL');
+    expect(record.dataSource).toBe('STALE_CACHE');
+    expect(record.dataAgeMinutes).toBe(95);
+    expect(record.dataAsOf).toEqual(asOf);
+  });
+
   describe('resolveStageReached', () => {
     it('returns SIZED when shares are computed', () => {
       const c = makeMockCandidate({ shares: 10 });

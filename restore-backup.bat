@@ -18,15 +18,11 @@ echo.
 :: Check the app isn't running
 tasklist /FI "IMAGENAME eq node.exe" /FO CSV 2>nul | find /i "node.exe" >nul
 if not errorlevel 1 (
-    echo WARNING: Node.js is running. Please stop the app first
+    echo ERROR: Node.js is running. Stop the app before restoring
     echo          ^(close the terminal running start.bat^)
     echo.
-    set /p CONTINUE="Continue anyway? (y/N): "
-    if /i not "!CONTINUE!"=="y" (
-        echo Cancelled.
-        pause
-        exit /b 1
-    )
+    pause
+    exit /b 1
 )
 
 :: Check backup directory exists
@@ -92,26 +88,14 @@ if /i not "%CONFIRM%"=="y" (
     exit /b 0
 )
 
-:: Create safety backup of current DB
-if exist "prisma\dev.db" (
-    echo.
-    echo Creating safety backup of current database...
-    copy /y "prisma\dev.db" "prisma\backups\dev.db.pre-restore-%date:~-4%%date:~3,2%%date:~0,2%" >nul 2>&1
-    if errorlevel 1 (
-        echo WARNING: Could not create safety backup. Proceeding anyway...
-    ) else (
-        echo   Saved as: dev.db.pre-restore-%date:~-4%%date:~3,2%%date:~0,2%
-    )
-)
-
-:: Perform the restore
+:: Perform the validated maintenance restore. The helper creates a WAL-safe
+:: pre-restore backup and rolls back automatically if verification fails.
 echo.
 echo Restoring from %SELECTED%...
-copy /y "prisma\backups\%SELECTED%" "prisma\dev.db" >nul 2>&1
+npx tsx scripts\restore-database.ts "%SELECTED%"
 if errorlevel 1 (
     echo.
-    echo ERROR: Restore failed! The file copy did not succeed.
-    echo        Check that no other process has dev.db locked.
+    echo ERROR: Restore failed. The live database was not replaced or was rolled back.
     pause
     exit /b 1
 )

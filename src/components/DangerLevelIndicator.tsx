@@ -17,11 +17,19 @@ import { Shield, ShieldAlert, X } from 'lucide-react';
 
 // ── Types ────────────────────────────────────────────────────
 
+interface VarianceRiskPremium {
+  vrp: number;
+  state: 'INVERTED' | 'NORMAL' | 'RICH';
+  approximatePercentile: number;
+  description: string;
+}
+
 interface DangerData {
   dangerScore: number;
   immuneAlert: boolean;
   riskTighteningPercent: number;
   topMatches: Array<{ label: string; similarity: number; factors?: string[] }>;
+  varianceRiskPremium: VarianceRiskPremium | null;
   loading: boolean;
   hasData: boolean;
 }
@@ -52,6 +60,7 @@ export function useDangerLevel(): DangerData {
     immuneAlert: false,
     riskTighteningPercent: 0,
     topMatches: [],
+    varianceRiskPremium: null,
     loading: true,
     hasData: false,
   });
@@ -80,6 +89,7 @@ export function useDangerLevel(): DangerData {
               similarity: m.similarity,
               factors: m.factors ?? [],
             })),
+            varianceRiskPremium: d.varianceRiskPremium ?? null,
             loading: false,
             hasData: true,
           });
@@ -105,6 +115,8 @@ interface DangerLevelIndicatorProps {
   immuneAlert: boolean;
   riskTighteningPercent: number;
   topMatches?: Array<{ label: string; similarity: number; factors?: string[] }>;
+  /** Advisory only — displayed, never acted on. */
+  varianceRiskPremium?: VarianceRiskPremium | null;
   /** Compact mode: just a badge */
   compact?: boolean;
 }
@@ -114,6 +126,7 @@ export default function DangerLevelIndicator({
   immuneAlert,
   riskTighteningPercent,
   topMatches = [],
+  varianceRiskPremium = null,
   compact = false,
 }: DangerLevelIndicatorProps) {
   const [drawerOpen, setDrawerOpen] = useState(false);
@@ -180,7 +193,7 @@ export default function DangerLevelIndicator({
           )}
           {immuneAlert && (
             <span className="text-red-400 font-medium">
-              Risk gates tightened by {riskTighteningPercent}%
+              Suggested risk cut: {riskTighteningPercent}% (advisory)
             </span>
           )}
         </div>
@@ -229,11 +242,47 @@ export default function DangerLevelIndicator({
               </div>
             )}
 
-            {/* Risk tightening */}
+            {/* Variance risk premium — advisory only, no action implied */}
+            {varianceRiskPremium && (
+              <div className="mb-6">
+                <h3 className="text-sm font-semibold text-muted-foreground mb-3">Variance Risk Premium</h3>
+                <div className="p-3 rounded-lg bg-navy-800/60 border border-border/30">
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-sm font-medium text-foreground">
+                      {varianceRiskPremium.vrp > 0 ? '+' : ''}{varianceRiskPremium.vrp.toFixed(1)} vol points
+                    </span>
+                    <span
+                      className={cn(
+                        'text-xs font-mono',
+                        varianceRiskPremium.state === 'INVERTED' ? 'text-red-400'
+                          : varianceRiskPremium.state === 'RICH' ? 'text-amber-400'
+                            : 'text-muted-foreground'
+                      )}
+                    >
+                      {varianceRiskPremium.state} · p{varianceRiskPremium.approximatePercentile}
+                    </span>
+                  </div>
+                  <div className="text-[10px] text-muted-foreground mt-1">
+                    {varianceRiskPremium.description}
+                  </div>
+                  <div className="text-[10px] text-muted-foreground/60 mt-2 italic">
+                    Observation only — does not affect gates, sizing or stops.
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Suggested risk reduction — advisory only, nothing consumes it */}
             {immuneAlert && (
               <div className="p-3 rounded-lg bg-red-500/5 border border-red-500/20">
                 <div className="text-sm text-red-400 font-medium mb-1">Immune System Active</div>
-                <div className="text-xs text-muted-foreground">Risk gates tightened by {riskTighteningPercent}%</div>
+                <div className="text-xs text-muted-foreground">
+                  Suggested reduction in max open risk: {riskTighteningPercent}%
+                </div>
+                <div className="text-[10px] text-muted-foreground/60 mt-2 italic">
+                  Advisory only — risk gates and position sizing are NOT changed automatically.
+                  Reduce exposure manually if you agree.
+                </div>
               </div>
             )}
           </div>
