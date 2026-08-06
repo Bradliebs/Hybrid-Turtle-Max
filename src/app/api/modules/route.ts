@@ -5,7 +5,7 @@
 // for the dashboard to consume.
 //
 // PERF: Heavy external-API checks (breadth, climax, dual regime,
-// fast followers, re-entry, SPY ADX, pyramid ATR) are parallelised
+// re-entry, SPY history, and pyramid ATR checks are parallelised
 // via Promise.allSettled.  SPY 'full' data is fetched once and
 // shared between ADX + dual-regime.  A 60 s server-side cache
 // prevents duplicate work across rapid refreshes.
@@ -14,7 +14,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import prisma from '@/lib/prisma';
 import { ensureDefaultUser } from '@/lib/default-user';
-import { getDailyPrices, calculateMA, calculateADX, calculateATR, getMarketRegime, normalizeBatchPricesToGBP } from '@/lib/market-data';
+import { getDailyPrices, calculateMA, calculateATR, getMarketRegime, normalizeBatchPricesToGBP } from '@/lib/market-data';
 import { getLivePrices } from '@/lib/live-prices';
 import { calculateRMultiple } from '@/lib/position-sizer';
 import { getRiskBudget, canPyramid, calculatePyramidAddSize } from '@/lib/risk-gates';
@@ -29,19 +29,14 @@ import {
   calculateBreadth,
   checkBreadthSafety,
   checkSuperClusterCaps,
-  // Module 13 disabled — import preserved for reference
-  // checkMomentumExpansion,
   calculateTurnover,
   generateActionCard,
   getTradeLog,
-  // Module 9 disabled — import preserved for reference
-  // scanFastFollowers,
   scanReEntrySignals,
 } from '@/lib/modules';
-import type { RiskProfileType, Sleeve, MarketRegime, ModuleStatus, AllModulesResult, FastFollowerSignal, ReEntrySignal, PyramidAlert, TradeLogEntry, MomentumExpansionResult } from '@/types';
+import type { RiskProfileType, Sleeve, MarketRegime, ModuleStatus, AllModulesResult, ReEntrySignal, PyramidAlert, TradeLogEntry } from '@/types';
 import { apiError } from '@/lib/api-response';
 import { getModulesCache, setModulesCache, MODULES_CACHE_TTL } from '@/lib/modules-cache';
-import { isEnabled } from '@/lib/feature-flags';
 
 export const dynamic = 'force-dynamic';
 
@@ -209,7 +204,6 @@ export async function GET(request: NextRequest) {
       breadthResult,
       spyFullResult,
       vwrlResult,
-      fastFollowerResult,
       reentryResult,
       stopRecsResult,
       regimeHistoryResult,
@@ -228,9 +222,7 @@ export async function GET(request: NextRequest) {
       getDailyPrices('SPY', 'full'),
       // 4: VWRL full (for dual regime)
       getDailyPrices('VWRL.L', 'full'),
-      // 5: Fast followers — gated by feature flag (always resolves as empty when disabled)
-      Promise.resolve([] as FastFollowerSignal[]),
-      // 6: Re-entry signals
+      // 5: Re-entry signals
       scanReEntrySignals(
         closedPositions
           .filter(p => p.exitReason !== 'STOP_HIT' && p.exitProfitR && p.exitProfitR > 0.5)
@@ -241,9 +233,9 @@ export async function GET(request: NextRequest) {
             exitReason: p.exitReason,
           }))
       ),
-      // 7: Stop recommendations
+      // 6: Stop recommendations
       generateStopRecommendations(userId, new Map(Object.entries(livePrices))),
-      // 8: Regime history
+      // 7: Regime history
       (async () => {
         try {
           const rh: { regime: string; date: Date }[] | undefined = await (prisma as unknown as Record<string, { findMany: (opts: unknown) => Promise<{ regime: string; date: Date }[]> }>).regimeHistory?.findMany({
@@ -253,7 +245,7 @@ export async function GET(request: NextRequest) {
           return rh ? rh.map((r) => ({ regime: r.regime, date: r.date })) : [];
         } catch { return []; }
       })(),
-      // 9: Trade count 30d
+      // 8: Trade count 30d
       (async () => {
         try {
           return await (prisma as unknown as Record<string, { count: (opts: unknown) => Promise<number> }>).tradeLog?.count({
@@ -261,12 +253,12 @@ export async function GET(request: NextRequest) {
           }) || 0;
         } catch { return 0; }
       })(),
-      // 10: Recent trades
+      // 9: Recent trades
       (async () => {
         try { return await getTradeLog(userId, 10); }
         catch { return [] as TradeLogEntry[]; }
       })(),
-      // 11: Pyramid add counts
+      // 10: Pyramid add counts
       (async () => {
         try {
           const rows = await prisma.tradeLog.groupBy({
@@ -279,7 +271,7 @@ export async function GET(request: NextRequest) {
           return m;
         } catch { return new Map<string, number>(); }
       })(),
-      // 12: Trigger-met candidates
+      // 11: Trigger-met candidates
       (async () => {
         try {
           const latestSnapshot = await prisma.snapshot.findFirst({
@@ -324,7 +316,6 @@ export async function GET(request: NextRequest) {
     const breadthPct = breadthResult.status === 'fulfilled' ? breadthResult.value : 100;
     const spyBars = spyFullResult.status === 'fulfilled' ? spyFullResult.value : [];
     const vwrlBars = vwrlResult.status === 'fulfilled' ? vwrlResult.value : [];
-    const fastFollowers: FastFollowerSignal[] = fastFollowerResult.status === 'fulfilled' ? fastFollowerResult.value : [];
     const reentrySignals: ReEntrySignal[] = reentryResult.status === 'fulfilled' ? reentryResult.value : [];
     const stopRecs = stopRecsResult.status === 'fulfilled' ? stopRecsResult.value : [];
     const regimeHistoryRecords = regimeHistoryResult.status === 'fulfilled' ? regimeHistoryResult.value : [];
@@ -333,32 +324,9 @@ export async function GET(request: NextRequest) {
     const addsMap = pyramidAddsResult.status === 'fulfilled' ? pyramidAddsResult.value : new Map<string, number>();
     const triggerMetCandidates = triggerMetResult.status === 'fulfilled' ? triggerMetResult.value : [];
 
-    if (fastFollowerResult.status === 'rejected') {
-      console.warn('[Modules] Fast-follower scan failed:', fastFollowerResult.reason);
-    }
     if (reentryResult.status === 'rejected') {
       console.warn('[Modules] Re-entry scan failed:', reentryResult.reason);
     }
-
-    // ── SPY ADX (reuse spyBars fetched for dual regime) ──
-    let spyAdx = 20;
-    if (spyBars.length >= 28) {
-      const adxResult = calculateADX(spyBars, 14);
-      spyAdx = adxResult.adx;
-    }
-    // Module 13: Momentum Expansion — gated by feature flag
-    const momentumExpansion: MomentumExpansionResult = isEnabled('MODULE_MOMENTUM_EXPANSION')
-      ? (() => {
-          // Would call checkMomentumExpansion(spyAdx, riskProfile) here
-          return { adx: spyAdx, threshold: 25, expandedMaxRisk: null, isExpanded: false, reason: 'Enabled but no expansion triggered' };
-        })()
-      : {
-          adx: spyAdx,
-          threshold: 25,
-          expandedMaxRisk: null,
-          isExpanded: false,
-          reason: 'Disabled — feature flag MODULE_MOMENTUM_EXPANSION is off',
-        };
 
     // ── Regime Stability ──
     const regimeStability = checkRegimeStability(regime, regimeHistoryRecords);
@@ -545,7 +513,6 @@ export async function GET(request: NextRequest) {
       climaxSignals,
       whipsawBlocks,
       swapSuggestions,
-      fastFollowers,
       reentrySignals,
       maxPositions: effectiveMaxPositions,
     });
@@ -566,11 +533,9 @@ export async function GET(request: NextRequest) {
       { id: 5, name: 'Climax Top Exit', status: climaxSignals.length > 0 ? 'RED' : 'GREEN', summary: climaxSignals.length > 0 ? `${climaxSignals.length} climax signal(s)` : 'No climax detected' },
       { id: 7, name: 'Heat-Map Swap', status: swapSuggestions.length > 0 ? 'YELLOW' : 'GREEN', summary: swapSuggestions.length > 0 ? `${swapSuggestions.length} swap(s) suggested` : 'No swaps needed' },
       { id: 8, name: 'Heat Check', status: heatChecks.some(h => h.blocked) ? 'RED' : 'GREEN', summary: heatChecks.some(h => h.blocked) ? 'Some entries blocked' : 'No concentration issues' },
-      { id: 9, name: 'Fast-Follower Re-Entry', status: 'DISABLED', summary: isEnabled('MODULE_FAST_FOLLOWER') ? 'Active' : 'Disabled — feature flag off. Awaiting backtesting.' },
       { id: 10, name: 'Breadth Safety Valve', status: breadthSafety.isRestricted ? 'RED' : 'GREEN', summary: breadthSafety.reason },
       { id: 11, name: 'Whipsaw Kill Switch', status: whipsawBlocks.length > 0 ? 'RED' : 'GREEN', summary: whipsawBlocks.length > 0 ? `${whipsawBlocks.length} ticker(s) blocked` : 'No blocks active' },
       { id: 12, name: 'Super-Cluster Cap', status: superClusterResults.some(s => s.breached) ? 'RED' : 'GREEN', summary: superClusterResults.some(s => s.breached) ? 'Breach detected' : 'Within limits' },
-      { id: 13, name: 'Momentum Expansion', status: 'DISABLED', summary: isEnabled('MODULE_MOMENTUM_EXPANSION') ? 'Active' : 'Disabled — feature flag off. Awaiting backtesting.' },
       { id: 14, name: 'Climax Trim/Tighten', status: climaxSignals.length > 0 ? 'YELLOW' : 'GREEN', summary: climaxSignals.length > 0 ? 'Action needed' : 'No action' },
       { id: 15, name: 'Trades Log', status: 'GREEN', summary: `${recentTrades.length} recent trades` },
       { id: 16, name: 'Turnover Monitor', status: turnover.avgHoldingPeriod < 5 ? 'YELLOW' : 'GREEN', summary: `Avg hold: ${turnover.avgHoldingPeriod}d, ${turnover.tradesLast30Days} trades/30d` },
@@ -589,11 +554,9 @@ export async function GET(request: NextRequest) {
       climaxSignals,
       swapSuggestions,
       heatChecks: heatChecks.filter(h => h.blocked),
-      fastFollowers,
       breadthSafety,
       whipsawBlocks,
       regimeStability,
-      momentumExpansion,
       dualRegime,
       turnover,
       dataValidation,

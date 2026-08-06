@@ -1,4 +1,5 @@
 import { DataFetchStatus, JobRunStatus, Prisma } from '@prisma/client';
+import { toYahooTicker } from '../../../src/lib/ticker-maps';
 import { prisma, toInputJson } from './prisma';
 import type { HistoricalBar, HistoricalBarsResult, SymbolRefreshResult } from './types';
 
@@ -7,6 +8,77 @@ type UpsertDailyBarsInput = {
   bars: HistoricalBar[];
   metadata: HistoricalBarsResult;
 };
+
+type ActiveStockUniverseRow = {
+  ticker: string;
+  yahooTicker: string | null;
+  name: string;
+  sleeve: string;
+  currency: string | null;
+};
+
+export function toInstrumentSeed(stock: ActiveStockUniverseRow) {
+  return {
+    symbol: toYahooTicker(stock.ticker, stock.yahooTicker),
+    name: stock.name || stock.ticker,
+    assetType: stock.sleeve === 'ETF' ? 'ETF' as const : 'STOCK' as const,
+    exchange: 'UNKNOWN',
+    currency: stock.currency || 'UNKNOWN',
+    dataSource: 'YAHOO',
+    isActive: true,
+  };
+}
+
+export function toUniqueInstrumentSeeds(stocks: ActiveStockUniverseRow[]) {
+  const seedBySymbol = new Map<string, ReturnType<typeof toInstrumentSeed>>();
+  for (const stock of stocks) {
+    const seed = toInstrumentSeed(stock);
+    const existing = seedBySymbol.get(seed.symbol);
+    if (!existing || stock.ticker === seed.symbol) {
+      seedBySymbol.set(seed.symbol, seed);
+    }
+  }
+  return Array.from(seedBySymbol.values());
+}
+
+export function toAssetType(instrumentType: string) {
+  if (instrumentType === 'ETF') return 'ETF' as const;
+  if (instrumentType === 'MUTUALFUND') return 'FUND' as const;
+  if (instrumentType === 'CURRENCY') return 'FOREX' as const;
+  return 'STOCK' as const;
+}
+
+export async function syncActiveStockInstruments(symbols?: string[]): Promise<number> {
+  const stocks = await prisma.stock.findMany({
+    where: { active: true },
+    select: {
+      ticker: true,
+      yahooTicker: true,
+      name: true,
+      sleeve: true,
+      currency: true,
+    },
+  });
+  const requestedSymbols = symbols ? new Set(symbols) : null;
+  const seeds = toUniqueInstrumentSeeds(stocks)
+    .filter((seed) => !requestedSymbols || requestedSymbols.has(seed.symbol));
+  if (seeds.length === 0) {
+    return 0;
+  }
+
+  const existing = await prisma.instrument.findMany({
+    where: { symbol: { in: seeds.map((seed) => seed.symbol) } },
+    select: { symbol: true },
+  });
+  const existingSymbols = new Set(existing.map((instrument) => instrument.symbol));
+  const missing = seeds.filter((seed) => !existingSymbols.has(seed.symbol));
+  if (missing.length === 0) {
+    return 0;
+  }
+
+  await prisma.instrument.createMany({ data: missing });
+  return missing.length;
+}
 
 export async function ensureInstrument(symbol: string, metadata?: HistoricalBarsResult) {
   const exchange = typeof metadata?.meta.exchangeName === 'string' ? metadata.meta.exchangeName : 'UNKNOWN';
@@ -18,6 +90,7 @@ export async function ensureInstrument(symbol: string, metadata?: HistoricalBars
         : symbol;
   const currency = typeof metadata?.meta.currency === 'string' ? metadata.meta.currency : 'USD';
   const instrumentType = typeof metadata?.meta.instrumentType === 'string' ? metadata.meta.instrumentType : 'OTHER';
+  const assetType = toAssetType(instrumentType);
 
   return prisma.instrument.upsert({
     where: { symbol },
@@ -25,7 +98,7 @@ export async function ensureInstrument(symbol: string, metadata?: HistoricalBars
       name,
       exchange,
       currency,
-      assetType: instrumentType === 'ETF' ? 'ETF' : instrumentType === 'MUTUALFUND' ? 'FUND' : 'STOCK',
+      assetType,
       dataSource: 'YAHOO',
     },
     create: {
@@ -33,7 +106,7 @@ export async function ensureInstrument(symbol: string, metadata?: HistoricalBars
       name,
       exchange,
       currency,
-      assetType: instrumentType === 'ETF' ? 'ETF' : instrumentType === 'MUTUALFUND' ? 'FUND' : 'STOCK',
+      assetType,
       dataSource: 'YAHOO',
       isActive: true,
     },
@@ -268,4 +341,26 @@ export async function getActiveUniverseSymbols(symbols?: string[]) {
   });
 
   return instruments.map((instrument) => instrument.symbol);
+}
+
+export async function getActiveUniverseSymbolsWithoutBars(): Promise<string[]> {
+  return getActiveUniverseSymbolsBelowBarCount(1);
+}
+
+export async function getActiveUniverseSymbolsBelowBarCount(minimumBars: number): Promise<string[]> {
+  const instruments = await prisma.instrument.findMany({
+    where: { isActive: true },
+    orderBy: { symbol: 'asc' },
+    select: { id: true, symbol: true },
+  });
+  const counts = await prisma.dailyBar.groupBy({
+    by: ['instrumentId'],
+    where: { instrumentId: { in: instruments.map((instrument) => instrument.id) } },
+    _count: { _all: true },
+  });
+  const countByInstrument = new Map(counts.map((count) => [count.instrumentId, count._count._all]));
+
+  return instruments
+    .filter((instrument) => (countByInstrument.get(instrument.id) ?? 0) < minimumBars)
+    .map((instrument) => instrument.symbol);
 }

@@ -8,16 +8,20 @@
  *        Only counts rows with enrichedAt != null for outcome metrics.
  */
 import prisma from './prisma';
+import { overlapAdjustedMeanConfidenceInterval, type ConfidenceInterval } from './statistics';
 
 // ── Shared Stat Types ───────────────────────────────────────────────
 
 export interface OutcomeStats {
   count: number;
   withOutcomes: number;
+  scanDays: number;
   avgFwd5d: number | null;
   avgFwd10d: number | null;
   avgFwd20d: number | null;
+  avgFwd20dInterval: ConfidenceInterval | null;
   hit1RRate: number | null;
+  hit1RRateInterval: ConfidenceInterval | null;
   hit2RRate: number | null;
   hit3RRate: number | null;
   stopHitRate: number | null;
@@ -27,7 +31,7 @@ export interface OutcomeStats {
   avgMaeR: number | null;
 }
 
-// ── Section 1: Rule Contribution ────────────────────────────────────
+// ── Section 1: Rule Association ─────────────────────────────────────
 
 export interface RuleContributionRow {
   rule: string;
@@ -90,6 +94,9 @@ export interface EvidenceResponse {
   sampleSize: {
     totalCandidates: number;
     enrichedCandidates: number;
+    distinctScans: number;
+    distinctScanDays: number;
+    distinctTickers: number;
     totalTrades: number;
     closedTrades: number;
   };
@@ -104,6 +111,9 @@ export interface EvidenceResponse {
 // ── Helpers ─────────────────────────────────────────────────────────
 
 type CandidateRow = {
+  scanId: string;
+  scanDate: Date;
+  ticker: string;
   status: string;
   stageReached: string;
   passedTechFilter: boolean;
@@ -164,11 +174,55 @@ export function rate(trueCount: number, total: number): number | null {
   return Math.round((trueCount / total) * 1000) / 10;
 }
 
+function groupByScanDay(rows: CandidateRow[]): CandidateRow[][] {
+  const groups = new Map<string, CandidateRow[]>();
+  for (const row of rows) {
+    const key = row.scanDate.toISOString().slice(0, 10);
+    const group = groups.get(key) ?? [];
+    group.push(row);
+    groups.set(key, group);
+  }
+  return [...groups.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([, group]) => group);
+}
+
+function clusteredDailyMeans(
+  rows: CandidateRow[],
+  valueOf: (row: CandidateRow) => number | null,
+): number[] {
+  return groupByScanDay(rows)
+    .map((group) => {
+      const values = group.map(valueOf).filter((value): value is number => value != null);
+      return values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+    })
+    .filter((value): value is number => value != null);
+}
+
+function clusteredMeanInterval(
+  rows: CandidateRow[],
+  valueOf: (row: CandidateRow) => number | null,
+): ConfidenceInterval | null {
+  return overlapAdjustedMeanConfidenceInterval(clusteredDailyMeans(rows, valueOf), 20);
+}
+
+function clusteredRateInterval(
+  rows: CandidateRow[],
+  valueOf: (row: CandidateRow) => boolean | null,
+): ConfidenceInterval | null {
+  const interval = clusteredMeanInterval(rows, (row) => {
+    const value = valueOf(row);
+    return value == null ? null : Number(value) * 100;
+  });
+  return interval
+    ? { ...interval, lower: Math.max(0, interval.lower), upper: Math.min(100, interval.upper) }
+    : null;
+}
+
 function computeStats(rows: CandidateRow[]): OutcomeStats {
   const enriched = rows.filter((r) => r.enrichedAt != null);
   const fwd5 = enriched.map((r) => r.fwdReturn5d).filter((v): v is number => v != null);
   const fwd10 = enriched.map((r) => r.fwdReturn10d).filter((v): v is number => v != null);
-  const fwd20 = enriched.map((r) => r.fwdReturn20d).filter((v): v is number => v != null);
   const mfe = enriched.map((r) => r.mfeR).filter((v): v is number => v != null);
   const mae = enriched.map((r) => r.maeR).filter((v): v is number => v != null);
   const r1 = enriched.filter((r) => r.reached1R != null);
@@ -183,10 +237,13 @@ function computeStats(rows: CandidateRow[]): OutcomeStats {
   return {
     count: rows.length,
     withOutcomes: enriched.length,
+    scanDays: groupByScanDay(enriched).length,
     avgFwd5d: mean(fwd5),
     avgFwd10d: mean(fwd10),
-    avgFwd20d: mean(fwd20),
+    avgFwd20d: mean(clusteredDailyMeans(enriched, (row) => row.fwdReturn20d)),
+    avgFwd20dInterval: clusteredMeanInterval(enriched, (row) => row.fwdReturn20d),
     hit1RRate: rate(r1.filter((r) => r.reached1R === true).length, r1.length),
+    hit1RRateInterval: clusteredRateInterval(enriched, (row) => row.reached1R),
     hit2RRate: rate(r2.filter((r) => r.reached2R === true).length, r2.length),
     hit3RRate: rate(r3.filter((r) => r.reached3R === true).length, r3.length),
     stopHitRate: rate(sH.filter((r) => r.stopHit === true).length, sH.length),
@@ -197,7 +254,7 @@ function computeStats(rows: CandidateRow[]): OutcomeStats {
   };
 }
 
-// ── Section 1: Rule Contribution ────────────────────────────────────
+// ── Section 1: Rule Association ─────────────────────────────────────
 
 function buildRuleContribution(rows: CandidateRow[]): RuleContributionRow[] {
   function ruleRow(
@@ -546,6 +603,9 @@ export async function generateEvidence(opts?: EvidenceOptions): Promise<Evidence
     prisma.candidateOutcome.findMany({
       where: candidateWhere,
       select: {
+        scanId: true,
+        scanDate: true,
+        ticker: true,
         status: true,
         stageReached: true,
         passedTechFilter: true,
@@ -604,14 +664,18 @@ export async function generateEvidence(opts?: EvidenceOptions): Promise<Evidence
   ]);
 
   const enrichedCount = candidates.filter((r) => r.enrichedAt != null).length;
+  const enrichedCandidates = candidates.filter((r) => r.enrichedAt != null);
+  const distinctScans = new Set(enrichedCandidates.map((row) => row.scanId)).size;
+  const distinctScanDays = new Set(enrichedCandidates.map((row) => row.scanDate.toISOString().slice(0, 10))).size;
+  const distinctTickers = new Set(enrichedCandidates.map((row) => row.ticker)).size;
   const closedTrades = trades.filter(
     (t) => (t.tradeType === 'EXIT' || t.tradeType === 'STOP_HIT') && t.finalRMultiple != null
   ).length;
 
   // ── Warnings ──
   const warnings: string[] = [];
-  if (enrichedCount < 30) {
-    warnings.push(`Only ${enrichedCount} candidates have forward outcome data. Results may be unreliable (need ≥ 30).`);
+  if (distinctScanDays < 30) {
+    warnings.push(`${enrichedCount} outcome rows come from only ${distinctScanDays} distinct scan days. Treat associations as inconclusive until at least 30 scan days are available; serial correlation may reduce the effective sample further.`);
   }
   if (closedTrades < 10) {
     warnings.push(`Only ${closedTrades} closed trades found. Exit and simulation analysis needs ≥ 10.`);
@@ -626,6 +690,9 @@ export async function generateEvidence(opts?: EvidenceOptions): Promise<Evidence
     sampleSize: {
       totalCandidates: candidates.length,
       enrichedCandidates: enrichedCount,
+      distinctScans,
+      distinctScanDays,
+      distinctTickers,
       totalTrades: trades.length,
       closedTrades,
     },

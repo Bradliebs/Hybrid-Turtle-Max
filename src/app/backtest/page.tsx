@@ -47,6 +47,13 @@ interface BacktestTrade {
   entryTrigger: number;
   stopLevel: number;
   riskPerShare: number;
+  currency?: string;
+  entryFxToGbp?: number | null;
+  exitFxToGbp?: number | null;
+  simulatedQuantity?: number | null;
+  simulatedPositionValueGbp?: number | null;
+  simulatedRiskAmountGbp?: number | null;
+  cashReservationStatus?: 'FUNDED' | 'REJECTED_CASH' | 'REJECTED_FX' | 'NOT_SLOT_ELIGIBLE';
   bqs: number;
   fws: number;
   ncs: number;
@@ -70,19 +77,47 @@ interface BacktestCurvePoint {
   tradeCount: number;
 }
 
+interface BacktestConfidenceInterval {
+  lower: number;
+  upper: number;
+  confidence: 0.95;
+}
+
 interface BacktestSummary {
+  validity: 'VALID' | 'PARTIAL' | 'INVALID_FOR_PERFORMANCE_CLAIMS';
+  validityReasons: string[];
   mode: 'FULL' | 'CORE_LITE';
   startDate: string;
   endDate: string;
   replayDate: string | null;
   initialCapital: number;
-  endingCapital: number;
+  endingCapital: number | null;
   riskPerTradePct: number;
+  maxPositions: number;
+  executionCostPctPerSide: number;
   snapshotCount: number;
   signalCount: number;
   completedTrades: number;
+  incompleteTrades: number;
+  slotEligibleTrades: number;
+  positionLimitRejectedTrades: number;
+  cashFundedTrades: number;
+  cashRejectedTrades: number;
+  fxRejectedTrades: number;
+  averageFundedPositionValueGbp: number | null;
+  averageFundedRiskAmountGbp: number | null;
+  slotEligibleGrossAverageR: number | null;
+  slotEligibleNetAverageR: number | null;
+  executionCostDragR: number | null;
+  distinctOutcomeDays: number;
+  evidenceVerdict: 'INCONCLUSIVE' | 'PROMISING' | 'SUPPORTED' | 'DEGRADING';
+  evidenceVerdictReason: string;
   winRate: number | null;
+  dailyWinRate: number | null;
+  winRateInterval: BacktestConfidenceInterval | null;
   averageR: number | null;
+  dailyMeanR: number | null;
+  averageRInterval: BacktestConfidenceInterval | null;
   averageWinR: number | null;
   averageLossR: number | null;
   expectancyR: number | null;
@@ -183,6 +218,8 @@ export default function BacktestPage() {
   const [regime, setRegime] = useState('');
   const [initialCapital, setInitialCapital] = useState('10000');
   const [riskPerTradePct, setRiskPerTradePct] = useState('2');
+  const [maxPositions, setMaxPositions] = useState('4');
+  const [executionCostPctPerSide, setExecutionCostPctPerSide] = useState('0');
   const [run, setRun] = useState<StoredBacktestRun | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -206,6 +243,8 @@ export default function BacktestPage() {
         regime: regime || null,
         initialCapital: Number(initialCapital),
         riskPerTradePct: Number(riskPerTradePct),
+        maxPositions: Number(maxPositions),
+        executionCostPctPerSide: Number(executionCostPctPerSide),
       };
 
       const response = await apiRequest<RunResponse>('/api/backtests/run', {
@@ -220,7 +259,7 @@ export default function BacktestPage() {
     } finally {
       setLoading(false);
     }
-  }, [endDate, initialCapital, loadRun, mode, replayDate, regime, riskPerTradePct, sleeve, startDate, useReplayDate]);
+  }, [endDate, executionCostPctPerSide, initialCapital, loadRun, maxPositions, mode, replayDate, regime, riskPerTradePct, sleeve, startDate, useReplayDate]);
 
   const filteredTrades = useMemo(() => {
     if (!run) {
@@ -360,6 +399,31 @@ export default function BacktestPage() {
                 className="w-full bg-navy-800/70 border border-border rounded-lg px-3 py-2 text-foreground"
               />
             </label>
+            <label className="space-y-2 text-sm">
+              <span className="text-muted-foreground">Max positions</span>
+              <input
+                type="number"
+                min="1"
+                max="20"
+                step="1"
+                value={maxPositions}
+                onChange={(event) => setMaxPositions(event.target.value)}
+                className="w-full bg-navy-800/70 border border-border rounded-lg px-3 py-2 text-foreground"
+              />
+            </label>
+            <label className="space-y-2 text-sm">
+              <span className="text-muted-foreground">Execution cost % per side</span>
+              <input
+                type="number"
+                min="0"
+                max="10"
+                step="0.05"
+                value={executionCostPctPerSide}
+                onChange={(event) => setExecutionCostPctPerSide(event.target.value)}
+                className="w-full bg-navy-800/70 border border-border rounded-lg px-3 py-2 text-foreground"
+              />
+              <span className="block text-xs text-muted-foreground">Hypothetical adverse entry and exit cost.</span>
+            </label>
             <div className="space-y-2 text-sm">
               <label className="flex items-center gap-2 text-muted-foreground">
                 <input
@@ -428,15 +492,58 @@ export default function BacktestPage() {
           </section>
         )}
 
+        {run && run.summary.validity !== 'VALID' && (
+          <section className="rounded-xl border border-warning/40 bg-warning/10 px-5 py-4 flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 text-warning shrink-0 mt-0.5" />
+            <div className="space-y-2 text-sm">
+              <p className="font-semibold text-warning">
+                {run.summary.validity === 'PARTIAL'
+                  ? 'Signal replay only — not a portfolio performance backtest'
+                  : 'Invalid for performance claims'}
+              </p>
+              <ul className="space-y-1 text-foreground/80">
+                {run.summary.validityReasons.map((reason) => (
+                  <li key={reason}>• {reason}</li>
+                ))}
+              </ul>
+              {run.summary.incompleteTrades > 0 && (
+                <p className="text-foreground/80">
+                  {run.summary.incompleteTrades} incomplete signal{run.summary.incompleteTrades === 1 ? '' : 's'} excluded from outcome statistics.
+                </p>
+              )}
+            </div>
+          </section>
+        )}
+
         {run && (
           <>
-            <section className="grid grid-cols-2 lg:grid-cols-6 gap-3">
+            <section className="rounded-xl border border-border/70 bg-navy-900/40 px-5 py-4 space-y-1">
+              <p className="text-sm font-semibold text-foreground">
+                Outcome evidence: {run.summary.evidenceVerdict}
+              </p>
+              <p className="text-sm text-muted-foreground">{run.summary.evidenceVerdictReason}</p>
+              <p className="text-xs text-muted-foreground">
+                Effective sample: {run.summary.distinctOutcomeDays} distinct signal days. Intervals aggregate outcomes within each day first.
+              </p>
+            </section>
+
+            <section className="grid grid-cols-2 lg:grid-cols-4 gap-3">
               <MetricCard label="Signals" value={String(run.summary.signalCount)} icon={<Target className="w-4 h-4 text-primary-400" />} />
-              <MetricCard label="Completed" value={String(run.summary.completedTrades)} icon={<Activity className="w-4 h-4 text-blue-400" />} />
-              <MetricCard label="Win Rate" value={run.summary.winRate == null ? '—' : `${run.summary.winRate.toFixed(2)}%`} valueClass={run.summary.winRate != null && run.summary.winRate >= 50 ? 'text-profit' : 'text-foreground'} icon={<TrendingUp className="w-4 h-4 text-profit" />} />
-              <MetricCard label="Average R" value={formatR(run.summary.averageR)} valueClass={run.summary.averageR != null && run.summary.averageR >= 0 ? 'text-profit' : 'text-loss'} icon={<ShieldCheck className="w-4 h-4 text-warning" />} />
-              <MetricCard label="Total Return" value={formatPct(run.summary.totalReturnPct)} valueClass={run.summary.totalReturnPct != null && run.summary.totalReturnPct >= 0 ? 'text-profit' : 'text-loss'} icon={<TrendingUp className="w-4 h-4 text-primary-400" />} />
-              <MetricCard label="Max Drawdown" value={formatPct(run.summary.maxDrawdownPct == null ? null : -Math.abs(run.summary.maxDrawdownPct))} valueClass="text-loss" icon={<TrendingDown className="w-4 h-4 text-loss" />} />
+              <MetricCard label="Complete Outcomes" value={String(run.summary.completedTrades)} icon={<Activity className="w-4 h-4 text-blue-400" />} />
+              <MetricCard
+                label="Daily Outcome Win Rate"
+                value={run.summary.dailyWinRate == null ? '—' : `${run.summary.dailyWinRate.toFixed(2)}%`}
+                detail={run.summary.winRateInterval == null ? '95% interval unavailable' : `95% CI ${run.summary.winRateInterval.lower.toFixed(2)}% to ${run.summary.winRateInterval.upper.toFixed(2)}%`}
+                valueClass={run.summary.dailyWinRate != null && run.summary.dailyWinRate >= 50 ? 'text-profit' : 'text-foreground'}
+                icon={<TrendingUp className="w-4 h-4 text-profit" />}
+              />
+              <MetricCard
+                label="Daily Mean Outcome R"
+                value={formatR(run.summary.dailyMeanR)}
+                detail={run.summary.averageRInterval == null ? '95% interval unavailable' : `95% CI ${run.summary.averageRInterval.lower.toFixed(2)}R to ${run.summary.averageRInterval.upper.toFixed(2)}R`}
+                valueClass={run.summary.dailyMeanR != null && run.summary.dailyMeanR >= 0 ? 'text-profit' : 'text-loss'}
+                icon={<ShieldCheck className="w-4 h-4 text-warning" />}
+              />
             </section>
 
             {run.summary.replayDate && (
@@ -445,7 +552,8 @@ export default function BacktestPage() {
               </section>
             )}
 
-            <section className="grid grid-cols-1 xl:grid-cols-2 gap-6">
+            {run.summary.validity === 'VALID' && run.summary.endingCapital != null && (
+              <section className="grid grid-cols-1 xl:grid-cols-2 gap-6">
               <ChartCard
                 title="Equity Curve"
                 subtitle={`${formatCurrency(run.summary.initialCapital)} to ${formatCurrency(run.summary.endingCapital)}`}
@@ -475,12 +583,23 @@ export default function BacktestPage() {
                   </AreaChart>
                 </ResponsiveContainer>
               </ChartCard>
-            </section>
+              </section>
+            )}
 
-            <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
-              <DetailCard label="Profit Factor" value={run.summary.profitFactor == null ? '—' : run.summary.profitFactor.toFixed(2)} />
+            <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-5 gap-4">
+              <DetailCard label="Outcome Profit Factor" value={run.summary.profitFactor == null ? '—' : run.summary.profitFactor.toFixed(2)} />
               <DetailCard label="Average Holding" value={run.summary.averageHoldingDays == null ? '—' : `${run.summary.averageHoldingDays.toFixed(1)}d`} />
               <DetailCard label="Stops Hit" value={run.summary.stopsHitPct == null ? `${run.summary.stopsHit}` : `${run.summary.stopsHit} (${run.summary.stopsHitPct.toFixed(2)}%)`} />
+              <DetailCard label="Slot-Eligible Outcomes" value={String(run.summary.slotEligibleTrades)} />
+              <DetailCard label={`Rejected at ${run.summary.maxPositions}-Position Cap`} value={String(run.summary.positionLimitRejectedTrades)} />
+              <DetailCard label="Cash-Funded Trades" value={String(run.summary.cashFundedTrades)} />
+              <DetailCard label="Rejected for Cash" value={String(run.summary.cashRejectedTrades)} />
+              <DetailCard label="Rejected for Missing FX" value={String(run.summary.fxRejectedTrades)} />
+              <DetailCard label="Average Funded Position" value={formatCurrency(run.summary.averageFundedPositionValueGbp)} />
+              <DetailCard label="Average Funded Risk" value={formatCurrency(run.summary.averageFundedRiskAmountGbp)} />
+              <DetailCard label="Slot-Eligible Gross Mean" value={formatR(run.summary.slotEligibleGrossAverageR)} />
+              <DetailCard label={`Net Mean at ${run.summary.executionCostPctPerSide.toFixed(2)}% / Side`} value={formatR(run.summary.slotEligibleNetAverageR)} />
+              <DetailCard label="Scenario Cost Drag" value={formatR(run.summary.executionCostDragR)} />
               <DetailCard label="Snapshot Rows" value={String(run.summary.snapshotCount)} />
             </section>
 
@@ -489,7 +608,7 @@ export default function BacktestPage() {
                 <div>
                   <h2 className="text-lg font-semibold text-foreground">Trade Log</h2>
                   <p className="text-sm text-muted-foreground">
-                    Fixed-risk replay of historical evening signals using the stored stop ladder outcome.
+                    Historical evening signal replay. Only complete 20-day or stop-hit outcomes enter observational outcome statistics.
                   </p>
                 </div>
                 <div className="w-full md:w-64">
@@ -513,6 +632,9 @@ export default function BacktestPage() {
                       <th className="px-3 py-3 text-right">Entry</th>
                       <th className="px-3 py-3 text-right">Stop</th>
                       <th className="px-3 py-3 text-right">NCS</th>
+                      <th className="px-3 py-3 text-right">Qty</th>
+                      <th className="px-3 py-3 text-right">Position GBP</th>
+                      <th className="px-3 py-3 text-left">Cash Status</th>
                       <th className="px-3 py-3 text-right">R</th>
                       <th className="px-3 py-3 text-left">Exit</th>
                       <th className="px-3 py-3 text-right">Held</th>
@@ -539,6 +661,9 @@ export default function BacktestPage() {
                             {trade.ncs.toFixed(0)}
                           </span>
                         </td>
+                        <td className="px-3 py-3 text-right font-mono text-foreground">{trade.simulatedQuantity ?? '—'}</td>
+                        <td className="px-3 py-3 text-right font-mono text-foreground">{formatCurrency(trade.simulatedPositionValueGbp ?? null)}</td>
+                        <td className="px-3 py-3 text-xs text-muted-foreground whitespace-nowrap">{trade.cashReservationStatus?.replaceAll('_', ' ') ?? '—'}</td>
                         <td className={cn(
                           'px-3 py-3 text-right font-mono font-semibold',
                           (trade.realizedR ?? 0) >= 0 ? 'text-profit' : 'text-loss',
@@ -554,7 +679,7 @@ export default function BacktestPage() {
                     ))}
                     {filteredTrades.length === 0 && (
                       <tr>
-                        <td colSpan={9} className="px-4 py-10 text-center text-muted-foreground">
+                        <td colSpan={12} className="px-4 py-10 text-center text-muted-foreground">
                           No trades match the current filter.
                         </td>
                       </tr>
@@ -575,11 +700,13 @@ function MetricCard({
   value,
   icon,
   valueClass,
+  detail,
 }: {
   label: string;
   value: string;
   icon: React.ReactNode;
   valueClass?: string;
+  detail?: string;
 }) {
   return (
     <div className="card-surface p-4 border border-border/70">
@@ -588,6 +715,7 @@ function MetricCard({
         {label}
       </div>
       <div className={cn('text-2xl font-bold text-foreground', valueClass)}>{value}</div>
+      {detail && <div className="text-xs text-muted-foreground mt-1">{detail}</div>}
     </div>
   );
 }

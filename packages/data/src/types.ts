@@ -29,6 +29,8 @@ export interface RefreshUniverseOptions {
   range?: HistoricalRange;
   interval?: HistoricalInterval;
   force?: boolean;
+  syncStockUniverse?: boolean;
+  minimumBars?: number;
 }
 
 export interface SymbolRefreshResult {

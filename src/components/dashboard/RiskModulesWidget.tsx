@@ -1,14 +1,12 @@
 'use client';
 
-import { BarChart3, TrendingUp, Ban, Clock, Flame, Trash2 } from 'lucide-react';
-import type { BreadthSafetyResult, MomentumExpansionResult, TurnoverMetrics } from '@/types';
+import { BarChart3, Ban, Clock, Flame, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useModulesData } from '@/hooks/useModulesData';
 
 export default function RiskModulesWidget() {
   const { data: modulesData, loading } = useModulesData();
   const breadth = modulesData?.breadthSafety ?? null;
-  const momentum = modulesData?.momentumExpansion ?? null;
   const turnover = modulesData?.turnover ?? null;
   const whipsawCount = modulesData?.whipsawBlocks?.length || 0;
   const laggardCount = modulesData?.laggards?.length || 0;
@@ -43,14 +41,6 @@ export default function RiskModulesWidget() {
               Max pos → {breadth.maxPositionsOverride}
             </div>
           )}
-        </div>
-
-        {/* Momentum Expansion — DISABLED */}
-        <div className="rounded-lg border border-muted/10 bg-muted/5 p-3 text-center opacity-50">
-          <TrendingUp className="w-5 h-5 mx-auto mb-1 text-muted-foreground" />
-          <div className="text-xl font-bold text-muted-foreground">OFF</div>
-          <div className="text-[10px] text-muted-foreground">Momentum Exp.</div>
-          <div className="text-[10px] text-muted-foreground mt-1">Disabled</div>
         </div>
 
         {/* Turnover */}

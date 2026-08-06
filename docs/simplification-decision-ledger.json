@@ -1,0 +1,413 @@
+{
+  "schemaVersion": 1,
+  "capturedAt": "2026-08-06",
+  "status": "RETIREMENT_BATCH_1_COMPLETE",
+  "scope": {
+    "featureFlags": 0,
+    "secondaryNavigationDestinations": 20,
+    "totalEntries": 23
+  },
+  "evidenceLimits": [
+    "No route-access analytics are available, so operator usage is unknown.",
+    "Database row counts show whether a surface has data, not whether its output improves decisions.",
+    "No further code removal is authorized by the remaining preliminary dispositions."
+  ],
+  "databaseSnapshot": {
+    "closedPositions": 20,
+    "tradeLogs": 132,
+    "tradeJournals": 0,
+    "candidateOutcomes": 58622,
+    "backtestRuns": 7,
+    "executionLogs": 186,
+    "filterAttributions": 58622,
+    "scoreBreakdowns": 81504,
+    "conformalCalibrations": 201,
+    "failureModeScores": 0,
+    "signalAuditResults": 0,
+    "stressTestResults": 7,
+    "invarianceAuditResults": 0,
+    "gnnInferenceLogs": 13,
+    "tradeEpisodes": 0,
+    "jobRuns": 75,
+    "plannedTrades": 0,
+    "brokerOrders": 0
+  },
+  "entries": [
+    {
+      "id": "flag:MODULE_FAST_FOLLOWER",
+      "kind": "FEATURE_FLAG",
+      "label": "Fast Follower",
+      "systemJob": "Scan",
+      "disposition": "RETIRE",
+      "status": "RETIRED",
+      "retiredAt": "2026-08-05",
+      "confidence": "HIGH",
+      "risk": "ADVISORY_ENTRY_LOGIC",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The flag is false.",
+        "The modules API returns a hard-coded empty array instead of invoking scanFastFollowers.",
+        "No scheduled invocation was found.",
+        "The implementation requires backtesting and four weeks of paper trading, with no recorded completion."
+      ],
+      "nextGate": "Completed: removed the flag, dormant module, dashboard detail, and status row without changing production scan behavior."
+    },
+    {
+      "id": "flag:MODULE_MOMENTUM_EXPANSION",
+      "kind": "FEATURE_FLAG",
+      "label": "Momentum Expansion",
+      "systemJob": "Risk",
+      "disposition": "RETIRE",
+      "status": "RETIRED",
+      "retiredAt": "2026-08-05",
+      "confidence": "HIGH",
+      "risk": "MONEY_LOGIC_IF_ENABLED",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The flag is false.",
+        "Both enabled branches contain placeholder comments and do not call checkMomentumExpansion.",
+        "The implementation would increase maximum open risk and has no recorded backtest or paper-trading validation."
+      ],
+      "nextGate": "Completed: removed the unreachable feature path without changing current risk limits or position sizing."
+    },
+    {
+      "id": "flag:BENCHMARK_SCAN_MODE",
+      "kind": "FEATURE_FLAG",
+      "label": "Benchmark Scan Mode",
+      "systemJob": "Learn",
+      "disposition": "RETIRE",
+      "status": "RETIRED",
+      "retiredAt": "2026-08-05",
+      "confidence": "HIGH",
+      "risk": "READ_ONLY",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The flag is false and the endpoint returns HTTP 403.",
+        "The route claims a scan-page benchmark tab consumer, but no benchmark request or tab exists in the current scan page or components.",
+        "The benchmark implementation is consumed only by the disabled endpoint."
+      ],
+      "nextGate": "Completed: removed the flag, disabled endpoint, and orphan implementation; production scan modes are unchanged."
+    },
+    {
+      "id": "nav:/trade-pulse",
+      "kind": "NAVIGATION",
+      "label": "Trade Pulse",
+      "path": "/trade-pulse",
+      "systemJob": "Review",
+      "disposition": "QUARANTINE",
+      "confidence": "MEDIUM",
+      "risk": "ADVISORY",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The view aggregates cross-reference, danger, prediction, and analyst outputs.",
+        "Only 20 closed positions exist, below the 30-trade calibration threshold."
+      ],
+      "nextGate": "Ask whether this view changed a trade-review decision in the last 30 days; otherwise remove it from primary navigation."
+    },
+    {
+      "id": "nav:/backtest",
+      "kind": "NAVIGATION",
+      "label": "Signals",
+      "path": "/backtest",
+      "systemJob": "Learn",
+      "disposition": "KEEP",
+      "confidence": "HIGH",
+      "risk": "READ_ONLY",
+      "operatorEvidence": "PRESENT",
+      "evidence": [
+        "The navigation label Signals opens the backtest runner.",
+        "Seven named replay runs are stored and the current scenario has been used to validate OHLC outcomes, execution costs, concurrency, historical FX, whole-share sizing, and cash reservation.",
+        "The runner remains advisory-only and suppresses portfolio return and drawdown while validity is PARTIAL."
+      ],
+      "nextGate": "Retain as the canonical replay surface; require observed intraday execution evidence before allowing a VALID portfolio verdict."
+    },
+    {
+      "id": "nav:/filter-scorecard",
+      "kind": "NAVIGATION",
+      "label": "Scorecard",
+      "path": "/filter-scorecard",
+      "systemJob": "Learn",
+      "disposition": "KEEP",
+      "confidence": "HIGH",
+      "risk": "READ_ONLY",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The view measures outcomes for passed and blocked filters.",
+        "CandidateOutcome and FilterAttribution each contain 58,622 rows."
+      ],
+      "nextGate": "Retain as the canonical filter-effectiveness view; verify operator use before consolidating related evidence pages into it."
+    },
+    {
+      "id": "nav:/score-validation",
+      "kind": "NAVIGATION",
+      "label": "Score Lab",
+      "path": "/score-validation",
+      "systemJob": "Learn",
+      "disposition": "CONSOLIDATE",
+      "confidence": "MEDIUM",
+      "risk": "READ_ONLY_WITH_BACKFILL",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The page validates score bands and can trigger a backfill.",
+        "ScoreBreakdown contains 81,504 rows.",
+        "Its operator question overlaps the broader evidence and filter-scorecard views."
+      ],
+      "nextGate": "Choose one canonical evidence destination and preserve backfill as an advanced action."
+    },
+    {
+      "id": "nav:/breakout-evidence",
+      "kind": "NAVIGATION",
+      "label": "Breakout Evidence",
+      "path": "/breakout-evidence",
+      "systemJob": "Learn",
+      "disposition": "CONSOLIDATE",
+      "confidence": "MEDIUM",
+      "risk": "READ_ONLY",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The page reads candidate outcomes for breakout and novel-signal comparisons.",
+        "Its evidence question overlaps the broader evidence framework."
+      ],
+      "nextGate": "Move distinct breakout comparisons into the canonical evidence destination if operators use them."
+    },
+    {
+      "id": "nav:/prediction-status",
+      "kind": "NAVIGATION",
+      "label": "Prediction",
+      "path": "/prediction-status",
+      "systemJob": "Learn",
+      "disposition": "QUARANTINE",
+      "confidence": "HIGH",
+      "risk": "ADVISORY_MODEL_MANAGEMENT",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "Only 20 closed positions exist, below the 30-trade calibration threshold.",
+        "Several prediction result tables are empty while 201 conformal calibration rows and 13 GNN inference rows exist.",
+        "The page can trigger model training but cannot affect deterministic execution."
+      ],
+      "nextGate": "Remove from normal navigation until calibration readiness and a named decision consumer both exist."
+    },
+    {
+      "id": "nav:/price-accuracy",
+      "kind": "NAVIGATION",
+      "label": "Price Accuracy",
+      "path": "/price-accuracy",
+      "systemJob": "Review",
+      "disposition": "KEEP",
+      "confidence": "MEDIUM",
+      "risk": "DATA_QUALITY",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The page compares recorded prices with later market data.",
+        "Price integrity can invalidate downstream evidence and execution review."
+      ],
+      "nextGate": "Confirm the page catches a distinct failure not already surfaced by health checks."
+    },
+    {
+      "id": "nav:/watchlist-news",
+      "kind": "NAVIGATION",
+      "label": "Watchlist News",
+      "path": "/watchlist-news",
+      "systemJob": "Review",
+      "disposition": "QUARANTINE",
+      "confidence": "MEDIUM",
+      "risk": "EXTERNAL_ADVISORY",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The page depends on analyst news-batch and sentiment-trend endpoints.",
+        "Its output is display-only and has no deterministic execution consumer."
+      ],
+      "nextGate": "Keep only if it caused a distinct documented review action in the last 30 days."
+    },
+    {
+      "id": "nav:/execution-quality",
+      "kind": "NAVIGATION",
+      "label": "Execution Quality",
+      "path": "/execution-quality",
+      "systemJob": "Learn",
+      "disposition": "CONSOLIDATE",
+      "confidence": "HIGH",
+      "risk": "READ_ONLY",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "Execution Quality and Execution Audit both consume /api/analytics/execution-audit.",
+        "ExecutionLog contains 186 rows."
+      ],
+      "nextGate": "Merge summary cards into Execution Audit and retain one navigation destination."
+    },
+    {
+      "id": "nav:/execution-audit",
+      "kind": "NAVIGATION",
+      "label": "Exec Audit",
+      "path": "/execution-audit",
+      "systemJob": "Learn",
+      "disposition": "KEEP",
+      "confidence": "HIGH",
+      "risk": "READ_ONLY",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The page is the detailed consumer of the shared execution-audit endpoint.",
+        "ExecutionLog contains 186 rows."
+      ],
+      "nextGate": "Use this as the canonical execution evidence destination."
+    },
+    {
+      "id": "nav:/alerts",
+      "kind": "NAVIGATION",
+      "label": "Alerts",
+      "path": "/alerts",
+      "systemJob": "Manage",
+      "disposition": "KEEP",
+      "confidence": "HIGH",
+      "risk": "SAFETY",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The page exposes stale data, broker failure, stop gaps, failed orders, drawdown, and risk-limit breaches.",
+        "It links active failures to corrective views and shows kill-switch posture."
+      ],
+      "nextGate": "Protected operational surface; consolidate only if every alert remains visible and actionable elsewhere."
+    },
+    {
+      "id": "nav:/planned-trades",
+      "kind": "NAVIGATION",
+      "label": "Planned Trades",
+      "path": "/planned-trades",
+      "systemJob": "Act",
+      "disposition": "KEEP",
+      "confidence": "HIGH",
+      "risk": "EXECUTION_REVIEW",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The page joins planned entry, stop, risk approval, and broker-order state for the next session.",
+        "The table is currently empty, but it represents the pre-execution review contract rather than an advisory experiment."
+      ],
+      "nextGate": "Retain; investigate why no planned trades are persisted only as a separate workflow question."
+    },
+    {
+      "id": "nav:/stops",
+      "kind": "NAVIGATION",
+      "label": "Stops",
+      "path": "/stops",
+      "systemJob": "Manage",
+      "disposition": "KEEP",
+      "confidence": "HIGH",
+      "risk": "SAFETY",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The page exposes unprotected positions, local-to-broker mismatches, failed stops, and verification times."
+      ],
+      "nextGate": "Protected management surface; preserve stop monotonicity and broker reconciliation."
+    },
+    {
+      "id": "nav:/orders",
+      "kind": "NAVIGATION",
+      "label": "Orders",
+      "path": "/orders",
+      "systemJob": "Act",
+      "disposition": "KEEP",
+      "confidence": "HIGH",
+      "risk": "EXECUTION_AUDIT",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The page exposes broker order status, fills, rejections, and planned-trade linkage.",
+        "The local BrokerOrder table is currently empty, but reconciliation is a core execution requirement."
+      ],
+      "nextGate": "Retain; validate broker-order persistence separately before relying on this view operationally."
+    },
+    {
+      "id": "nav:/jobs",
+      "kind": "NAVIGATION",
+      "label": "Jobs",
+      "path": "/jobs",
+      "systemJob": "Manage",
+      "disposition": "KEEP",
+      "confidence": "HIGH",
+      "risk": "OPERATIONS",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The page exposes failed and partial scheduled jobs plus audit events.",
+        "JobRun contains 75 rows."
+      ],
+      "nextGate": "Protected operational surface; align with scheduler audit rather than remove it."
+    },
+    {
+      "id": "nav:/signal-audit",
+      "kind": "NAVIGATION",
+      "label": "Signal Audit",
+      "path": "/signal-audit",
+      "systemJob": "Learn",
+      "disposition": "QUARANTINE",
+      "confidence": "HIGH",
+      "risk": "ADVISORY_ANALYTICS",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "SignalAuditResult contains zero rows.",
+        "The page can trigger mutual-information analysis but has no recorded result."
+      ],
+      "nextGate": "Hide until a named signal-pruning experiment has a sample requirement and review date."
+    },
+    {
+      "id": "nav:/causal-audit",
+      "kind": "NAVIGATION",
+      "label": "Causal Audit",
+      "path": "/causal-audit",
+      "systemJob": "Learn",
+      "disposition": "QUARANTINE",
+      "confidence": "HIGH",
+      "risk": "ADVISORY_ANALYTICS",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "InvarianceAuditResult contains zero rows.",
+        "The page can trigger IRM analysis but has no recorded result."
+      ],
+      "nextGate": "Hide until a named invariance experiment has enough environments, samples, and a review date."
+    },
+    {
+      "id": "nav:/trade-log",
+      "kind": "NAVIGATION",
+      "label": "Trade Log",
+      "path": "/trade-log",
+      "systemJob": "Learn",
+      "disposition": "KEEP",
+      "confidence": "HIGH",
+      "risk": "AUDIT_RECORD",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "TradeLog contains 132 rows.",
+        "The page provides execution history and outcome summaries."
+      ],
+      "nextGate": "Retain as the canonical quantitative trade history."
+    },
+    {
+      "id": "nav:/journal",
+      "kind": "NAVIGATION",
+      "label": "Journal",
+      "path": "/journal",
+      "systemJob": "Learn",
+      "disposition": "CONSOLIDATE",
+      "confidence": "HIGH",
+      "risk": "OPERATOR_NOTES",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "TradeJournal contains zero rows.",
+        "The same journal API is already consumed by JournalDrawer in the portfolio workflow."
+      ],
+      "nextGate": "Remove the standalone navigation destination if the portfolio drawer supports the complete note workflow; preserve the API and data model."
+    },
+    {
+      "id": "nav:/settings",
+      "kind": "NAVIGATION",
+      "label": "Settings",
+      "path": "/settings",
+      "systemJob": "Manage",
+      "disposition": "KEEP",
+      "confidence": "HIGH",
+      "risk": "SAFETY_AND_CREDENTIALS",
+      "operatorEvidence": "MISSING",
+      "evidence": [
+        "The page owns account configuration, broker credentials, data providers, notifications, prediction settings, and kill switches."
+      ],
+      "nextGate": "Protected configuration surface; simplify panels only through separate behavior-preserving work."
+    }
+  ]
+}

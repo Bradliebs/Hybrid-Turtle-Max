@@ -28,7 +28,6 @@ import { findSwapSuggestions } from '@/lib/modules/heatmap-swap';
 import { checkWhipsawBlocks } from '@/lib/modules/whipsaw-guard';
 import { calculateBreadth, checkBreadthSafety } from '@/lib/modules/breadth-safety';
 // Module 13 disabled — import preserved for reference
-// import { checkMomentumExpansion } from '@/lib/modules/momentum-expansion';
 import { getRiskBudget } from '@/lib/risk-gates';
 import { canPyramid, calculatePyramidAddSize } from '@/lib/risk-gates';
 import { calculateRMultiple } from '@/lib/position-sizer';

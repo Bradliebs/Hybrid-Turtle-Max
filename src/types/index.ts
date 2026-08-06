@@ -116,12 +116,6 @@ export const EQUITY_REVIEW_THRESHOLDS = [
   { equity: 5000, message: 'Account passed £5,000 — review all profile options for better diversification' },
 ];
 
-// ---- Disabled Modules ----
-// Modules gated by feature flags. Controlled via src/lib/feature-flags.ts.
-// Module 9: Fast Follower — disabled: requires backtesting, not validated for small account
-// Module 13: Momentum Expansion — disabled: affects position sizing, needs paper trading validation
-export const DISABLED_MODULES: Set<number> = new Set([9, 13]);
-
 // ---- Gap Guard Config ----
 export type GapGuardMode = 'ALL' | 'MONDAY_ONLY';
 
@@ -838,17 +832,6 @@ export interface HeatCheckResult {
   reason: string;
 }
 
-// Module 9: Fast-Follower Re-Entry
-export interface FastFollowerSignal {
-  ticker: string;
-  exitDate: string;
-  daysSinceExit: number;
-  reclaimedTwentyDayHigh: boolean;
-  volumeRatio: number;
-  eligible: boolean;
-  reason: string;
-}
-
 // Module 10: Market Breadth Safety Valve
 export interface BreadthSafetyResult {
   breadthPct: number; // % of universe above 50DMA
@@ -863,15 +846,6 @@ export interface WhipsawBlock {
   ticker: string;
   stopsInLast30Days: number;
   blocked: boolean;
-  reason: string;
-}
-
-// Module 13: Momentum Expansion
-export interface MomentumExpansionResult {
-  adx: number;
-  threshold: number; // 25
-  expandedMaxRisk: number | null; // 8.5% or null
-  isExpanded: boolean;
   reason: string;
 }
 
@@ -924,7 +898,6 @@ export interface WeeklyActionCard {
   climaxDetails: ClimaxSignal[];
   whipsawDetails: WhipsawBlock[];
   swapDetails: SwapSuggestion[];
-  fastFollowerDetails: FastFollowerSignal[];
   reentryDetails: ReEntrySignal[];
   maxPositions: number;
   notes: string[];
@@ -1026,11 +999,9 @@ export interface AllModulesResult {
   climaxSignals: ClimaxSignal[];
   swapSuggestions: SwapSuggestion[];
   heatChecks: HeatCheckResult[];
-  fastFollowers: FastFollowerSignal[];
   breadthSafety: BreadthSafetyResult;
   whipsawBlocks: WhipsawBlock[];
   regimeStability: RegimeStabilityResult;
-  momentumExpansion: MomentumExpansionResult;
   dualRegime: DualRegimeResult;
   turnover: TurnoverMetrics;
   dataValidation: DataValidationResult[];

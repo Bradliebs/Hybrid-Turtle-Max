@@ -4,7 +4,7 @@ import { useState } from 'react';
 import {
   FileText, TrendingUp, ShieldAlert,
   Flame, Trash2, Ban, ArrowRightLeft,
-  ChevronDown, ChevronUp, Zap, RotateCcw,
+  ChevronDown, ChevronUp, RotateCcw,
   ArrowRight, AlertTriangle,
 } from 'lucide-react';
 import type { WeeklyActionCard as ActionCardType } from '@/types';
@@ -18,7 +18,6 @@ type DrillSection =
   | 'climax'
   | 'whipsaw'
   | 'swaps'
-  | 'fastFollowers'
   | 'reentry';
 
 export default function ActionCardWidget() {
@@ -56,7 +55,6 @@ export default function ActionCardWidget() {
     (card.climaxDetails?.length || 0) +
     (card.whipsawDetails?.length || 0) +
     (card.swapDetails?.length || 0) +
-    (card.fastFollowerDetails?.length || 0) +
     (card.reentryDetails?.length || 0);
 
   return (
@@ -341,49 +339,6 @@ export default function ActionCardWidget() {
                       <span className="text-muted-foreground ml-2">
                         {w.stopsInLast30Days} stop{w.stopsInLast30Days > 1 ? 's' : ''} in 30d — blocked 60 days
                       </span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </DrillableSection>
-          )}
-
-          {/* Fast-Follower Re-Entry */}
-          {card.fastFollowerDetails && card.fastFollowerDetails.length > 0 && (
-            <DrillableSection
-              icon={<Zap className="w-3 h-3 text-yellow-400" />}
-              label={`Fast-Follower${card.fastFollowerDetails.length > 1 ? 's' : ''} (${card.fastFollowerDetails.length})`}
-              isOpen={drillOpen === 'fastFollowers'}
-              onToggle={() => toggle('fastFollowers')}
-              color="info"
-            >
-              <div className="space-y-2">
-                {card.fastFollowerDetails.map((f) => (
-                  <div key={f.ticker} className="bg-surface-elevated/50 rounded-md p-2 border border-border/30">
-                    <div className="flex items-center justify-between mb-1">
-                      <span className="text-[11px] font-medium text-foreground">{f.ticker}</span>
-                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-yellow-500/10 text-yellow-400 border border-yellow-500/20">
-                        RE-ENTER
-                      </span>
-                    </div>
-                    <div className="grid grid-cols-3 gap-2 text-[10px]">
-                      <div>
-                        <span className="text-muted-foreground">Days since exit</span>
-                        <div className="font-medium text-foreground">{f.daysSinceExit}d</div>
-                      </div>
-                      <div>
-                        <span className="text-muted-foreground">20d high</span>
-                        <div className={cn('font-medium', f.reclaimedTwentyDayHigh ? 'text-profit' : 'text-loss')}>
-                          {f.reclaimedTwentyDayHigh ? 'Reclaimed' : 'Below'}
-                        </div>
-                      </div>
-                      <div>
-                        <span className="text-muted-foreground">Volume</span>
-                        <div className="font-medium text-foreground">{f.volumeRatio.toFixed(1)}×</div>
-                      </div>
-                    </div>
-                    <div className="text-[10px] text-muted-foreground mt-1">
-                      Stopped out {f.exitDate} — shakeout recovery signal
                     </div>
                   </div>
                 ))}

@@ -9,6 +9,7 @@
 import pLimit from 'p-limit';
 import { Prisma } from '@prisma/client';
 import { env } from '../../config/src/env';
+import { toYahooTicker } from '../../../src/lib/ticker-maps';
 import { YahooMarketDataProvider } from './yahoo-provider';
 import {
   createDataRefreshRun,
@@ -16,6 +17,7 @@ import {
   getActiveUniverseSymbols,
   markInstrumentStale,
   recordDataRefreshResult,
+  syncActiveStockInstruments,
   upsertDailyBars,
 } from './repository';
 import type {
@@ -65,7 +67,14 @@ export async function upsertDailyBarsForSymbol(symbol: string, bars: HistoricalB
 export async function refreshUniverseDailyBars(options: RefreshUniverseOptions = {}): Promise<RefreshUniverseResult> {
   const range = options.range ?? env.MARKET_DATA_DEFAULT_RANGE;
   const interval = options.interval ?? env.MARKET_DATA_DEFAULT_INTERVAL;
-  const symbols = await getActiveUniverseSymbols(options.symbols);
+  const minimumBars = options.minimumBars ?? 1;
+  const requestedSymbols = options.symbols
+    ? Array.from(new Set(options.symbols.map((symbol) => toYahooTicker(symbol))))
+    : undefined;
+  if (options.syncStockUniverse) {
+    await syncActiveStockInstruments(requestedSymbols);
+  }
+  const symbols = await getActiveUniverseSymbols(requestedSymbols);
   const run = await createDataRefreshRun({
     range,
     interval,
@@ -86,6 +95,9 @@ export async function refreshUniverseDailyBars(options: RefreshUniverseOptions =
             }
 
             const response = await fetchHistoricalBars(symbol, range, interval);
+            if (response.bars.length < minimumBars) {
+              throw new Error(`Yahoo returned ${response.bars.length} ${interval} bars for ${symbol}; at least ${minimumBars} required`);
+            }
             return response;
           }, env.MARKET_DATA_FETCH_RETRIES);
 

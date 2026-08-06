@@ -9,6 +9,14 @@
 
 export type BacktestMode = 'FULL' | 'CORE_LITE';
 export type BacktestExitReason = 'STOP_HIT' | 'TIME_EXIT_20D' | 'PARTIAL_LOOKAHEAD' | 'NO_OUTCOME';
+export type BacktestValidity = 'VALID' | 'PARTIAL' | 'INVALID_FOR_PERFORMANCE_CLAIMS';
+export type BacktestEvidenceVerdict = 'INCONCLUSIVE' | 'PROMISING' | 'SUPPORTED' | 'DEGRADING';
+
+export interface BacktestConfidenceInterval {
+  lower: number;
+  upper: number;
+  confidence: 0.95;
+}
 
 export interface BacktestRequest {
   startDate: Date;
@@ -20,6 +28,8 @@ export interface BacktestRequest {
   ticker?: string | null;
   initialCapital?: number;
   riskPerTradePct?: number;
+  maxPositions?: number;
+  executionCostPctPerSide?: number;
 }
 
 export interface BacktestTrade {
@@ -32,6 +42,13 @@ export interface BacktestTrade {
   entryTrigger: number;
   stopLevel: number;
   riskPerShare: number;
+  currency?: string;
+  entryFxToGbp?: number | null;
+  exitFxToGbp?: number | null;
+  simulatedQuantity?: number | null;
+  simulatedPositionValueGbp?: number | null;
+  simulatedRiskAmountGbp?: number | null;
+  cashReservationStatus?: 'FUNDED' | 'REJECTED_CASH' | 'REJECTED_FX' | 'NOT_SLOT_ELIGIBLE';
   bqs: number;
   fws: number;
   ncs: number;
@@ -56,18 +73,40 @@ export interface BacktestCurvePoint {
 }
 
 export interface BacktestSummary {
+  validity: BacktestValidity;
+  validityReasons: string[];
   mode: BacktestMode;
   startDate: string;
   endDate: string;
   replayDate: string | null;
   initialCapital: number;
-  endingCapital: number;
+  endingCapital: number | null;
   riskPerTradePct: number;
+  maxPositions: number;
+  executionCostPctPerSide: number;
   snapshotCount: number;
   signalCount: number;
   completedTrades: number;
+  incompleteTrades: number;
+  slotEligibleTrades: number;
+  positionLimitRejectedTrades: number;
+  cashFundedTrades: number;
+  cashRejectedTrades: number;
+  fxRejectedTrades: number;
+  averageFundedPositionValueGbp: number | null;
+  averageFundedRiskAmountGbp: number | null;
+  slotEligibleGrossAverageR: number | null;
+  slotEligibleNetAverageR: number | null;
+  executionCostDragR: number | null;
+  distinctOutcomeDays: number;
+  evidenceVerdict: BacktestEvidenceVerdict;
+  evidenceVerdictReason: string;
   winRate: number | null;
+  dailyWinRate: number | null;
+  winRateInterval: BacktestConfidenceInterval | null;
   averageR: number | null;
+  dailyMeanR: number | null;
+  averageRInterval: BacktestConfidenceInterval | null;
   averageWinR: number | null;
   averageLossR: number | null;
   expectancyR: number | null;

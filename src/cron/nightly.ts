@@ -48,8 +48,6 @@ import { scanClimaxSignals } from '@/lib/modules/climax-detector';
 import { findSwapSuggestions } from '@/lib/modules/heatmap-swap';
 import { checkWhipsawBlocks } from '@/lib/modules/whipsaw-guard';
 import { calculateBreadth, checkBreadthSafety } from '@/lib/modules/breadth-safety';
-// Module 13 disabled — import preserved for reference
-// import { checkMomentumExpansion } from '@/lib/modules/momentum-expansion';
 import { computeCorrelationMatrix } from '@/lib/correlation-matrix';
 import { refreshSectorMomentumCache } from '@/lib/sector-etf-cache';
 import { preCacheEarningsBatch } from '@/lib/earnings-calendar';
@@ -62,7 +60,6 @@ import { isAutoTradingEnabled } from '../../packages/workflow/src';
 import { Trading212Client, Trading212Error } from '@/lib/trading212';
 import type { T212AccountType } from '@/lib/trading212-dual';
 import { decryptField } from '@/lib/crypto';
-import { isEnabled } from '@/lib/feature-flags';
 import { isEarlyCloseDay, checkHolidayCoverage } from '@/lib/market-holidays';
 import { createCronLogger } from '@/lib/cron-logger';
 import { getUKDayOfWeek } from '@/lib/uk-time';
@@ -1298,14 +1295,6 @@ async function runNightlyProcess() {
     } catch (error) {
       hadFailure = true;
       console.warn('  [5] Breadth safety failed:', (error as Error).message);
-    }
-
-    // Momentum expansion — gated by feature flag
-    if (isEnabled('MODULE_MOMENTUM_EXPANSION')) {
-      console.log('  [5] Module 13 (Momentum Expansion) — running');
-      // Would call checkMomentumExpansion() here
-    } else {
-      console.log('  [5] Module 13 (Momentum Expansion) — DISABLED (feature flag off), skipping');
     }
 
     // Correlation matrix (isolated — advisory only, no hard blocks)

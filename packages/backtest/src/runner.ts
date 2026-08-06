@@ -9,20 +9,28 @@
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
 import { prisma, round } from '../../data/src/prisma';
+import { computeAtr } from '../../signals/src/math';
 import { scoreRow, type SnapshotRow } from '../../../src/lib/dual-score';
 import { calcBPSFromSnapshot, computeRsPercentiles } from '../../../src/lib/breakout-probability';
+import { overlapAdjustedMeanConfidenceInterval } from '../../../src/lib/statistics';
+import { toYahooTicker } from '../../../src/lib/ticker-maps';
 import type {
+  BacktestConfidenceInterval,
+  BacktestEvidenceVerdict,
   BacktestCurvePoint,
   BacktestMode,
   BacktestRequest,
   BacktestResult,
   BacktestSummary,
   BacktestTrade,
+  BacktestValidity,
   StoredBacktestRun,
 } from './types';
 
 const DEFAULT_INITIAL_CAPITAL = 10_000;
 const DEFAULT_RISK_PER_TRADE_PCT = 2;
+const DEFAULT_MAX_POSITIONS = 4;
+const DEFAULT_EXECUTION_COST_PCT_PER_SIDE = 0;
 const LOOKBACK_BUFFER_DAYS = 10;
 const LOOKAHEAD_BUFFER_DAYS = 45;
 
@@ -36,6 +44,10 @@ function isSameUtcDay(left: Date, right: Date): boolean {
     && left.getUTCDate() === right.getUTCDate();
 }
 
+function exitsBeforeSignalDay(exitDate: string, signalDate: string): boolean {
+  return exitDate.slice(0, 10) < signalDate.slice(0, 10);
+}
+
 function daysBetween(start: Date, end: Date): number {
   return Math.max(0, Math.round((end.getTime() - start.getTime()) / (24 * 60 * 60 * 1000)));
 }
@@ -44,12 +56,35 @@ function decimalOrNull(value: number | null | undefined): number | null {
   return value == null ? null : value;
 }
 
+type FxBar = { date: Date; close: number };
+
+export function resolveHistoricalFxToGbp(
+  currency: string | null | undefined,
+  ticker: string,
+  at: Date,
+  barsBySymbol: Map<string, FxBar[]>,
+): number | null {
+  if (toYahooTicker(ticker).endsWith('.L')) return 0.01;
+  const normalized = currency === 'GBp' ? 'GBX' : currency?.trim().toUpperCase();
+  if (normalized === 'GBP') return 1;
+  if (normalized === 'GBX') return 0.01;
+  if (!normalized) return null;
+  const targetDay = at.toISOString().slice(0, 10);
+  const bars = barsBySymbol.get(`${normalized}GBP=X`) ?? [];
+  let rate: number | null = null;
+  for (const bar of bars) {
+    if (bar.date.toISOString().slice(0, 10) >= targetDay) break;
+    if (Number.isFinite(bar.close) && bar.close > 0) rate = bar.close;
+  }
+  return rate;
+}
+
 const snapshotRowSchema = z.object({
   ticker: z.string(),
   name: z.string().default(''),
   sleeve: z.string().default(''),
   status: z.string().default(''),
-  currency: z.string().default(''),
+  currency: z.string().nullish().transform((value) => value ?? ''),
   close: z.number().default(0),
   atr14: z.number().default(0),
   atrPct: z.number().default(0),
@@ -137,7 +172,7 @@ function toSnapshotRow(row: Record<string, unknown>): SnapshotRow {
 export function simulateStopLadder(
   entryPrice: number,
   initialStop: number,
-  forwardCloses: Array<{ date: string; close: number; atr14: number }>,
+  forwardCloses: Array<{ date: string; close: number; low?: number; atr14: number }>,
 ): { hit: boolean; hitDate: string | null; hitR: number | null; maxFavR: number; maxAdvR: number } {
   const riskPerShare = entryPrice - initialStop;
   if (riskPerShare <= 0) {
@@ -153,7 +188,7 @@ export function simulateStopLadder(
     maxFavR = Math.max(maxFavR, rMultiple);
     maxAdvR = Math.min(maxAdvR, rMultiple);
 
-    if (snap.close <= currentStop) {
+    if ((snap.low ?? snap.close) <= currentStop) {
       return {
         hit: true,
         hitDate: snap.date,
@@ -173,6 +208,43 @@ export function simulateStopLadder(
   }
 
   return { hit: false, hitDate: null, hitR: null, maxFavR, maxAdvR };
+}
+
+type DailyOutcomeBar = {
+  date: Date;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number | bigint;
+};
+
+/** @internal Exported for testing - converts OHLC history into post-signal stop inputs. */
+export function buildDailyOutcomeSeries(
+  bars: DailyOutcomeBar[],
+  signalDate: Date,
+  fallbackAtr14: number,
+) {
+  return bars.flatMap((bar, index) => {
+    if (bar.date <= signalDate) {
+      return [];
+    }
+    const atrWindow = bars.slice(Math.max(0, index - 14), index + 1).map((windowBar) => ({
+      date: windowBar.date,
+      open: windowBar.open,
+      high: windowBar.high,
+      low: windowBar.low,
+      close: windowBar.close,
+      volume: 0,
+    }));
+    const atr14 = computeAtr(atrWindow, 14) || fallbackAtr14;
+    return [{
+      date: bar.date.toISOString(),
+      close: bar.close,
+      low: bar.low,
+      atr14,
+    }];
+  });
 }
 
 function findForwardReturn(
@@ -210,7 +282,109 @@ function findForwardReturn(
   };
 }
 
-function buildSummary(
+export function isCompleteBacktestTrade(
+  trade: BacktestTrade,
+): trade is BacktestTrade & { realizedR: number } {
+  return trade.realizedR != null
+    && (trade.exitReason === 'STOP_HIT' || trade.exitReason === 'TIME_EXIT_20D');
+}
+
+export function classifyBacktestValidity(
+  completedTrades: number,
+  maxPositions = DEFAULT_MAX_POSITIONS,
+  executionCostPctPerSide = DEFAULT_EXECUTION_COST_PCT_PER_SIDE,
+): {
+  validity: BacktestValidity;
+  validityReasons: string[];
+} {
+  const modelLimitations = [
+    'Signals and entries come from timestamped snapshots; stop hits use daily lows and assume fills at the active stop price.',
+    'Trailing stops update from daily closes, so intraday price ordering within a session is not simulated.',
+    'Same-date exits do not release cash or position slots until the next UTC date because daily bars do not establish intraday ordering.',
+    `Concurrent entries are limited to ${maxPositions} positions and same-snapshot collisions are ranked by NCS.`,
+    `${executionCostPctPerSide.toFixed(2)}% adverse execution cost per side is applied as a user-defined scenario, not an observed estimate.`,
+    'Whole-share sizing uses historical entry FX; cash is reserved at entry and released from converted exit proceeds.',
+    'Trades with missing currency or historical FX are rejected rather than assigned a fallback rate.',
+  ];
+  if (completedTrades === 0) {
+    return {
+      validity: 'INVALID_FOR_PERFORMANCE_CLAIMS',
+      validityReasons: ['No trades have a complete 20-day or stop-hit outcome.', ...modelLimitations],
+    };
+  }
+  return { validity: 'PARTIAL', validityReasons: modelLimitations };
+}
+
+function computeOutcomeEvidence(completed: Array<BacktestTrade & { realizedR: number }>): {
+  distinctOutcomeDays: number;
+  dailyMeanR: number | null;
+  dailyWinRate: number | null;
+  averageRInterval: BacktestConfidenceInterval | null;
+  winRateInterval: BacktestConfidenceInterval | null;
+  evidenceVerdict: BacktestEvidenceVerdict;
+  evidenceVerdictReason: string;
+} {
+  const outcomesByDay = new Map<string, number[]>();
+  for (const trade of completed) {
+    const day = trade.signalDate.slice(0, 10);
+    const outcomes = outcomesByDay.get(day) ?? [];
+    outcomes.push(trade.realizedR);
+    outcomesByDay.set(day, outcomes);
+  }
+
+  const orderedOutcomes = [...outcomesByDay.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([, outcomes]) => outcomes);
+  const dailyMeanR = orderedOutcomes.map((outcomes) =>
+    outcomes.reduce((sum, outcome) => sum + outcome, 0) / outcomes.length);
+  const dailyWinRates = orderedOutcomes.map((outcomes) =>
+    (outcomes.filter((outcome) => outcome > 0).length / outcomes.length) * 100);
+  const averageRInterval = overlapAdjustedMeanConfidenceInterval(dailyMeanR, 20);
+  const winRateInterval = overlapAdjustedMeanConfidenceInterval(dailyWinRates, 20);
+  const distinctOutcomeDays = outcomesByDay.size;
+  const averageDailyR = dailyMeanR.length > 0
+    ? dailyMeanR.reduce((sum, outcome) => sum + outcome, 0) / dailyMeanR.length
+    : 0;
+  const averageDailyWinRate = dailyWinRates.length > 0
+    ? dailyWinRates.reduce((sum, rate) => sum + rate, 0) / dailyWinRates.length
+    : null;
+  const shared = {
+    distinctOutcomeDays,
+    dailyMeanR: dailyMeanR.length > 0 ? round(averageDailyR) : null,
+    dailyWinRate: averageDailyWinRate == null ? null : round(averageDailyWinRate),
+    averageRInterval,
+    winRateInterval,
+  };
+
+  if (distinctOutcomeDays < 30 || !averageRInterval) {
+    return {
+      ...shared,
+      evidenceVerdict: 'INCONCLUSIVE',
+      evidenceVerdictReason: `Only ${distinctOutcomeDays} distinct signal days have complete outcomes; at least 30 are required.`,
+    };
+  }
+  if (averageRInterval.upper < 0) {
+    return {
+      ...shared,
+      evidenceVerdict: 'DEGRADING',
+      evidenceVerdictReason: `Daily mean outcome is ${averageDailyR.toFixed(2)}R (95% CI ${averageRInterval.lower.toFixed(2)} to ${averageRInterval.upper.toFixed(2)}R).`,
+    };
+  }
+  if (averageRInterval.lower > 0) {
+    return {
+      ...shared,
+      evidenceVerdict: 'SUPPORTED',
+      evidenceVerdictReason: `Daily mean outcome is ${averageDailyR.toFixed(2)}R (95% CI ${averageRInterval.lower.toFixed(2)} to ${averageRInterval.upper.toFixed(2)}R).`,
+    };
+  }
+  return {
+    ...shared,
+    evidenceVerdict: averageDailyR > 0 ? 'PROMISING' : 'INCONCLUSIVE',
+    evidenceVerdictReason: `Daily mean outcome is ${averageDailyR.toFixed(2)}R; uncertainty includes no edge (95% CI ${averageRInterval.lower.toFixed(2)} to ${averageRInterval.upper.toFixed(2)}R).`,
+  };
+}
+
+export function buildSummary(
   mode: BacktestMode,
   startDate: Date,
   endDate: Date,
@@ -220,8 +394,36 @@ function buildSummary(
   snapshotCount: number,
   trades: BacktestTrade[],
   equityCurve: BacktestCurvePoint[],
+  maxPositions = DEFAULT_MAX_POSITIONS,
+  executionCostPctPerSide = DEFAULT_EXECUTION_COST_PCT_PER_SIDE,
+  cashSimulation?: ReturnType<typeof simulateCashConstrainedPortfolio>,
 ): BacktestSummary {
-  const completed = trades.filter((trade) => trade.realizedR != null);
+  const completed = trades.filter(isCompleteBacktestTrade);
+  const incompleteTrades = trades.length - completed.length;
+  const { validity, validityReasons } = classifyBacktestValidity(completed.length, maxPositions, executionCostPctPerSide);
+  const outcomeEvidence = computeOutcomeEvidence(completed);
+  const portfolioSimulation = cashSimulation ?? simulateCashConstrainedPortfolio(
+    trades,
+    initialCapital,
+    riskPerTradePct,
+    executionCostPctPerSide,
+    maxPositions,
+  );
+  const completedSlotEligible = portfolioSimulation.slotEligible.filter(isCompleteBacktestTrade);
+  const slotGrossR = completedSlotEligible.map((trade) => trade.realizedR);
+  const slotNetR = completedSlotEligible.map((trade) => applyExecutionCostScenario(trade, executionCostPctPerSide));
+  const slotEligibleGrossAverageR = slotGrossR.length > 0
+    ? round(slotGrossR.reduce((sum, value) => sum + value, 0) / slotGrossR.length)
+    : null;
+  const slotEligibleNetAverageR = slotNetR.length > 0
+    ? round(slotNetR.reduce((sum, value) => sum + value, 0) / slotNetR.length)
+    : null;
+  const averageFundedPositionValueGbp = portfolioSimulation.funded.length > 0
+    ? round(portfolioSimulation.funded.reduce((sum, position) => sum + position.positionValue, 0) / portfolioSimulation.funded.length)
+    : null;
+  const averageFundedRiskAmountGbp = portfolioSimulation.funded.length > 0
+    ? round(portfolioSimulation.funded.reduce((sum, position) => sum + position.riskAmount, 0) / portfolioSimulation.funded.length)
+    : null;
   const winners = completed.filter((trade) => (trade.realizedR ?? 0) > 0);
   const losers = completed.filter((trade) => (trade.realizedR ?? 0) < 0);
   const winSum = winners.reduce((sum, trade) => sum + (trade.realizedR ?? 0), 0);
@@ -233,9 +435,14 @@ function buildSummary(
   const averageLossR = losers.length > 0
     ? round(losers.reduce((sum, trade) => sum + (trade.realizedR ?? 0), 0) / losers.length)
     : null;
-  const endingCapital = equityCurve[equityCurve.length - 1]?.equity ?? initialCapital;
-  const totalReturnPct = completed.length > 0 ? round(((endingCapital - initialCapital) / initialCapital) * 100) : null;
-  const maxDrawdownPct = equityCurve.length > 0
+  const portfolioMetricsAvailable = validity === 'VALID';
+  const endingCapital = portfolioMetricsAvailable
+    ? equityCurve[equityCurve.length - 1]?.equity ?? initialCapital
+    : null;
+  const totalReturnPct = portfolioMetricsAvailable && endingCapital != null
+    ? round(((endingCapital - initialCapital) / initialCapital) * 100)
+    : null;
+  const maxDrawdownPct = portfolioMetricsAvailable && equityCurve.length > 0
     ? round(Math.max(...equityCurve.map((point) => point.drawdownPct)))
     : null;
   const stopsHit = trades.filter((trade) => trade.stopHit).length;
@@ -244,16 +451,34 @@ function buildSummary(
     : null;
 
   return {
+    validity,
+    validityReasons,
     mode,
     startDate: startDate.toISOString(),
     endDate: endDate.toISOString(),
     replayDate: replayDate?.toISOString() ?? null,
     initialCapital: round(initialCapital),
-    endingCapital: round(endingCapital),
+    endingCapital: endingCapital == null ? null : round(endingCapital),
     riskPerTradePct: round(riskPerTradePct),
+    maxPositions,
+    executionCostPctPerSide: round(executionCostPctPerSide),
     snapshotCount,
     signalCount: trades.length,
     completedTrades: completed.length,
+    incompleteTrades,
+    slotEligibleTrades: portfolioSimulation.slotEligible.length,
+    positionLimitRejectedTrades: portfolioSimulation.positionRejected,
+    cashFundedTrades: portfolioSimulation.funded.length,
+    cashRejectedTrades: portfolioSimulation.cashRejected,
+    fxRejectedTrades: portfolioSimulation.fxRejected,
+    averageFundedPositionValueGbp,
+    averageFundedRiskAmountGbp,
+    slotEligibleGrossAverageR,
+    slotEligibleNetAverageR,
+    executionCostDragR: slotEligibleGrossAverageR != null && slotEligibleNetAverageR != null
+      ? round(slotEligibleGrossAverageR - slotEligibleNetAverageR)
+      : null,
+    ...outcomeEvidence,
     winRate: completed.length > 0 ? round((winners.length / completed.length) * 100) : null,
     averageR,
     averageWinR,
@@ -301,6 +526,8 @@ export async function runBacktest(input: BacktestRequest): Promise<BacktestResul
   const mode: BacktestMode = input.mode ?? 'FULL';
   const initialCapital = input.initialCapital ?? DEFAULT_INITIAL_CAPITAL;
   const riskPerTradePct = input.riskPerTradePct ?? DEFAULT_RISK_PER_TRADE_PCT;
+  const maxPositions = Math.max(1, Math.floor(input.maxPositions ?? DEFAULT_MAX_POSITIONS));
+  const executionCostPctPerSide = Math.max(0, input.executionCostPctPerSide ?? DEFAULT_EXECUTION_COST_PCT_PER_SIDE);
 
   const loadStart = addDays(startDate, -LOOKBACK_BUFFER_DAYS);
   const loadEnd = addDays(endDate, LOOKAHEAD_BUFFER_DAYS);
@@ -324,7 +551,7 @@ export async function runBacktest(input: BacktestRequest): Promise<BacktestResul
       tradeCount: 0,
     }];
     return {
-      summary: buildSummary(mode, startDate, endDate, replayDate, initialCapital, riskPerTradePct, 0, [], emptyCurve),
+      summary: buildSummary(mode, startDate, endDate, replayDate, initialCapital, riskPerTradePct, 0, [], emptyCurve, maxPositions, executionCostPctPerSide),
       trades: [],
       equityCurve: emptyCurve,
       drawdownCurve: emptyCurve,
@@ -412,6 +639,80 @@ export async function runBacktest(input: BacktestRequest): Promise<BacktestResul
     historyByTicker.set(row.ticker, history);
   }
 
+  const sourceTickers = Array.from(historyByTicker.keys());
+  const stockMappings = await prisma.stock.findMany({
+    where: { ticker: { in: sourceTickers } },
+    select: { ticker: true, yahooTicker: true },
+  });
+  const yahooOverrideByTicker = new Map(stockMappings.map((stock) => [stock.ticker, stock.yahooTicker]));
+  const canonicalSymbolByTicker = new Map(sourceTickers.map((ticker) => [
+    ticker,
+    toYahooTicker(ticker, yahooOverrideByTicker.get(ticker)),
+  ]));
+  const marketInstruments = await prisma.instrument.findMany({
+    where: { symbol: { in: Array.from(new Set(canonicalSymbolByTicker.values())) } },
+    select: {
+      symbol: true,
+      currency: true,
+      dailyBars: {
+        where: {
+          date: {
+            gte: addDays(loadStart, -30),
+            lte: loadEnd,
+          },
+        },
+        orderBy: { date: 'asc' },
+        select: {
+          date: true,
+          open: true,
+          high: true,
+          low: true,
+          close: true,
+          volume: true,
+        },
+      },
+    },
+  });
+  const currencies = Array.from(new Set([
+    ...rows.map((row) => row.currency),
+    ...marketInstruments.map((instrument) => instrument.currency),
+  ].filter((currency): currency is string => Boolean(currency))));
+  const fxSymbols = currencies
+    .map((currency) => currency === 'GBp' ? 'GBX' : currency.toUpperCase())
+    .filter((currency) => currency !== 'GBP' && currency !== 'GBX')
+    .map((currency) => `${currency}GBP=X`);
+  const fxInstruments = await prisma.instrument.findMany({
+    where: { symbol: { in: Array.from(new Set(fxSymbols)) } },
+    select: {
+      symbol: true,
+      currency: true,
+      dailyBars: {
+        where: {
+          date: {
+            gte: addDays(loadStart, -30),
+            lte: loadEnd,
+          },
+        },
+        orderBy: { date: 'asc' },
+        select: {
+          date: true,
+          open: true,
+          high: true,
+          low: true,
+          close: true,
+          volume: true,
+        },
+      },
+    },
+  });
+  const instruments = [...marketInstruments, ...fxInstruments];
+  const dailyBarsBySymbol = new Map(instruments.map((instrument) => [instrument.symbol, instrument.dailyBars]));
+  const instrumentCurrencyBySymbol = new Map(instruments.map((instrument) => [instrument.symbol, instrument.currency]));
+  const fxBarsBySymbol = new Map(fxSymbols.map((symbol) => [
+    symbol,
+    (dailyBarsBySymbol.get(symbol) ?? []).map((bar) => ({ date: bar.date, close: bar.close })),
+  ]));
+
   const trades: BacktestTrade[] = [];
 
   for (const [ticker, history] of Array.from(historyByTicker.entries())) {
@@ -458,11 +759,12 @@ export async function runBacktest(input: BacktestRequest): Promise<BacktestResul
         : scored.NCS;
       const actionNote = mode === 'CORE_LITE' ? 'CORE_LITE' : scored.ActionNote;
 
-      const forwardCloses = history.slice(index + 1).map((row) => ({
-        date: (snapshotDateMap.get(row.snapshotId) ?? row.createdAt).toISOString(),
-        close: row.close,
-        atr14: row.atr14,
-      }));
+      const canonicalSymbol = canonicalSymbolByTicker.get(ticker) ?? toYahooTicker(ticker);
+      const forwardCloses = buildDailyOutcomeSeries(
+        dailyBarsBySymbol.get(canonicalSymbol) ?? [],
+        signalDate,
+        current.atr14,
+      );
       const fwd20 = findForwardReturn(
         forwardCloses.map((point) => ({ date: point.date, close: point.close })),
         signalDate,
@@ -490,6 +792,11 @@ export async function runBacktest(input: BacktestRequest): Promise<BacktestResul
           : lastForward
             ? 'PARTIAL_LOOKAHEAD'
             : 'NO_OUTCOME';
+      const tradeCurrency = instrumentCurrencyBySymbol.get(canonicalSymbol) || current.currency || '';
+      const entryFxToGbp = resolveHistoricalFxToGbp(tradeCurrency, ticker, signalDate, fxBarsBySymbol);
+      const exitFxToGbp = exitDate
+        ? resolveHistoricalFxToGbp(tradeCurrency, ticker, new Date(exitDate), fxBarsBySymbol)
+        : null;
 
       const rsPercentile = rsPercentileBySnapshot.get(current.snapshotId)?.get(ticker) ?? null;
       const bps = calcBPSFromSnapshot({
@@ -511,6 +818,9 @@ export async function runBacktest(input: BacktestRequest): Promise<BacktestResul
         entryTrigger: round(current.entryTrigger),
         stopLevel: round(current.stopLevel),
         riskPerShare: round(riskPerShare),
+        currency: tradeCurrency,
+        entryFxToGbp,
+        exitFxToGbp,
         bqs: round(scored.BQS),
         fws: round(scored.FWS),
         ncs: round(displayNcs),
@@ -530,46 +840,57 @@ export async function runBacktest(input: BacktestRequest): Promise<BacktestResul
   }
 
   trades.sort((left, right) => new Date(left.signalDate).getTime() - new Date(right.signalDate).getTime());
-
-  let equity = initialCapital;
-  let peakEquity = initialCapital;
-  const equityCurve: BacktestCurvePoint[] = [{
-    date: startDate.toISOString(),
-    equity: round(initialCapital),
-    drawdownPct: 0,
-    tradeCount: 0,
-  }];
-
-  for (let index = 0; index < trades.length; index += 1) {
-    const trade = trades[index];
-    if (trade.realizedR == null) {
-      continue;
+  const cashSimulation = simulateCashConstrainedPortfolio(
+    trades,
+    initialCapital,
+    riskPerTradePct,
+    executionCostPctPerSide,
+    maxPositions,
+  );
+  const slotEligibleKeys = new Set(cashSimulation.slotEligible.map((trade) => `${trade.ticker}|${trade.signalDate}`));
+  const fundedByKey = new Map(cashSimulation.funded.map((position) => [
+    `${position.trade.ticker}|${position.trade.signalDate}`,
+    position,
+  ]));
+  const simulatedTrades = trades.map((trade) => {
+    const key = `${trade.ticker}|${trade.signalDate}`;
+    const funded = fundedByKey.get(key);
+    if (funded) {
+      return {
+        ...trade,
+        simulatedQuantity: funded.quantity,
+        simulatedPositionValueGbp: funded.positionValue,
+        simulatedRiskAmountGbp: funded.riskAmount,
+        cashReservationStatus: 'FUNDED' as const,
+      };
     }
-
-    const riskAmount = equity * (riskPerTradePct / 100);
-    equity += riskAmount * trade.realizedR;
-    peakEquity = Math.max(peakEquity, equity);
-    const drawdownPct = peakEquity > 0 ? ((peakEquity - equity) / peakEquity) * 100 : 0;
-    equityCurve.push({
-      date: trade.exitDate ?? trade.signalDate,
-      equity: round(equity),
-      drawdownPct: round(drawdownPct),
-      tradeCount: equityCurve.length,
-    });
-  }
-
-  const summary = buildSummary(mode, startDate, endDate, replayDate, initialCapital, riskPerTradePct, snapshots.length, trades, equityCurve);
+    if (!slotEligibleKeys.has(key)) {
+      return { ...trade, cashReservationStatus: 'NOT_SLOT_ELIGIBLE' as const };
+    }
+    const missingFx = trade.entryFxToGbp == null
+      || (isCompleteBacktestTrade(trade) && trade.exitFxToGbp == null);
+    return {
+      ...trade,
+      simulatedQuantity: 0,
+      simulatedPositionValueGbp: 0,
+      simulatedRiskAmountGbp: 0,
+      cashReservationStatus: missingFx ? 'REJECTED_FX' as const : 'REJECTED_CASH' as const,
+    };
+  });
+  const equityCurve = cashSimulation.equityCurve;
+  const summary = buildSummary(mode, startDate, endDate, replayDate, initialCapital, riskPerTradePct, snapshots.length, simulatedTrades, equityCurve, maxPositions, executionCostPctPerSide, cashSimulation);
+  const portfolioMetricsAvailable = summary.validity === 'VALID';
 
   return {
     summary,
-    trades: [...trades].sort((left, right) => new Date(right.signalDate).getTime() - new Date(left.signalDate).getTime()),
-    equityCurve,
-    drawdownCurve: equityCurve.map((point) => ({
+    trades: [...simulatedTrades].sort((left, right) => new Date(right.signalDate).getTime() - new Date(left.signalDate).getTime()),
+    equityCurve: portfolioMetricsAvailable ? equityCurve : [],
+    drawdownCurve: portfolioMetricsAvailable ? equityCurve.map((point) => ({
       date: point.date,
       equity: point.drawdownPct,
       drawdownPct: point.drawdownPct,
       tradeCount: point.tradeCount,
-    })),
+    })) : [],
   };
 }
 
@@ -602,7 +923,7 @@ export async function runAndStoreBacktest(input: BacktestRequest): Promise<Store
     const updated = await prisma.backtestRun.update({
       where: { id: created.id },
       data: {
-        status: 'SUCCEEDED',
+        status: result.summary.validity === 'VALID' ? 'SUCCEEDED' : 'PARTIAL',
         signalCount: result.summary.signalCount,
         completedTrades: result.summary.completedTrades,
         winRate: decimalOrNull(result.summary.winRate),
@@ -661,4 +982,174 @@ export async function getStoredBacktestRun(id: string): Promise<StoredBacktestRu
   });
 
   return row ? mapStoredRun(row) : null;
+}
+
+export function selectTradesByPositionLimit(
+  trades: BacktestTrade[],
+  maxPositions: number,
+): { selected: BacktestTrade[]; rejected: number } {
+  const candidates = [...trades].sort((left, right) => {
+    const dateDelta = new Date(left.signalDate).getTime() - new Date(right.signalDate).getTime();
+    if (dateDelta !== 0) return dateDelta;
+    const scoreDelta = right.ncs - left.ncs;
+    return scoreDelta !== 0 ? scoreDelta : left.ticker.localeCompare(right.ticker);
+  });
+  const selected: BacktestTrade[] = [];
+  let active: BacktestTrade[] = [];
+  let rejected = 0;
+
+  for (const trade of candidates) {
+    active = active.filter((position) =>
+      !isCompleteBacktestTrade(position)
+      || position.exitDate == null
+      || !exitsBeforeSignalDay(position.exitDate, trade.signalDate));
+    const duplicateTicker = active.some((position) => position.ticker === trade.ticker);
+    if (active.length >= maxPositions || duplicateTicker) {
+      rejected += 1;
+      continue;
+    }
+    selected.push(trade);
+    active.push(trade);
+  }
+
+  return { selected, rejected };
+}
+
+export function applyExecutionCostScenario(
+  trade: BacktestTrade & { realizedR: number },
+  costPctPerSide: number,
+): number {
+  if (costPctPerSide <= 0 || trade.riskPerShare <= 0) {
+    return trade.realizedR;
+  }
+  const exitPrice = Math.max(0, trade.entryPrice + trade.realizedR * trade.riskPerShare);
+  const roundTripCost = (trade.entryPrice + exitPrice) * (costPctPerSide / 100);
+  return round(trade.realizedR - roundTripCost / trade.riskPerShare);
+}
+
+export interface SimulatedBacktestPosition {
+  trade: BacktestTrade;
+  quantity: number;
+  positionValue: number;
+  riskAmount: number;
+  netPnl: number | null;
+}
+
+export function simulateCashConstrainedPortfolio(
+  trades: BacktestTrade[],
+  initialCapital: number,
+  riskPerTradePct: number,
+  executionCostPctPerSide: number,
+  maxPositions = Number.MAX_SAFE_INTEGER,
+): {
+  funded: SimulatedBacktestPosition[];
+  slotEligible: BacktestTrade[];
+  positionRejected: number;
+  cashRejected: number;
+  endingCash: number;
+  equityCurve: BacktestCurvePoint[];
+  fxRejected: number;
+} {
+  const candidates = [...trades]
+    .sort((left, right) => {
+      const dateDelta = new Date(left.signalDate).getTime() - new Date(right.signalDate).getTime();
+      if (dateDelta !== 0) return dateDelta;
+      const scoreDelta = right.ncs - left.ncs;
+      return scoreDelta !== 0 ? scoreDelta : left.ticker.localeCompare(right.ticker);
+    });
+  const costRate = Math.max(0, executionCostPctPerSide) / 100;
+  const funded: SimulatedBacktestPosition[] = [];
+  const slotEligible: BacktestTrade[] = [];
+  let open: SimulatedBacktestPosition[] = [];
+  let cash = initialCapital;
+  let peakEquity = initialCapital;
+  let cashRejected = 0;
+  let fxRejected = 0;
+  let positionRejected = 0;
+  const equityCurve: BacktestCurvePoint[] = [{
+    date: candidates[0]?.signalDate ?? new Date(0).toISOString(),
+    equity: round(initialCapital),
+    drawdownPct: 0,
+    tradeCount: 0,
+  }];
+
+  const closePosition = (position: SimulatedBacktestPosition): void => {
+    if (!isCompleteBacktestTrade(position.trade) || position.trade.exitDate == null) return;
+    const grossExitPrice = Math.max(0, position.trade.entryPrice + position.trade.realizedR * position.trade.riskPerShare);
+    cash += position.quantity * grossExitPrice * (position.trade.exitFxToGbp ?? 0) * (1 - costRate);
+    const equity = cash + open
+      .filter((candidate) => candidate !== position)
+      .reduce((sum, candidate) => sum + candidate.positionValue, 0);
+    peakEquity = Math.max(peakEquity, equity);
+    equityCurve.push({
+      date: position.trade.exitDate,
+      equity: round(equity),
+      drawdownPct: round(peakEquity > 0 ? ((peakEquity - equity) / peakEquity) * 100 : 0),
+      tradeCount: funded.length,
+    });
+  };
+
+  for (const trade of candidates) {
+    const exiting = open
+      .filter((position) => isCompleteBacktestTrade(position.trade)
+        && position.trade.exitDate != null
+        && exitsBeforeSignalDay(position.trade.exitDate, trade.signalDate))
+      .sort((left, right) => new Date(left.trade.exitDate ?? 0).getTime() - new Date(right.trade.exitDate ?? 0).getTime());
+    for (const position of exiting) closePosition(position);
+    open = open.filter((position) => !isCompleteBacktestTrade(position.trade)
+      || position.trade.exitDate == null
+      || !exitsBeforeSignalDay(position.trade.exitDate, trade.signalDate));
+
+    if (open.length >= maxPositions || open.some((position) => position.trade.ticker === trade.ticker)) {
+      positionRejected += 1;
+      continue;
+    }
+    slotEligible.push(trade);
+
+    const entryFxToGbp = trade.entryFxToGbp;
+    const exitFxToGbp = trade.exitFxToGbp;
+    const complete = isCompleteBacktestTrade(trade) && trade.exitDate != null;
+    if (entryFxToGbp == null || entryFxToGbp <= 0 || (complete && (exitFxToGbp == null || exitFxToGbp <= 0))) {
+      fxRejected += 1;
+      continue;
+    }
+
+    const accountEquity = cash + open.reduce((sum, position) => sum + position.positionValue, 0);
+    const riskBudget = Math.max(0, accountEquity * (riskPerTradePct / 100));
+    const entryCashPerShare = trade.entryPrice * entryFxToGbp * (1 + costRate);
+    const riskPerShareGbp = trade.riskPerShare * entryFxToGbp;
+    const maxRiskShares = Math.floor(riskBudget / riskPerShareGbp);
+    const maxCashShares = entryCashPerShare > 0 ? Math.floor(cash / entryCashPerShare) : 0;
+    const quantity = Math.max(0, Math.min(maxRiskShares, maxCashShares));
+    if (quantity === 0) {
+      cashRejected += 1;
+      continue;
+    }
+
+    const positionValue = quantity * trade.entryPrice * entryFxToGbp;
+    const entryOutflow = quantity * entryCashPerShare;
+    const grossExitPrice = complete ? Math.max(0, trade.entryPrice + trade.realizedR * trade.riskPerShare) : null;
+    const exitProceeds = grossExitPrice == null || exitFxToGbp == null
+      ? null
+      : quantity * grossExitPrice * exitFxToGbp * (1 - costRate);
+    const position: SimulatedBacktestPosition = {
+      trade,
+      quantity,
+      positionValue: round(positionValue),
+      riskAmount: round(quantity * riskPerShareGbp),
+      netPnl: exitProceeds == null ? null : round(exitProceeds - entryOutflow),
+    };
+    cash -= entryOutflow;
+    funded.push(position);
+    open.push(position);
+  }
+
+  for (const position of [...open]
+    .filter((candidate) => isCompleteBacktestTrade(candidate.trade) && candidate.trade.exitDate != null)
+    .sort((left, right) => new Date(left.trade.exitDate ?? 0).getTime() - new Date(right.trade.exitDate ?? 0).getTime())) {
+    closePosition(position);
+    open = open.filter((candidate) => candidate !== position);
+  }
+
+  return { funded, slotEligible, positionRejected, cashRejected, fxRejected, endingCash: round(cash), equityCurve };
 }

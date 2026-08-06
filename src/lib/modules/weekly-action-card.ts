@@ -14,7 +14,6 @@ import type {
   ClimaxSignal,
   WhipsawBlock,
   SwapSuggestion,
-  FastFollowerSignal,
   ReEntrySignal,
 } from '@/types';
 
@@ -29,7 +28,6 @@ interface ActionCardInput {
   climaxSignals: ClimaxSignal[];
   whipsawBlocks: WhipsawBlock[];
   swapSuggestions: SwapSuggestion[];
-  fastFollowers: FastFollowerSignal[];
   reentrySignals: ReEntrySignal[];
   maxPositions: number;
 }
@@ -63,9 +61,6 @@ export function generateActionCard(input: ActionCardInput): WeeklyActionCard {
   if (input.swapSuggestions.length > 0) {
     notes.push(`🔄 ${input.swapSuggestions.length} swap suggestion(s) — upgrade portfolio quality`);
   }
-  if (input.fastFollowers.filter(f => f.eligible).length > 0) {
-    notes.push(`⚡ ${input.fastFollowers.filter(f => f.eligible).length} fast-follower re-entry signal(s)`);
-  }
   if (input.reentrySignals.filter(r => r.eligible).length > 0) {
     notes.push(`🔁 ${input.reentrySignals.filter(r => r.eligible).length} re-entry signal(s) after profitable exits`);
   }
@@ -90,7 +85,6 @@ export function generateActionCard(input: ActionCardInput): WeeklyActionCard {
     climaxDetails: input.climaxSignals.filter(c => c.isClimax),
     whipsawDetails: input.whipsawBlocks,
     swapDetails: input.swapSuggestions,
-    fastFollowerDetails: input.fastFollowers.filter(f => f.eligible),
     reentryDetails: input.reentrySignals.filter(r => r.eligible),
     // Backward-compat flat strings (Telegram / markdown)
     laggardFlags: input.laggards.map(l => `${l.ticker}: ${l.reason}`),

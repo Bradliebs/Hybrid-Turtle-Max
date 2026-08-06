@@ -5,7 +5,7 @@
  * Consumed by: Next.js app router (/evidence)
  * Consumes: /api/analytics/evidence
  * Risk-sensitive: NO — read-only research dashboard
- * Notes: Evidence framework — proves which rules improve expectancy.
+ * Notes: Evidence framework — measures associations between rules and outcomes.
  *        Does not modify live trading logic.
  */
 
@@ -37,10 +37,13 @@ import {
 interface OutcomeStats {
   count: number;
   withOutcomes: number;
+  scanDays: number;
   avgFwd5d: number | null;
   avgFwd10d: number | null;
   avgFwd20d: number | null;
+  avgFwd20dInterval: ConfidenceInterval | null;
   hit1RRate: number | null;
+  hit1RRateInterval: ConfidenceInterval | null;
   hit2RRate: number | null;
   hit3RRate: number | null;
   stopHitRate: number | null;
@@ -48,6 +51,12 @@ interface OutcomeStats {
   medianR: number | null;
   avgMfeR: number | null;
   avgMaeR: number | null;
+}
+
+interface ConfidenceInterval {
+  lower: number;
+  upper: number;
+  confidence: 0.95;
 }
 
 interface RuleContributionRow {
@@ -96,7 +105,15 @@ interface SimulationScenario {
 interface EvidenceData {
   ok: boolean;
   generatedAt: string;
-  sampleSize: { totalCandidates: number; enrichedCandidates: number; totalTrades: number; closedTrades: number };
+  sampleSize: {
+    totalCandidates: number;
+    enrichedCandidates: number;
+    distinctScans: number;
+    distinctScanDays: number;
+    distinctTickers: number;
+    totalTrades: number;
+    closedTrades: number;
+  };
   warnings: string[];
   ruleContribution: RuleContributionRow[];
   classificationPerformance: ClassificationBandRow[];
@@ -145,6 +162,20 @@ function StatCell({ value, suffix, higher }: { value: number | null; suffix?: st
   return (
     <td className={cn('px-2 py-1.5 text-right font-mono text-xs', higher != null ? statColor(value, higher) : 'text-foreground')}>
       {fmt(value, suffix)}
+    </td>
+  );
+}
+
+function IntervalCell({ value, interval, suffix = '' }: { value: number | null; interval: ConfidenceInterval | null; suffix?: string }) {
+  const title = interval
+    ? `95% interval across scan-day averages: ${interval.lower}${suffix} to ${interval.upper}${suffix}`
+    : 'At least two independent scan days are required for an interval';
+  return (
+    <td className="px-2 py-1.5 text-right font-mono text-xs text-foreground" title={title}>
+      <div>{fmt(value, suffix)}</div>
+      <div className="text-[9px] text-muted-foreground">
+        {interval ? `[${interval.lower}, ${interval.upper}]` : 'CI unavailable'}
+      </div>
     </td>
   );
 }
@@ -202,13 +233,13 @@ export default function EvidencePage() {
   // Build context for AI explain based on active tab
   const evidenceContext = useMemo(() => {
     if (!data) return '';
-    const samples = `Evidence Data (${data.sampleSize.totalCandidates} candidates, ${data.sampleSize.enrichedCandidates} enriched, ${data.sampleSize.totalTrades} trades, ${data.sampleSize.closedTrades} closed)`;
+    const samples = `Evidence Data (${data.sampleSize.totalCandidates} candidate rows, ${data.sampleSize.enrichedCandidates} enriched, ${data.sampleSize.distinctScans} scans across ${data.sampleSize.distinctScanDays} days, ${data.sampleSize.distinctTickers} tickers, ${data.sampleSize.closedTrades} closed trades)`;
 
     if (tab === 'rules') {
       const lines = data.ruleContribution.slice(0, 10).map(r =>
         `${r.rule}: passed fwd20d=${r.passed.avgFwd20d?.toFixed(2) ?? 'N/A'}%, blocked fwd20d=${r.blocked.avgFwd20d?.toFixed(2) ?? 'N/A'}%, edge=${r.edgeFwd20d?.toFixed(2) ?? '?'}%, passed 1R=${r.passed.hit1RRate?.toFixed(0) ?? '?'}%`
       ).join('\n');
-      return `${samples}\n\nRule Contribution:\n${lines}`;
+      return `${samples}\n\nRule Associations (observational, not causal):\n${lines}`;
     }
     if (tab === 'classification') {
       const lines = data.classificationPerformance.map(c =>
@@ -239,7 +270,7 @@ export default function EvidencePage() {
 
   const evidenceQuestion = useMemo(() => {
     switch (tab) {
-      case 'rules': return 'Which rules add the most edge? Are any rules blocking candidates that would have performed well?';
+      case 'rules': return 'Which rule associations look strongest after accounting for confidence intervals? Which remain inconclusive?';
       case 'classification': return 'Do A-grade candidates genuinely outperform B and C grades? Is the grading system working?';
       case 'entry': return 'How good are the entry decisions? Are entries well-timed or is there room for improvement?';
       case 'exit': return 'How effective are the exit decisions? Are stops being hit too early, or are exits well-managed?';
@@ -249,7 +280,7 @@ export default function EvidencePage() {
   }, [tab]);
 
   const tabs: { key: TabKey; label: string; icon: typeof Filter }[] = [
-    { key: 'rules', label: 'Rule Contribution', icon: Filter },
+    { key: 'rules', label: 'Rule Association', icon: Filter },
     { key: 'classification', label: 'Classification', icon: Layers },
     { key: 'entry', label: 'Entry Quality', icon: Target },
     { key: 'exit', label: 'Exit Performance', icon: LogOut },
@@ -268,7 +299,7 @@ export default function EvidencePage() {
               Evidence Framework
             </h1>
             <p className="text-sm text-muted-foreground mt-1">
-              Prove which rules improve expectancy. Read-only — does not affect live trading.
+              Measure which rules are associated with better outcomes. Read-only — does not affect live trading.
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -311,11 +342,13 @@ export default function EvidencePage() {
         {data && !loading && (
           <>
             {/* Sample size banner */}
-            <div className="grid grid-cols-4 gap-3">
+            <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6 gap-3">
               {[
-                { label: 'Candidates', value: data.sampleSize.totalCandidates },
-                { label: 'With Outcomes', value: data.sampleSize.enrichedCandidates },
-                { label: 'Total Trades', value: data.sampleSize.totalTrades },
+                { label: 'Candidate Rows', value: data.sampleSize.totalCandidates },
+                { label: 'Outcome Rows', value: data.sampleSize.enrichedCandidates },
+                { label: 'Distinct Scans', value: data.sampleSize.distinctScans },
+                { label: 'Distinct Scan Days', value: data.sampleSize.distinctScanDays },
+                { label: 'Distinct Tickers', value: data.sampleSize.distinctTickers },
                 { label: 'Closed Trades', value: data.sampleSize.closedTrades },
               ].map((s) => (
                 <div key={s.label} className="card-surface p-3 text-center">
@@ -368,7 +401,7 @@ export default function EvidencePage() {
   );
 }
 
-// ── Tab: Rule Contribution ──────────────────────────────────
+// ── Tab: Rule Association ───────────────────────────────────
 
 function RulesTab({ data }: { data: RuleContributionRow[] }) {
   const handleExport = () => {
@@ -380,7 +413,7 @@ function RulesTab({ data }: { data: RuleContributionRow[] }) {
       String(r.passed.stopHitRate ?? ''), String(r.blocked.stopHitRate ?? ''),
       String(r.passed.avgMfeR ?? ''), String(r.blocked.avgMaeR ?? ''),
     ]);
-    exportCsv('rule-contribution.csv', headers, rows);
+    exportCsv('rule-association.csv', headers, rows);
   };
 
   return (
@@ -388,7 +421,7 @@ function RulesTab({ data }: { data: RuleContributionRow[] }) {
       <div className="flex items-center justify-between mb-3">
         <h3 className="text-sm font-semibold text-foreground flex items-center gap-2">
           <Filter className="w-4 h-4 text-primary-400" />
-          Rule Contribution — Does each filter improve outcomes?
+          Rule Association — How do outcomes differ between pass and block groups?
         </h3>
         <button onClick={handleExport} className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground bg-navy-700/30 px-2 py-1 rounded">
           <Download className="w-3 h-3" /> CSV
@@ -421,13 +454,13 @@ function RulesTab({ data }: { data: RuleContributionRow[] }) {
                 <td className="px-2 py-1.5 text-right font-mono">{r.blocked.count}</td>
                 <StatCell value={r.passed.avgFwd5d} suffix="%" higher />
                 <StatCell value={r.blocked.avgFwd5d} suffix="%" higher />
-                <StatCell value={r.passed.avgFwd20d} suffix="%" higher />
-                <StatCell value={r.blocked.avgFwd20d} suffix="%" higher />
+                <IntervalCell value={r.passed.avgFwd20d} interval={r.passed.avgFwd20dInterval} suffix="%" />
+                <IntervalCell value={r.blocked.avgFwd20d} interval={r.blocked.avgFwd20dInterval} suffix="%" />
                 <td className={cn('px-2 py-1.5 text-right font-mono font-semibold', edgeColor(r.edgeFwd20d))}>
                   {fmt(r.edgeFwd20d, '%')}
                 </td>
-                <StatCell value={r.passed.hit1RRate} suffix="%" higher />
-                <StatCell value={r.blocked.hit1RRate} suffix="%" higher />
+                <IntervalCell value={r.passed.hit1RRate} interval={r.passed.hit1RRateInterval} suffix="%" />
+                <IntervalCell value={r.blocked.hit1RRate} interval={r.blocked.hit1RRateInterval} suffix="%" />
                 <td className={cn('px-2 py-1.5 text-right font-mono font-semibold', edgeColor(r.edge1RRate))}>
                   {fmt(r.edge1RRate, 'pp')}
                 </td>
@@ -440,7 +473,7 @@ function RulesTab({ data }: { data: RuleContributionRow[] }) {
       </div>
       <div className="mt-3 text-[10px] text-muted-foreground/70 flex items-center gap-1">
         <Shield className="w-3 h-3" />
-        Green edge = rule is adding value. Red edge = rule may be removing good candidates.
+        Edge is an observational difference, not a causal contribution. Brackets show the 95% interval across scan-day averages.
       </div>
     </div>
   );

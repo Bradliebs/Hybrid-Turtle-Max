@@ -383,8 +383,6 @@ function getModuleDetails(mod: ModuleStatus, data: AllModulesResult): string[] |
     case 11:
       if (data.whipsawBlocks.length === 0) return null;
       return data.whipsawBlocks.map(w => w.reason);
-    case 13:
-      return [data.momentumExpansion.reason];
     case 9.1:
       return [data.regimeStability.reason];
     case 19:

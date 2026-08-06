@@ -18,21 +18,22 @@ interface Scoreboard {
   avgWinR: number;
   avgLossR: number;
   expectancyPerTrade: number;
+  expectancyPerOutcomeDay: number;
   profitFactor: number | null;
   maxDrawdownPct: number;
   currentDrawdownPct: number;
   avgHoldDays: number | null;
-  grade: string;
-  gradeReason: string;
+  verdict: string;
+  verdictReason: string;
+  expectancyInterval: { lower: number; upper: number; confidence: 0.95 } | null;
   sampleSizeWarning: string | null;
 }
 
-const GRADE_COLORS: Record<string, string> = {
-  A: 'text-profit bg-profit/20',
-  B: 'text-blue-400 bg-blue-400/20',
-  C: 'text-warning bg-warning/20',
-  D: 'text-orange-400 bg-orange-400/20',
-  F: 'text-loss bg-loss/20',
+const VERDICT_COLORS: Record<string, string> = {
+  SUPPORTED: 'text-profit bg-profit/20',
+  PROMISING: 'text-blue-400 bg-blue-400/20',
+  INCONCLUSIVE: 'text-warning bg-warning/20',
+  DEGRADING: 'text-loss bg-loss/20',
 };
 
 export default function PerformancePage() {
@@ -82,16 +83,16 @@ export default function PerformancePage() {
                 <Award className="w-5 h-5 text-primary-400" />
                 System Scoreboard
               </h2>
-              <span className={cn('text-2xl font-bold px-3 py-1 rounded-lg', GRADE_COLORS[scoreboard.grade] || 'text-muted-foreground')}>
-                {scoreboard.grade}
+              <span className={cn('text-sm font-bold px-3 py-1 rounded-lg', VERDICT_COLORS[scoreboard.verdict] || 'text-muted-foreground')}>
+                {scoreboard.verdict}
               </span>
             </div>
-            <p className="text-xs text-muted-foreground mb-4">{scoreboard.gradeReason}</p>
+            <p className="text-xs text-muted-foreground mb-4">{scoreboard.verdictReason}</p>
 
             <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-4">
               <StatCard label="Closed Trades" value={String(scoreboard.totalClosedTrades)} />
               <StatCard label="Win Rate" value={`${scoreboard.winRate.toFixed(0)}%`} color={scoreboard.winRate >= 50 ? 'text-profit' : 'text-loss'} />
-              <StatCard label="Expectancy" value={`${scoreboard.expectancyPerTrade >= 0 ? '+' : ''}${scoreboard.expectancyPerTrade.toFixed(2)}R`} color={scoreboard.expectancyPerTrade >= 0 ? 'text-profit' : 'text-loss'} />
+              <StatCard label="Daily Expectancy" value={`${scoreboard.expectancyPerOutcomeDay >= 0 ? '+' : ''}${scoreboard.expectancyPerOutcomeDay.toFixed(2)}R${scoreboard.expectancyInterval ? ` [${scoreboard.expectancyInterval.lower}, ${scoreboard.expectancyInterval.upper}]` : ''}`} color={scoreboard.expectancyPerOutcomeDay >= 0 ? 'text-profit' : 'text-loss'} />
               <StatCard label="Total R" value={`${scoreboard.totalRealisedR >= 0 ? '+' : ''}${scoreboard.totalRealisedR.toFixed(1)}R`} color={scoreboard.totalRealisedR >= 0 ? 'text-profit' : 'text-loss'} />
               <StatCard label="Profit Factor" value={scoreboard.profitFactor ? scoreboard.profitFactor.toFixed(2) : '—'} />
               <StatCard label="Max Drawdown" value={`${scoreboard.maxDrawdownPct.toFixed(1)}%`} color="text-warning" />
@@ -105,7 +106,7 @@ export default function PerformancePage() {
 
             {scoreboard.sampleSizeWarning && (
               <div className="mt-4 text-xs text-warning bg-warning/10 px-3 py-2 rounded-lg">
-                ⚠ {scoreboard.sampleSizeWarning}
+                {scoreboard.sampleSizeWarning}
               </div>
             )}
           </div>

@@ -29,6 +29,17 @@ Each entry uses this shape (newest at top of the History section):
 
 ## History
 
+### 2026-08-06 - pending - Canonicalize historical OHLC and instrument currency data
+
+- File(s):
+  - `packages/data/src/normalizers.ts` and `packages/data/src/normalizers.test.ts`: Preserved daily OHLC fields during historical bar normalization and added regression coverage.
+  - `packages/data/src/repository.ts` and `packages/data/src/repository.test.ts`: Persisted canonical Instrument metadata and DailyBars, including Yahoo currency instruments mapped to the Prisma FOREX type.
+  - `packages/data/src/service.ts` and `packages/data/src/types.ts`: Carried OHLC and instrument currency data through the shared historical-data service contracts.
+- Why: Advisory backtests require canonical OHLC bars for stop simulation and authoritative instrument currency metadata for fail-closed GBP funding. The previous close-only and snapshot-derived paths could not model these outcomes reliably.
+- Behaviour preserved: Live scanning, regime detection, ranking, risk gates, position sizing, order execution, broker synchronization, and stop management are unchanged. The data changes extend persisted historical fields and metadata for read-only replay without bypassing missing-data or FX safety checks.
+- Tests: Full suite passed 1,948/1,948 tests across 136 files. TypeScript typecheck, ESLint, complexity and simplification audits, scheduler audit, four-check application smoke test, focused data and backtest tests, and independent adversarial review passed.
+- Author: GitHub Copilot (agent), on user instruction to complete and publish the simplification and backtest hardening batch.
+
 ### 2026-08-05 — pending — Revalidate entries and make stop updates atomic
 
 - File(s):

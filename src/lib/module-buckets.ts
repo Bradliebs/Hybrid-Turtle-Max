@@ -62,14 +62,6 @@ export const MODULE_BUCKETS: BucketDefinition[] = [
     // 19  Dual Benchmark — SPY + VWRL regime display
     // 21  Position Tracking — open/closed counts
   },
-  {
-    id: 'PLANNED',
-    label: 'Planned Modules',
-    description: 'Implemented but not yet enabled. Will be activated after backtesting validation.',
-    moduleIds: [9, 13],
-    // 9   Fast-Follower Re-Entry — gated by MODULE_FAST_FOLLOWER flag
-    // 13  Momentum Expansion — gated by MODULE_MOMENTUM_EXPANSION flag
-  },
 ];
 
 // ── Set of all assigned IDs for fast lookup ──

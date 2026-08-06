@@ -31,7 +31,7 @@ export async function scanReEntrySignals(
 
   const eligible = closedPositions.filter(p => {
     if (!p.exitProfitR || p.exitProfitR < MIN_EXIT_R) return false;
-    // Not stop-hit exits (those go through fast-follower)
+    // Re-entry monitoring excludes stop-hit exits.
     if (p.exitReason === 'STOP_HIT') return false;
     const exitDate = p.exitDate instanceof Date ? p.exitDate : new Date(p.exitDate);
     const daysSinceExit = Math.floor(

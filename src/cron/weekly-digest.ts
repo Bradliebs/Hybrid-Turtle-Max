@@ -126,7 +126,8 @@ async function runWeeklyDigest() {
     lines.push(`  🎯 <b>Milestone: ${justReached} trades completed!</b>`);
   }
 
-  lines.push(`  Grade: ${scoreboard.grade} | Expectancy: ${scoreboard.expectancyPerTrade >= 0 ? '+' : ''}${scoreboard.expectancyPerTrade.toFixed(2)}R/trade`);
+  const expectancyInterval = scoreboard.expectancyInterval;
+  lines.push(`  Evidence: ${scoreboard.verdict} | Daily expectancy: ${scoreboard.expectancyPerOutcomeDay >= 0 ? '+' : ''}${scoreboard.expectancyPerOutcomeDay.toFixed(2)}R/entry day${expectancyInterval ? ` (95% CI ${expectancyInterval.lower.toFixed(2)} to ${expectancyInterval.upper.toFixed(2)}R)` : ''}`);
   lines.push(`  Win rate: ${scoreboard.winRate.toFixed(0)}% | Trades: ${scoreboard.totalClosedTrades}`);
   lines.push(`  Avg win: +${scoreboard.avgWinR.toFixed(1)}R | Avg loss: ${scoreboard.avgLossR.toFixed(1)}R`);
   if (scoreboard.profitFactor) {
@@ -142,9 +143,8 @@ async function runWeeklyDigest() {
   lines.push('<b>📋 Weekly Review</b>');
   const suggestions: string[] = [];
 
-  // Grade-based suggestion
-  if (scoreboard.grade === 'D' || scoreboard.grade === 'F') {
-    suggestions.push('System grade is low — review entry criteria and consider tightening filters.');
+  if (scoreboard.verdict === 'DEGRADING') {
+    suggestions.push('Performance evidence is degrading — review entry criteria before changing live rules.');
   }
 
   // Win rate trend
@@ -266,7 +266,7 @@ async function runWeeklyDigest() {
         ranAt: new Date().toISOString(),
         closedThisWeek: closedThisWeek.length,
         weekTotalR,
-        grade: scoreboard.grade,
+        verdict: scoreboard.verdict,
       }),
     },
   });

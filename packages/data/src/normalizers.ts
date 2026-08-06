@@ -24,8 +24,8 @@ export function normalizeYahooBar(rawBar: YahooChartQuote, fetchedAt: Date): His
   return {
     date: rawBar.date,
     open: rawBar.open,
-    high: rawBar.high,
-    low: rawBar.low,
+    high: Math.max(rawBar.high, rawBar.open, rawBar.close),
+    low: Math.min(rawBar.low, rawBar.open, rawBar.close),
     close: rawBar.close,
     volume: rawBar.volume,
     adjustedClose: rawBar.adjclose ?? null,

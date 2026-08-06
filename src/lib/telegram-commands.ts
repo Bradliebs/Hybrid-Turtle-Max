@@ -588,7 +588,7 @@ async function cmdBacktest(): Promise<CommandResponse> {
     const lines = [
       `📈 <b>System Performance</b>`,
       '',
-      `Grade: <b>${scoreboard.grade}</b> — ${scoreboard.gradeReason}`,
+      `Evidence: <b>${scoreboard.verdict}</b> — ${scoreboard.verdictReason}`,
       `Trades: ${scoreboard.totalClosedTrades} closed`,
       '',
     ];

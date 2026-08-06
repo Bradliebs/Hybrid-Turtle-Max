@@ -25,6 +25,8 @@ const requestSchema = z.object({
   ticker: z.string().trim().min(1).nullable().optional(),
   initialCapital: z.number().positive().max(1_000_000).optional(),
   riskPerTradePct: z.number().positive().max(25).optional(),
+  maxPositions: z.number().int().min(1).max(20).optional(),
+  executionCostPctPerSide: z.number().min(0).max(10).optional(),
 });
 
 function parseDate(value: string): Date | null {
@@ -63,6 +65,8 @@ export async function POST(request: NextRequest) {
       ticker: parsed.data.ticker ?? null,
       initialCapital: parsed.data.initialCapital,
       riskPerTradePct: parsed.data.riskPerTradePct,
+      maxPositions: parsed.data.maxPositions,
+      executionCostPctPerSide: parsed.data.executionCostPctPerSide,
     });
 
     return NextResponse.json({ ok: true, run });

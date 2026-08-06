@@ -55,4 +55,21 @@ describe('normalizeYahooBar', () => {
       ),
     ).toBeNull();
   });
+
+  it('expands inconsistent Yahoo high-low values to contain open and close', () => {
+    const result = normalizeYahooBar(
+      {
+        date: new Date('2026-03-08T00:00:00.000Z'),
+        open: 30.48,
+        high: 30.54,
+        low: 30.39,
+        close: 30.575,
+        volume: 10_000,
+      },
+      new Date('2026-03-09T22:00:00.000Z'),
+    );
+
+    expect(result?.high).toBe(30.575);
+    expect(result?.low).toBe(30.39);
+  });
 });

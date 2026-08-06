@@ -18,6 +18,9 @@ import {
 
 function makeCandidate(overrides: Partial<CandidateRow> = {}): CandidateRow {
   return {
+    scanId: 'scan-1',
+    scanDate: new Date('2026-01-01T20:00:00Z'),
+    ticker: 'TEST',
     status: 'READY',
     stageReached: 'SIZED',
     passedTechFilter: true,
@@ -145,9 +148,34 @@ describe('computeStats', () => {
     expect(stats.avgFwd5d).toBeNull();
     expect(stats.hit1RRate).toBeNull();
   });
+
+  it('computes uncertainty across scan days rather than candidate rows', () => {
+    const rows = [
+      makeCandidate({ ticker: 'AAA', scanDate: new Date('2026-01-01T20:00:00Z'), fwdReturn20d: 2, reached1R: true }),
+      makeCandidate({ ticker: 'BBB', scanDate: new Date('2026-01-01T20:00:00Z'), fwdReturn20d: 4, reached1R: true }),
+      makeCandidate({ ticker: 'AAA', scanId: 'scan-2', scanDate: new Date('2026-01-02T20:00:00Z'), fwdReturn20d: -2, reached1R: false }),
+    ];
+
+    const stats = computeStats(rows);
+
+    expect(stats.scanDays).toBe(2);
+    expect(stats.avgFwd20dInterval).toEqual({ lower: -31.26, upper: 32.27, confidence: 0.95 });
+    expect(stats.hit1RRateInterval).toEqual({ lower: 0, upper: 100, confidence: 0.95 });
+  });
+
+  it('does not claim an interval from one scan day', () => {
+    const stats = computeStats([
+      makeCandidate({ ticker: 'AAA' }),
+      makeCandidate({ ticker: 'BBB' }),
+    ]);
+
+    expect(stats.scanDays).toBe(1);
+    expect(stats.avgFwd20dInterval).toBeNull();
+    expect(stats.hit1RRateInterval).toBeNull();
+  });
 });
 
-// ── Rule Contribution ───────────────────────────────────────
+// ── Rule Association ────────────────────────────────────────
 
 describe('buildRuleContribution', () => {
   it('produces rows for each major filter', () => {

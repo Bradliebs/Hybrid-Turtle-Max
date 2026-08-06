@@ -18,7 +18,6 @@ import {
 } from 'lucide-react';
 import BackupPanel from '@/components/settings/BackupPanel';
 import CacheStatusPanel from '@/components/settings/CacheStatusPanel';
-import FeatureFlagsPanel from '@/components/settings/FeatureFlagsPanel';
 
 interface StockItem {
   id: string;
@@ -88,9 +87,6 @@ export default function SystemPanel() {
 
       {/* Cache Status */}
       <CacheStatusPanel />
-
-      {/* Feature Flags */}
-      <FeatureFlagsPanel />
 
       {/* Ticker Universe */}
       <div className="card-surface p-6">
