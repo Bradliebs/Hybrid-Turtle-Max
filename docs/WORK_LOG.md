@@ -823,3 +823,118 @@ tests. Documentation links and diagnostics passed. The staged-file exclusion
 check and common credential-pattern scan passed. The required risk-sensitive
 change-log entry records auto-trade evidence capture and preserved behaviour.
 The full repository suite was not run for this publication step.
+
+## 2026-09-12 trade lifecycle diagnosis
+
+Investigated the user's losing trade-history chart in read-only mode. The
+[trade-by-trade report](../reports/trade-lifecycle-review-2026-09-12.md)
+reproduces 25 measured closures, nine wins, fifteen losses and one flat,
+totaling -3.6912R. Eleven measured automated entries contribute -5.2892R
+across six entry dates. Imported positions have different entry periods and
+5%-of-entry stored risk distances, so the source split is not a strategy test.
+
+Seven automated losers have sparse logged closing-price references below
++0.45R; CLDX lacks such a reference. Cached interior-session closes for
+CLDX, HAYW and ETSY are all below entry. This supports investigating entry
+follow-through without proving invalid entries or selecting new thresholds.
+SCHW's cached exit-session open of 108.25 is below the logged 110.84 stop and
+near the stored 108.21 fill, supporting gap risk over an assumed large
+avoidable execution loss. Broker stop/fill sequence verification remains open.
+
+Added a date-specific, read-only report verifier. It passed all 25 trade rows,
+eleven entry gaps, eleven cached-coverage rows, SCHW exit-session prices,
+the baseline total and local report links. Cached data has incomplete coverage;
+SCHW has adjustment-basis variation. No historical outcomes were repaired,
+no market or broker request was sent, and no live rule or risk gate changed.
+Actual August/September held-position outcomes were inspected, but reserved
+candidate forward labels and holdout policy comparisons were not. These
+observed trade outcomes are development evidence, not an unseen validation set.
+
+## 2026-09-12 entry policy resolution attempt
+
+The user requested resolution of the lifecycle findings. Added a research-only
+necessary-condition screen and integrated it with the existing isolated replay.
+The [resolution report](../reports/entry-policy-resolution-2026-09-12.md)
+and retained JSON distinguish observable rejections from incomplete eligibility.
+Production classifier parity is tested; no live rule, sacred file or database
+record changed. Existing unrelated edits remain untouched.
+
+The replay's 1,224 May-June trigger crossings match exact ticker/timestamps.
+At the existing 0.15 session-volume threshold, 921 fail observable necessary
+conditions and 303 remain incomplete. Other existing execution thresholds
+leave 291-296 incomplete candidates. The modeled subsets fund 9-10 trades on
+4-5 dates and lose GBP 96.03-117.78 at 0.5% cost per side. This does not validate
+a strategy change, prove historical rule violations or justify removing filters.
+Snapshot defaults, recomputed scores and missing execution/portfolio evidence
+prevent full policy parity. No reserved August candidate outcomes were used.
+
+Final replay/screen tests passed 35/35; screen/classifier tests passed 64/64.
+Typecheck and scoped lint passed. A duplicate report write was refused by the
+existing exclusive-write guard; a clean rerun without report output passed.
+The baseline fingerprint and nine reconciliation exceptions remain unchanged.
+Full historical reconciliation requires account-scoped broker fills; SCHW also
+requires stop amendment/acknowledgement history. No historical correction or
+profit uplift is claimed. The report records the specific export requirements.
+
+## 2026-09-12 broker evidence recovery and closure selector fixes
+
+The user was unavailable and requested autonomous continuation. A GET-only
+account-summary probe confirmed the existing live ISA identity and GBP currency.
+A tested, explicitly opted-in collector retained raw and normalized broker
+history in Git-ignored backups without printing credentials or raw account ID.
+The initial eight-page archive was incomplete. A second bounded collection
+exhausted history at 15 pages and 749 records. This supersedes the earlier
+export-unavailable blocker; no manual export is needed for the nine proposals.
+
+Complete archive SHA-256:
+`0a41156bd2f757e48f531d8eca86ea7d4f3a9852e1c293cd0318abb772be2e1b`.
+Across the successful probe and two collections there were 26 GET requests.
+Initial TypeScript loader failures made no network calls; CommonJS with tsx
+resolved them. Existing quota telemetry updates are expected.
+
+The actual dry run exposed two false rejections in closure-evidence: cancelled
+sells with zero execution totals and no fills, and later same-ticker lifecycles
+included in an earlier closed position. Surgical fixes preserve all quantity,
+fill-ID, conflict, GBP and holding-window requirements. Tests passed 43/43 for
+closure/sync and 8/8 for the collector boundary. Typecheck and lint passed.
+
+All 28 closed positions now yield closure candidates; 19 other GBP outcomes
+match. The [broker-supported proposal](../reports/broker-closure-proposal-2026-09-12.md)
+lists nine corrections, which would change the displayed subtotal to -4.905926R
+and GBP -42.36 across 28 measured closures. No historical writes were made;
+review and backup-backed expected-old-value application remain necessary.
+SCHW's exact STOP order confirms stop 110.84, fill 108.21 and GBP -1 P&L.
+No risk/entry/stop strategy change, broker order mutation, commit or push occurred.
+
+## 2026-09-12 approved historical closure corrections applied
+
+The user approved the nine broker-supported corrections with "Go for it" after
+the explicit accounting approval request. Added a standalone, dry-run-default
+repair pinned to the reviewed archive and nine position/order identities. It
+checks account scope and approved outcomes, verifies a fresh SQLite backup,
+records the exact intended changes and uses an atomic Prisma transaction with
+full target-snapshot rechecks and postconditions. No broker client is invoked.
+
+All 13 tests passed, including actual-copy backup fidelity, forced rollback,
+scope preservation and byte-identical repeat application. Initial rehearsal
+failures exposed Windows handle cleanup masking the actual assertion and tiny
+Prisma float serialization differences; both were resolved before live writes.
+Numeric postconditions use absolute tolerance 1e-10; identity, dates, archive
+hash and stale snapshot checks stay exact. Typecheck and scoped lint passed.
+
+Live application changed exactly nine closed positions, updated six exit logs
+and created three missing exits. Independent backup comparison confirmed all
+other positions/logs and stop history unchanged, with original risk, entry,
+shares and stops preserved. Integrity is ok. Repeating apply returned zero
+pending, nine already applied and zero writes. Final totals: 28 measured,
+10 wins, 18 losses, -4.9059260508793R total and GBP -42.36. CCRN remains a market
+exit, not a stop hit. These are corrected past results, not profit improvement.
+
+Recovery directory: `prisma/backups/closure-corrections-2026-09-12-approved/`.
+Backup SHA-256: `2f5e09a9733f8f3bc92b3ac2d2802b857af35828023eb898f2fdf443fb071cae`.
+Backup, exact intent and receipt are Git-ignored. The
+[application report](../reports/broker-closure-applied-2026-09-12.md) supersedes
+the pending-approval status above. Reproduce the old lifecycle report or repair
+rehearsal using this pre-repair backup, not the corrected live database.
+Dashboard browser rendering remains a manual check. No commit/push, live
+strategy change, broker request or automation change occurred in this step.

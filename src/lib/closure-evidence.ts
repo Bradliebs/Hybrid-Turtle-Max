@@ -24,9 +24,12 @@ export function reconcileClosureEvidence(
     || !Number.isFinite(position.shares) || position.shares <= 0) return unresolved('INVALID_POSITION');
 
   const sells = accountOrders.filter(order => order.ticker === position.t212Ticker
-    && (order.side === 'SELL' || order.type === 'SELL'));
+    && (order.side === 'SELL' || order.type === 'SELL')
+    && !(order.status === 'CANCELLED' && order.filledQuantity === 0
+      && order.filledValue === 0 && !order.fills?.length));
   if (sells.some(order => !Number.isFinite(Date.parse(order.dateExecuted ?? '')))) return unresolved('MISSING_FILL_DATE');
-  const orders = sells.filter(order => Date.parse(order.dateExecuted!) >= entered);
+  const orders = sells.filter(order => Date.parse(order.dateExecuted!) >= entered
+    && Date.parse(order.dateExecuted!) <= closed);
   if (!orders.length) return unresolved('NO_SELL_EVIDENCE');
   if (new Set(orders.map(order => order.id)).size !== 1) return unresolved('MULTIPLE_SELL_ORDERS');
 

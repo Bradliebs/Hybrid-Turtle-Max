@@ -27,6 +27,7 @@ import {
   simulateCashConstrainedPortfolio, simulateStopLadder,
 } from '../packages/backtest/src/runner';
 import type { BacktestMode, BacktestTrade } from '../packages/backtest/src/types';
+import { screenEntryPolicy } from './entry-policy-screen';
 
 const sourcePath = process.env.HT_SIMULATION_SOURCE;
 const reportPath = process.env.HT_SIMULATION_REPORT;
@@ -122,6 +123,22 @@ describe.skipIf(!sourcePath)('isolated historical development replay', () => {
 
   it('runs the fixed mode/cost grid and missed-entry stress without writes or network', async () => {
     const scenarios = [];
+    const policyScreens = [];
+    const policyRows = await prisma.snapshotTicker.findMany({
+      where: { snapshot: { createdAt: {
+        gte: new Date('2026-05-01T00:00:00Z'), lte: new Date('2026-06-30T23:59:59Z'),
+      } } },
+      select: { ticker: true, status: true, close: true, entryTrigger: true,
+        marketRegime: true, volRatio: true, rsVsBenchmarkPct: true, atrSpiking: true,
+        snapshot: { select: { createdAt: true } } },
+    });
+    const rowsByIdentity = new Map<string, typeof policyRows>();
+    for (const row of policyRows) {
+      const key = `${row.ticker}|${row.snapshot.createdAt.toISOString()}`;
+      const rows = rowsByIdentity.get(key) ?? [];
+      rows.push(row);
+      rowsByIdentity.set(key, rows);
+    }
     for (const mode of modes) {
       for (const executionCostPctPerSide of costScenarios) {
         const result = await runBacktest({
@@ -135,6 +152,51 @@ describe.skipIf(!sourcePath)('isolated historical development replay', () => {
         expect(result.equityCurve).toEqual([]);
         expect(result.trades.every(trade => new Date(trade.signalDate) < new Date('2026-07-01'))).toBe(true);
         expect(result.trades.every(trade => !trade.exitDate || new Date(trade.exitDate).getTime() < holdoutStart)).toBe(true);
+        if (mode === 'FULL') {
+          for (const minVolumeRatio of [0.15, 0.4, 0.5, 0.6]) {
+            const observations = result.trades.map(trade => {
+              const rows = rowsByIdentity.get(`${trade.ticker}|${trade.signalDate}`) ?? [];
+              const row = rows.length === 1 ? rows[0] : null;
+              const screen = screenEntryPolicy({
+                regime: row?.marketRegime ?? null, status: row?.status ?? null,
+                price: row?.close ?? null, trigger: row?.entryTrigger ?? null,
+                ncs: trade.ncs, bqs: trade.bqs, fws: trade.fws,
+                volumeRatio: row?.volRatio ?? null, relativeStrength: row?.rsVsBenchmarkPct ?? null,
+                atrSpiking: row?.atrSpiking ?? null,
+              }, minVolumeRatio);
+              return { ticker: trade.ticker, signalDate: trade.signalDate,
+                exactSnapshotMatches: rows.length, ...screen };
+            });
+            const notRejected = result.trades.filter((_, index) =>
+              observations[index].verdict === 'INCOMPLETE');
+            const modeled = simulateCashConstrainedPortfolio(
+              notRejected, 10_000, 2, executionCostPctPerSide, 4,
+            );
+            const completed = modeled.funded.filter(position => isCompleteBacktestTrade(position.trade));
+            const rejectedByReason: Record<string, number> = {};
+            for (const observation of observations) {
+              for (const reason of observation.rejected) {
+                rejectedByReason[reason] = (rejectedByReason[reason] ?? 0) + 1;
+              }
+            }
+            expect(observations.length).toBe(result.trades.length);
+            expect(observations.every(observation => observation.verdict !== 'INCOMPLETE'
+              || observation.unresolved.length > 0)).toBe(true);
+            policyScreens.push({
+              kind: 'NECESSARY_CONDITIONS_ONLY_NOT_EXECUTION_ELIGIBILITY',
+              minVolumeRatio, executionCostPctPerSide, inputCandidates: observations.length,
+              rejected: observations.filter(observation => observation.verdict === 'REJECTED').length,
+              incomplete: notRejected.length, rejectedByReason,
+              unmatchedOrAmbiguousSnapshots: observations.filter(observation => observation.exactSnapshotMatches !== 1).length,
+              candidatesWithMissingFields: observations.filter(observation => observation.missing.length > 0).length,
+              modeledFunded: modeled.funded.length, modeledCompleted: completed.length,
+              modeledSignalDates: new Set(completed.map(position => position.trade.signalDate.slice(0, 10))).size,
+              exploratoryClosedPnlGbp: completed.length
+                ? completed.reduce((sum, position) => sum + (position.netPnl ?? 0), 0) : null,
+              observations: executionCostPctPerSide === 0 ? observations : undefined,
+            });
+          }
+        }
         for (const missedEntryStress of [false, true]) {
           const ordered = [...result.trades].sort((left, right) =>
             left.signalDate.localeCompare(right.signalDate) || left.ticker.localeCompare(right.ticker));
@@ -179,10 +241,16 @@ describe.skipIf(!sourcePath)('isolated historical development replay', () => {
         'All-signal confidence metrics are not funded-portfolio confidence metrics.',
         'Closed-trade P&L is modeled, excludes marking unresolved holdings, and is not verified portfolio return.',
         'No independent holdout evaluation, historical closure repair or live strategy change occurred.',
+        'Policy screens test only necessary observable A-grade conditions under current rules, not historical policy compliance.',
+        'Policy-screen scores are recomputed research scores; schema-defaulted snapshot fields lack certified observation provenance.',
+        'Session volume thresholds are sensitivity cases, not reconstructed intraday session data or tuned challengers.',
+        'Non-rejected candidates remain INCOMPLETE: fresh quotes, technical filters, portfolio gates and broker evidence are unresolved.',
+        'Policy-screen subset P&L is exploratory, not an executable strategy return or evidence of profit improvement.',
       ],
-      scenarios,
+      scenarios, policyScreens,
     };
     if (reportPath) await writeFile(resolve(reportPath), `${JSON.stringify(report, null, 2)}\n`, { flag: 'wx' });
     console.table(scenarios.map(({ allSignalSummary: _summary, ...scenario }) => scenario));
+    console.table(policyScreens.map(({ observations: _observations, rejectedByReason: _reasons, ...screen }) => screen));
   }, 120_000);
 });

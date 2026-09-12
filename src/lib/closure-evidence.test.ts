@@ -13,6 +13,33 @@ const order = (id: number, quantity: number, price: number, pnl: number): T212Hi
 });
 
 describe('reconcileClosureEvidence', () => {
+  it('ignores a confirmed unfilled cancellation beside a complete sell', () => {
+    const cancelled: T212HistoricalOrder = {
+      id: 99, ticker: position.t212Ticker, side: 'SELL', type: 'STOP', status: 'CANCELLED',
+      quantity: 10, filledQuantity: 0, filledValue: 0, dateCreated: '2026-06-01',
+    };
+    expect(reconcileClosureEvidence(position, [cancelled, order(1, 10, 110, 5)], closedAt))
+      .toMatchObject({ ok: true, exitPrice: 110, pnlGbp: 5 });
+    expect(reconcileClosureEvidence(position, [cancelled], closedAt))
+      .toEqual({ ok: false, reason: 'NO_SELL_EVIDENCE' });
+  });
+
+  it.each(['positive-quantity', 'positive-value', 'fill-present', 'unknown-quantity', 'active'] as const)(
+    'does not discard ambiguous or executed cancellation: %s', variant => {
+      const cancelled: T212HistoricalOrder = {
+        id: 99, ticker: position.t212Ticker, side: 'SELL', type: 'STOP', status: 'CANCELLED',
+        quantity: 10, filledQuantity: 0, filledValue: 0, dateCreated: '2026-06-01',
+      };
+      if (variant === 'positive-quantity') cancelled.filledQuantity = 1;
+      if (variant === 'positive-value') cancelled.filledValue = 100;
+      if (variant === 'fill-present') cancelled.fills = order(2, 1, 100, 0).fills;
+      if (variant === 'unknown-quantity') cancelled.filledQuantity = NaN;
+      if (variant === 'active') cancelled.status = 'NEW';
+      expect(reconcileClosureEvidence(position, [cancelled, order(1, 10, 110, 5)], closedAt))
+        .toEqual({ ok: false, reason: 'MISSING_FILL_DATE' });
+    },
+  );
+
   it('aggregates distinct same-order fills and ignores identical duplicates', () => {
     const first = order(1, 8, 110, 4);
     const last = order(2, 2, 120, 1);
@@ -20,6 +47,15 @@ describe('reconcileClosureEvidence', () => {
     expect(result).toMatchObject({ ok: true, exitPrice: 112, pnlGbp: 5,
       netValueGbp: 1120, fxRate: 1, order: { filledQuantity: 10, filledValue: 1120 } });
     if (result.ok) expect(result.order.fills).toHaveLength(2);
+  });
+
+  it('does not mix a later same-ticker lifecycle into an already closed position', () => {
+    const later = { ...order(2, 10, 120, 6), id: 102, dateExecuted: '2026-08-02' };
+    later.fills![0].filledAt = '2026-08-02';
+    expect(reconcileClosureEvidence(position, [order(1, 10, 110, 5), later], closedAt))
+      .toMatchObject({ ok: true, exitPrice: 110, pnlGbp: 5 });
+    expect(reconcileClosureEvidence(position, [later], closedAt))
+      .toEqual({ ok: false, reason: 'NO_SELL_EVIDENCE' });
   });
 
   it.each([
