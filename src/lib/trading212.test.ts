@@ -246,6 +246,46 @@ describe('Trading212Client.getOrderHistory', () => {
     expect(orders.map((order) => order.id)).toEqual([1]);
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    { maxPages: 1, expectedRows: 1, expectedQuantity: 2, expectedPnl: 1 },
+    { maxPages: 2, expectedRows: 2, expectedQuantity: 10, expectedPnl: 5 },
+  ])('characterizes fill-level history for one order with maxPages=$maxPages', async ({
+    maxPages, expectedRows, expectedQuantity, expectedPnl,
+  }) => {
+    const order = {
+      id: 101, ticker: 'TEST_US_EQ', type: 'STOP', side: 'SELL', status: 'FILLED',
+      quantity: -10, filledQuantity: 10, filledValue: 1100,
+      createdAt: '2026-06-01T09:00:00Z',
+    };
+    const response = (fillId: number, quantity: number, filledAt: string,
+      realisedProfitLoss: number, nextPagePath: string | null) => new Response(JSON.stringify({
+      items: [{ order, fill: {
+        id: fillId, quantity, price: 110, filledAt, type: 'FILL',
+        walletImpact: { currency: 'GBP', realisedProfitLoss, fxRate: 0.75 },
+      } }],
+      nextPagePath,
+    }));
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(response(202, -2, '2026-06-02T10:02:00Z', 1,
+        '/api/v0/equity/history/orders?limit=50&cursor=earlier'))
+      .mockResolvedValueOnce(response(201, -8, '2026-06-02T10:01:00Z', 4, null));
+
+    const client = new Trading212Client('key', 'secret', 'demo');
+    const orders = await client.getOrderHistory(50, { maxPages });
+
+    expect(fetchMock).toHaveBeenCalledTimes(expectedRows);
+    expect(orders).toHaveLength(expectedRows);
+    expect(orders.every((entry) => entry.id === 101 && entry.quantity === 10)).toBe(true);
+    expect(orders.map((entry) => entry.filledQuantity)).toEqual(maxPages === 1 ? [2] : [2, 8]);
+    expect(orders.reduce((total, entry) => total + entry.filledQuantity, 0)).toBe(expectedQuantity);
+    expect(orders.reduce((total, entry) => total
+      + (entry.fills?.[0].walletImpact?.realisedProfitLoss ?? 0), 0)).toBe(expectedPnl);
+    expect(orders[0]).toMatchObject({ filledQuantity: 2, filledValue: 220,
+      dateExecuted: '2026-06-02T10:02:00Z', fills: [{ quantity: 2 }] });
+    expect(orders[0].fills?.[0]).toMatchObject({ id: 202, walletImpact: { currency: 'GBP' } });
+  });
 });
 
 // ── Auth scheme ──

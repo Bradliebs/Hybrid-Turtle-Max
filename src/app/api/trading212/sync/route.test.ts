@@ -10,19 +10,24 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { NextRequest } from 'next/server';
 
-const { prismaMock, ensureDefaultUserMock } = vi.hoisted(() => ({
+const { prismaMock, ensureDefaultUserMock, fetchBothAccountsMock, canFetchMock } = vi.hoisted(() => ({
   prismaMock: {
     user: { findUnique: vi.fn(), update: vi.fn() },
-    position: { count: vi.fn() },
+    position: { count: vi.fn(), findMany: vi.fn(), update: vi.fn() },
   },
   ensureDefaultUserMock: vi.fn(async () => 'default-user'),
+  fetchBothAccountsMock: vi.fn(),
+  canFetchMock: vi.fn(() => false),
 }));
 
 vi.mock('@/lib/prisma', () => ({ default: prismaMock }));
 vi.mock('@/lib/default-user', () => ({ ensureDefaultUser: ensureDefaultUserMock }));
 vi.mock('@/lib/trading212-dual', () => ({
-  DualT212Client: class { },
-  validateDualCredentials: () => ({ canFetch: false }),
+  DualT212Client: class {
+    fetchBothAccounts = fetchBothAccountsMock;
+    getCombinedPositions() { return []; }
+  },
+  validateDualCredentials: () => ({ canFetch: canFetchMock() }),
   getCredentialsForAccount: () => null,
 }));
 vi.mock('@/lib/equity-snapshot', () => ({ recordEquitySnapshot: vi.fn() }));
@@ -35,11 +40,11 @@ vi.mock('@/lib/trading212', () => ({
 vi.mock('@/lib/trading212-sync-merge', () => ({
   buildSyncIndex: () => ({}),
   findExistingForSync: () => null,
-  isExistingStillActive: () => true,
+  isExistingStillActive: () => false,
   shouldSkipForCrossAccountDuplicate: () => false,
 }));
 
-import { GET } from './route';
+import { GET, POST } from './route';
 
 function makeRequest(url = 'http://localhost/api/trading212/sync?userId=u1'): NextRequest {
   return { nextUrl: new URL(url) } as unknown as NextRequest;
@@ -123,5 +128,36 @@ describe('GET /api/trading212/sync — positionCount source-filter regression', 
     for (const call of prismaMock.position.count.mock.calls) {
       expect(call[0]?.where ?? {}).not.toHaveProperty('source');
     }
+  });
+});
+
+describe('POST /api/trading212/sync closure accounting', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    canFetchMock.mockReturnValue(true);
+    prismaMock.user.findUnique.mockResolvedValue({ t212Environment: 'live', riskProfile: 'BALANCED' });
+    prismaMock.user.update.mockResolvedValue({});
+    prismaMock.position.update.mockResolvedValue({});
+    prismaMock.position.findMany.mockImplementation(async (args: { where: { accountType?: string }; include?: unknown }) =>
+      args.include && args.where.accountType === 'isa' ? [{ id: 'position-VOD', t212Ticker: 'VOD_UK_EQ',
+        stock: { ticker: 'VOD' } }] : []);
+  });
+
+  it.each([true, false])('marks closures pending only after a successful positions fetch: %s', async (positionsFetched) => {
+    fetchBothAccountsMock.mockResolvedValue({ invest: null, isa: {
+      positions: [], positionsFetched, summary: { totalValue: 1000, accountId: 123, currency: 'GBP' },
+    }, errors: {} });
+    const request = new Request('http://localhost/api/trading212/sync', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: 'u1' }),
+    }) as NextRequest;
+    const response = await POST(request);
+    expect(response.status).toBe(200);
+    if (positionsFetched) {
+      expect(prismaMock.position.update).toHaveBeenCalledWith({
+        where: { id: 'position-VOD', status: 'OPEN' },
+        data: { status: 'CLOSED', exitDate: expect.any(Date), exitReason: 'PENDING_BROKER_RECONCILIATION',
+          closedBy: 'PENDING_BROKER:live', exitPrice: null, exitProfitR: null, realisedPnlR: null, realisedPnlGbp: null },
+      });
+    } else expect(prismaMock.position.update).not.toHaveBeenCalled();
   });
 });

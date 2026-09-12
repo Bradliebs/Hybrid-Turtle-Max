@@ -359,7 +359,7 @@ async function main() {
       update: {
         name: stock.name,
         sleeve: stock.sleeve,
-        sector: stock.sector,
+        ...(stock.sector !== null ? { sector: stock.sector } : {}),
         cluster: stock.cluster,
         superCluster: stock.superCluster,
         region: stock.region,

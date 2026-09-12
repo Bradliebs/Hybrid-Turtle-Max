@@ -36,6 +36,7 @@ import {
   looksLikeValidT212Ticker,
 } from '@/lib/t212-ticker-validator';
 import { calcSyncedPositionRisk } from '@/lib/synced-position-risk';
+import { PENDING_BROKER_RECONCILIATION } from '@/lib/closure-evidence';
 import { z } from 'zod';
 import { parseJsonBody } from '@/lib/request-validation';
 import type { RiskProfileType, Sleeve } from '@/types';
@@ -335,14 +336,20 @@ export async function POST(request: NextRequest) {
 
           try {
             await prisma.position.update({
-              where: { id: existing.id },
+              where: { id: existing.id, status: 'OPEN' },
               data: {
                 status: 'CLOSED',
                 exitDate: new Date(),
-                exitReason: `Closed on Trading 212 (${acctType.toUpperCase()})`,
+                exitReason: PENDING_BROKER_RECONCILIATION,
+                closedBy: `PENDING_BROKER:${user.t212Environment}`,
+                exitPrice: null,
+                exitProfitR: null,
+                realisedPnlR: null,
+                realisedPnlGbp: null,
               },
             });
             acctResults.closed++;
+            acctResults.errors.push(`${existing.stock.ticker}: closed holding; exit accounting pending broker reconciliation`);
           } catch (err) {
             acctResults.errors.push(`Error closing ${existing.t212Ticker ?? existing.stock.ticker}: ${(err as Error).message}`);
           }

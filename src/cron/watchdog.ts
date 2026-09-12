@@ -29,6 +29,12 @@ import { checkSchedulerKills, checkZeroTradesOnBullishDay, checkNightlyHeartbeat
 const log = createCronLogger('watchdog');
 const NIGHTLY_STALE_HOURS = 26;
 
+export async function countBuyAttemptsSince(since: Date): Promise<number> {
+  return prisma.executionLog.count({
+    where: { createdAt: { gte: since }, phase: { in: ['BUY_PLACED', 'BUY_FAILED'] } },
+  });
+}
+
 /**
  * Run the scheduler audit script and parse its findings. Returns [] when the
  * audit is unavailable (non-Windows, missing script, or unexpected error).
@@ -221,9 +227,7 @@ async function runWatchdog(): Promise<void> {
       const todayStart = new Date();
       todayStart.setHours(0, 0, 0, 0);
 
-      const buyAttemptsToday = await prisma.executionLog.count({
-        where: { createdAt: { gte: todayStart } },
-      });
+      const buyAttemptsToday = await countBuyAttemptsSince(todayStart);
 
       const latestScan = await prisma.scan.findFirst({
         orderBy: { runDate: 'desc' },

@@ -172,7 +172,8 @@ function toSnapshotRow(row: Record<string, unknown>): SnapshotRow {
 export function simulateStopLadder(
   entryPrice: number,
   initialStop: number,
-  forwardCloses: Array<{ date: string; close: number; low?: number; atr14: number }>,
+  forwardCloses: Array<{ date: string; open?: number; close: number; low?: number; atr14: number }>,
+  timeExitDate?: string,
 ): { hit: boolean; hitDate: string | null; hitR: number | null; maxFavR: number; maxAdvR: number } {
   const riskPerShare = entryPrice - initialStop;
   if (riskPerShare <= 0) {
@@ -184,19 +185,25 @@ export function simulateStopLadder(
   let maxAdvR = 0;
 
   for (const snap of forwardCloses) {
-    const rMultiple = (snap.close - entryPrice) / riskPerShare;
-    maxFavR = Math.max(maxFavR, rMultiple);
-    maxAdvR = Math.min(maxAdvR, rMultiple);
-
-    if ((snap.low ?? snap.close) <= currentStop) {
+    if (timeExitDate && new Date(snap.date).getTime() > new Date(timeExitDate).getTime()) break;
+    const openingPrice = snap.open != null && Number.isFinite(snap.open) && snap.open > 0
+      ? snap.open : null;
+    if ((openingPrice != null && openingPrice <= currentStop)
+      || (snap.low ?? snap.close) <= currentStop) {
+      const fillPrice = openingPrice == null ? currentStop : Math.min(currentStop, openingPrice);
+      const hitR = (fillPrice - entryPrice) / riskPerShare;
       return {
         hit: true,
         hitDate: snap.date,
-        hitR: (currentStop - entryPrice) / riskPerShare,
-        maxFavR,
-        maxAdvR,
+        hitR,
+        maxFavR: Math.max(maxFavR, hitR),
+        maxAdvR: Math.min(maxAdvR, hitR),
       };
     }
+
+    const rMultiple = (snap.close - entryPrice) / riskPerShare;
+    maxFavR = Math.max(maxFavR, rMultiple);
+    maxAdvR = Math.min(maxAdvR, rMultiple);
 
     if (rMultiple >= 3.0) {
       currentStop = Math.max(currentStop, Math.max(entryPrice + riskPerShare, snap.close - 2 * snap.atr14));
@@ -240,6 +247,7 @@ export function buildDailyOutcomeSeries(
     const atr14 = computeAtr(atrWindow, 14) || fallbackAtr14;
     return [{
       date: bar.date.toISOString(),
+      open: bar.open,
       close: bar.close,
       low: bar.low,
       atr14,
@@ -298,7 +306,10 @@ export function classifyBacktestValidity(
   validityReasons: string[];
 } {
   const modelLimitations = [
-    'Signals and entries come from timestamped snapshots; stop hits use daily lows and assume fills at the active stop price.',
+    'Signals and entries come from timestamped snapshots; stop hits use daily lows and fill at the worse of the active stop and valid session open, before scenario costs.',
+    'Missing session opens fall back to stop-price fills; liquidity, intraday gaps and bid/ask execution are not reconstructed.',
+    'Favorable/adverse excursions use pre-exit daily closes and the exit fill, not full intraday extrema.',
+    'The time exit uses the available close nearest 20 calendar days within an 8-day tolerance, not 20 trading sessions.',
     'Trailing stops update from daily closes, so intraday price ordering within a session is not simulated.',
     'Same-date exits do not release cash or position slots until the next UTC date because daily bars do not establish intraday ordering.',
     `Concurrent entries are limited to ${maxPositions} positions and same-snapshot collisions are ranked by NCS.`,
@@ -772,7 +783,7 @@ export async function runBacktest(input: BacktestRequest): Promise<BacktestResul
         riskPerShare,
         entryPrice,
       );
-      const stopSimulation = simulateStopLadder(entryPrice, current.stopLevel, forwardCloses);
+      const stopSimulation = simulateStopLadder(entryPrice, current.stopLevel, forwardCloses, fwd20?.date);
       const lastForward = forwardCloses.length > 0 ? forwardCloses[forwardCloses.length - 1] : null;
 
       const realizedR = stopSimulation.hit

@@ -236,6 +236,9 @@ interface DailyBar {
   low: number;
   close: number;
   volume: number;
+  rawClose?: number;
+  adjustedClose?: number;
+  fetchedAt?: number;
 }
 
 // ── Ticker translation: DB/T212 format → Yahoo Finance format ──
@@ -365,6 +368,7 @@ export async function getDailyPrices(
       return [];
     }
     const validBars = chartParsed.data.quotes;
+    const fetchedAt = Date.now();
 
     // Sort newest first (scan-engine expects this order)
     const bars: DailyBar[] = validBars
@@ -375,10 +379,12 @@ export async function getDailyPrices(
         high: bar.high,
         low: bar.low,
         close: bar.adjclose ?? bar.close,
+        rawClose: bar.close,
+        adjustedClose: bar.adjclose,
+        fetchedAt,
         volume: bar.volume,
       }));
 
-    const fetchedAt = Date.now();
     historicalCache.set(cacheKey, { data: bars, expiry: fetchedAt + HISTORICAL_TTL, fetchedAt });
     recordTickerFreshness(ticker, 'LIVE', fetchedAt);
     recordLiveFetch();

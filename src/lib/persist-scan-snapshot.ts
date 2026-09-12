@@ -47,6 +47,8 @@ export async function persistScanSnapshot(params: {
   userId: string;
   scanResult: ScanRunResult;
   modelLayerEnabled: boolean;
+  executionCandidates?: PersistScanSnapshotResult['gradedCandidates'];
+  executionScoresByTicker?: Awaited<ReturnType<typeof getLatestScoresByTicker>>;
 }): Promise<PersistScanSnapshotResult> {
   const { userId, scanResult, modelLayerEnabled } = params;
 
@@ -71,20 +73,29 @@ export async function persistScanSnapshot(params: {
   const candidateTickers = modelLayer.candidates.map((c) => c.ticker);
   const scoresByTicker = await getLatestScoresByTicker(candidateTickers).catch((err) => {
     console.warn('[persistScanSnapshot] getLatestScoresByTicker failed, falling back to null scores:', (err as Error).message);
-    return new Map<string, ReturnType<typeof Map.prototype.get>>() as Map<string, never>;
+    const emptyScores: Awaited<ReturnType<typeof getLatestScoresByTicker>> = new Map();
+    return emptyScores;
   });
+  if (params.executionScoresByTicker) {
+    for (const candidate of params.executionCandidates ?? []) {
+      const scores = params.executionScoresByTicker.get(candidate.ticker);
+      if (scores) scoresByTicker.set(candidate.ticker, scores);
+      else scoresByTicker.delete(candidate.ticker);
+    }
+  }
 
   const baseGradingContext: GradingContext = {
     regime: scanResult.regime,
     healthOverall: (latestHealth?.overall as string) ?? 'GREEN',
   };
 
+  const executionCandidates = new Map(params.executionCandidates?.map(candidate => [candidate.ticker, candidate]));
   const gradedCandidates = classifyCandidates(modelLayer.candidates, (candidate) => {
     const scores = scoresByTicker.get(candidate.ticker);
     return scores
       ? { ...baseGradingContext, ncs: scores.ncs, fws: scores.fws, bqs: scores.bqs }
       : baseGradingContext;
-  });
+  }).map(candidate => executionCandidates.get(candidate.ticker) ?? candidate);
 
   // ── Persist to database (non-fatal — grading is still returned on failure) ──
   let scanId: string | null = null;

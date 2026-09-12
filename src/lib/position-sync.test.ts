@@ -152,6 +152,7 @@ function makeAccountSummary() {
 function makeDbPosition(ticker: string, t212Ticker = `${ticker}_UK_EQ`) {
   return {
     id: `position-${ticker}`,
+    status: 'OPEN',
     userId: 'default-user',
     stockId: `stock-${ticker}`,
     t212Ticker,
@@ -188,10 +189,11 @@ function makeSellOrder(ticker: string) {
     dateExecuted: '2026-04-30T10:00:00Z',
     initiatedFrom: 'STOP_LOSS',
     fills: [{
+      id: 1,
       price: 72,
       quantity: 10,
       filledAt: '2026-04-30T10:00:00Z',
-      walletImpact: { netValue: 720, realisedProfitLoss: -30, fxRate: 1 },
+      walletImpact: { currency: 'GBP', netValue: 720, realisedProfitLoss: -30, fxRate: 1 },
     }],
   };
 }
@@ -400,6 +402,7 @@ describe('syncClosedPositions order-history usage', () => {
   });
 
   it('fetches one history page and closes when a tracked position is missing from T212', async () => {
+    vi.setSystemTime(new Date('2026-04-30T10:05:00Z'));
     mocks.positionFindMany.mockResolvedValue([makeDbPosition('VOD')]);
     mocks.getPositions.mockResolvedValue([makePosition('SHEL', 2500)]);
     mocks.getOrderHistory.mockResolvedValue([makeSellOrder('VOD')]);
@@ -416,12 +419,150 @@ describe('syncClosedPositions order-history usage', () => {
     });
     expect(mocks.getOrderHistory).toHaveBeenCalledWith('invest-key', 50, { maxPages: 1 });
     expect(mocks.positionUpdate).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: 'position-VOD' },
+      where: { id: 'position-VOD', userId: 'default-user', accountType: 'invest',
+        shares: 10, entryPrice: 75, entryDate: new Date('2026-04-01T09:00:00Z'), status: 'OPEN' },
       data: expect.objectContaining({
         status: 'CLOSED',
         exitPrice: 72,
         closedBy: 'AUTO_SYNC',
       }),
     }));
+  });
+
+  it('aggregates same-order fills instead of recording just the latest fill', async () => {
+    vi.setSystemTime(new Date('2026-04-30T10:05:00Z'));
+    mocks.positionFindMany.mockResolvedValue([makeDbPosition('VOD')]);
+    mocks.getPositions.mockResolvedValue([makePosition('SHEL', 2500)]);
+    const sell = makeSellOrder('VOD');
+    const first = { ...sell, fills: [{ ...sell.fills[0], id: 1, quantity: 8,
+      walletImpact: { currency: 'GBP', realisedProfitLoss: -24 } }] };
+    const last = { ...sell, fills: [{ ...sell.fills[0], id: 2, quantity: 2,
+      walletImpact: { currency: 'GBP', realisedProfitLoss: -6 } }] };
+    mocks.getOrderHistory.mockResolvedValue([last, first, first]);
+    const { syncClosedPositions } = await import('./position-sync');
+    await syncClosedPositions('default-user', { detectUntrackedSales: false });
+    expect(mocks.tradeLogCreate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
+      fillQuantity: 10, realisedPnlT212: -30, gainLossGbp: -30, fillPrice: 72,
+    }) }));
+  });
+
+  it('keeps partial evidence pending without fabricated P&L or an EV record', async () => {
+    vi.setSystemTime(new Date('2026-04-30T10:05:00Z'));
+    mocks.positionFindMany.mockResolvedValue([makeDbPosition('VOD')]);
+    mocks.getPositions.mockResolvedValue([makePosition('SHEL', 2500)]);
+    const sell = makeSellOrder('VOD');
+    sell.fills[0].quantity = 2;
+    mocks.getOrderHistory.mockResolvedValue([sell]);
+    const { syncClosedPositions } = await import('./position-sync');
+    const result = await syncClosedPositions('default-user', { detectUntrackedSales: false });
+    expect(result.closed).toBe(1);
+    expect(result.errors).toContain('VOD: closure accounting pending - INCOMPLETE_QUANTITY');
+    expect(mocks.positionUpdate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
+      status: 'CLOSED', exitPrice: null, realisedPnlGbp: null, realisedPnlR: null,
+      exitReason: 'PENDING_BROKER_RECONCILIATION', closedBy: 'PENDING_BROKER:live',
+    }) }));
+    expect(mocks.tradeLogCreate).not.toHaveBeenCalled();
+    expect(mocks.logEVRecord).not.toHaveBeenCalled();
+  });
+
+  it('revisits only marked pending closures even when the account now has no holdings', async () => {
+    vi.setSystemTime(new Date('2026-04-30T10:05:00Z'));
+    mocks.positionFindMany.mockResolvedValue([{ ...makeDbPosition('VOD'), status: 'CLOSED',
+      exitDate: new Date('2026-04-30T10:01:00Z'), closedBy: 'PENDING_BROKER:live' }]);
+    mocks.getPositions.mockResolvedValue([]);
+    mocks.getOrderHistory.mockResolvedValue([makeSellOrder('VOD')]);
+    const { syncClosedPositions } = await import('./position-sync');
+    const result = await syncClosedPositions('default-user', { detectUntrackedSales: false });
+    expect(result).toMatchObject({ closed: 0, updated: 1, errors: [] });
+    expect(mocks.positionFindMany).toHaveBeenCalledWith(expect.objectContaining({ where: {
+      userId: 'default-user', OR: [{ status: 'OPEN' }, { status: 'CLOSED', exitReason: 'PENDING_BROKER_RECONCILIATION' }],
+    } }));
+    expect(mocks.positionUpdate).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({
+      exitDate: new Date('2026-04-30T10:00:00Z'), realisedPnlGbp: -30,
+    }) }));
+  });
+
+  it('does not use another accounts holding or sell evidence for an ISA closure', async () => {
+    vi.setSystemTime(new Date('2026-04-30T10:05:00Z'));
+    mocks.findUnique.mockResolvedValue(connectedDualUser());
+    mocks.positionFindMany.mockResolvedValue([{ ...makeDbPosition('VOD'), accountType: 'isa' }]);
+    mocks.getPositions.mockImplementation((key: string) => key === 'invest-key' ? [makePosition('VOD', 72)] : []);
+    mocks.getOrderHistory.mockImplementation((key: string) => key === 'invest-key' ? [makeSellOrder('VOD')] : []);
+    const { syncClosedPositions } = await import('./position-sync');
+    const result = await syncClosedPositions('default-user', { detectUntrackedSales: false });
+    expect(result.closed).toBe(1);
+    expect(result.errors).toContain('VOD: closure accounting pending - NO_SELL_EVIDENCE');
+    expect(mocks.tradeLogCreate).not.toHaveBeenCalled();
+  });
+
+  it('does not reconcile pending closures after the broker environment changes', async () => {
+    mocks.positionFindMany.mockResolvedValue([{ ...makeDbPosition('VOD'), status: 'CLOSED',
+      closedBy: 'PENDING_BROKER:demo', exitDate: new Date('2026-04-30') }]);
+    mocks.getPositions.mockResolvedValue([]);
+    mocks.getOrderHistory.mockResolvedValue([makeSellOrder('VOD')]);
+    const { syncClosedPositions } = await import('./position-sync');
+    const result = await syncClosedPositions('default-user', { detectUntrackedSales: false });
+    expect(result.skipped).toBe(1);
+    expect(mocks.positionUpdate).not.toHaveBeenCalled();
+  });
+
+  it('preserves the zero-broker-holdings guard for OPEN positions', async () => {
+    mocks.positionFindMany.mockResolvedValue([makeDbPosition('VOD')]);
+    mocks.getPositions.mockResolvedValue([]);
+    const { syncClosedPositions } = await import('./position-sync');
+    const result = await syncClosedPositions('default-user', { detectUntrackedSales: false });
+    expect(result.closed).toBe(0);
+    expect(mocks.positionUpdate).not.toHaveBeenCalled();
+    expect(mocks.getOrderHistory).not.toHaveBeenCalled();
+  });
+
+  it('propagates exit-log failure out of the closure transaction and does not emit EV success', async () => {
+    vi.setSystemTime(new Date('2026-04-30T10:05:00Z'));
+    mocks.positionFindMany.mockResolvedValue([makeDbPosition('VOD')]);
+    mocks.getPositions.mockResolvedValue([makePosition('SHEL', 2500)]);
+    mocks.getOrderHistory.mockResolvedValue([makeSellOrder('VOD')]);
+    mocks.tradeLogCreate.mockRejectedValueOnce(new Error('log write failed'));
+    const { syncClosedPositions } = await import('./position-sync');
+    const result = await syncClosedPositions('default-user', { detectUntrackedSales: false });
+    expect(result.closed).toBe(0);
+    expect(result.errors).toContain('VOD: close failed — log write failed');
+    expect(mocks.logEVRecord).not.toHaveBeenCalled();
+    await expect(mocks.transaction.mock.results[0].value).rejects.toThrow('log write failed');
+  });
+
+  it.each(['missing', 'failed', 'duplicate'] as const)('skips ISA accounting with %s account evidence', async (problem) => {
+    vi.setSystemTime(new Date('2026-04-30T10:05:00Z'));
+    mocks.findUnique.mockResolvedValue(problem === 'duplicate' ? connectedSameKeyUser() : {
+      ...connectedDualUser(), t212IsaConnected: problem !== 'missing',
+    });
+    mocks.positionFindMany.mockResolvedValue([{ ...makeDbPosition('VOD'), accountType: 'isa' }]);
+    mocks.getPositions.mockImplementation(async (key: string) => {
+      if (key === 'isa-key' && problem === 'failed') throw new Error('positions unavailable');
+      return [makePosition('SHEL', 2500)];
+    });
+    mocks.getOrderHistory.mockResolvedValue([makeSellOrder('VOD')]);
+    const { syncClosedPositions } = await import('./position-sync');
+    const result = await syncClosedPositions('default-user', { detectUntrackedSales: false });
+    expect(result).toMatchObject({ closed: 0, skipped: 1 });
+    expect(mocks.positionUpdate).not.toHaveBeenCalled();
+    expect(mocks.tradeLogCreate).not.toHaveBeenCalled();
+    expect(mocks.getOrderHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([true, false])('rejects a stale closure write after reconciliation, complete evidence: %s', async (complete) => {
+    vi.setSystemTime(new Date('2026-04-30T10:05:00Z'));
+    mocks.positionFindMany.mockResolvedValue([makeDbPosition('VOD')]);
+    mocks.getPositions.mockResolvedValue([makePosition('SHEL', 2500)]);
+    mocks.getOrderHistory.mockResolvedValue(complete ? [makeSellOrder('VOD')] : []);
+    mocks.positionUpdate.mockImplementationOnce(async ({ where }) => {
+      expect(where).toMatchObject({ id: 'position-VOD', status: 'OPEN', shares: 10 });
+      throw Object.assign(new Error('stale closure state'), { code: 'P2025' });
+    });
+    const { syncClosedPositions } = await import('./position-sync');
+    const result = await syncClosedPositions('default-user', { detectUntrackedSales: false });
+    expect(result.closed).toBe(0);
+    expect(result.errors).toContain('VOD: close failed — stale closure state');
+    expect(mocks.tradeLogCreate).not.toHaveBeenCalled();
+    expect(mocks.logEVRecord).not.toHaveBeenCalled();
   });
 });

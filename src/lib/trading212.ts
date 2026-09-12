@@ -83,10 +83,12 @@ export interface T212Instrument {
 }
 
 export interface T212HistoricalOrderFill {
+  id?: number;
   price: number;
   quantity: number;
   filledAt: string;
   walletImpact?: {
+    currency?: string;
     fxRate?: number;
     netValue?: number;
     realisedProfitLoss?: number;
@@ -510,10 +512,12 @@ export class Trading212Client {
         // Attach fill data in the fills[] format the importer expects
         if (f) {
           flat.fills = [{
+            id: f.id,
             price: f.price,
             quantity: Math.abs(f.quantity),
             filledAt: f.filledAt,
             walletImpact: f.walletImpact ? {
+              currency: f.walletImpact.currency,
               fxRate: f.walletImpact.fxRate,
               netValue: f.walletImpact.netValue,
               realisedProfitLoss: f.walletImpact.realisedProfitLoss,

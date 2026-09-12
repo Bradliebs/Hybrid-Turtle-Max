@@ -107,6 +107,24 @@ beforeEach(() => {
 });
 
 describe('persistScanSnapshot', () => {
+  it('preserves actual execution-session inputs and grades without replacing the full universe', async () => {
+    const scanResult = makeScanResult();
+    const executionCandidate = { ...scanResult.candidates[0], rankScore: 81,
+      classification: { grade: 'A_GRADE_BUY', reason: 'Session threshold passed' } };
+    scanResult.candidates.push({ ...scanResult.candidates[0], ticker: 'MSFT' });
+    stockFindMany.mockResolvedValue([{ id: 'stock-1', ticker: 'AAPL' }, { id: 'stock-2', ticker: 'MSFT' }]);
+    const result = await persistScanSnapshot({ userId: 'user-1', scanResult,
+      modelLayerEnabled: false, executionCandidates: [executionCandidate],
+      executionScoresByTicker: new Map() });
+    expect(result.gradedCandidates).toHaveLength(2);
+    expect(result.gradedCandidates[0]).toBe(executionCandidate);
+    expect(scanCreate.mock.calls[0][0].data.results.create[0]).toMatchObject({
+      grade: 'A_GRADE_BUY', gradeReason: 'Session threshold passed', rankScore: 81,
+      ncs: null, fws: null, bqs: null,
+    });
+    expect(saveCandidateOutcomes.mock.calls[0][0][0]).toBe(executionCandidate);
+  });
+
   it('persists the snapshot and returns scanId, graded candidates, and model layer', async () => {
     const result = await persistScanSnapshot({
       userId: 'user-1',

@@ -23,12 +23,12 @@ import {
   Trading212Error,
   type Trading212Environment,
 } from '@/lib/trading212';
-import { getFXRate } from '@/lib/market-data';
 import { sendAlert } from '@/lib/alert-service';
 import { logEVRecord } from '@/lib/ev-tracker';
 import { persistCache, rehydrateCache } from '@/lib/cache-persistence';
 import { CACHE_KEYS } from '@/lib/cache-keys';
 import { recordPriceSnapshots } from '@/lib/price-snapshot';
+import { PENDING_BROKER_RECONCILIATION, reconcileClosureEvidence } from './closure-evidence';
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -400,6 +400,7 @@ async function fetchT212LivePricesInner(userId: string): Promise<Record<string, 
 
 interface ClosureCandidate {
   positionId: string;
+  recordedClosureDate?: Date | null;
   ticker: string;
   stockName: string;
   t212Ticker: string;
@@ -431,12 +432,14 @@ export async function syncClosedPositions(userId: string = 'default-user', optio
   const result: PositionSyncResult = { checked: 0, closed: 0, skipped: 0, updated: 0, errors: [] };
 
   // 1. Fetch all OPEN positions from DB
-  const openPositions = await prisma.position.findMany({
-    where: { userId, status: 'OPEN' },
+  const positions = await prisma.position.findMany({
+    where: { userId, OR: [{ status: 'OPEN' },
+      { status: 'CLOSED', exitReason: PENDING_BROKER_RECONCILIATION }] },
     include: { stock: true },
   });
+  const openPositions = positions.filter(position => position.status === 'OPEN');
 
-  result.checked = openPositions.length;
+  result.checked = positions.length;
 
   // 2. Load T212 credentials and fetch live positions
   const user = await prisma.user.findUnique({
@@ -476,8 +479,9 @@ export async function syncClosedPositions(userId: string = 'default-user', optio
   }
 
   // SAFETY: If both accounts failed, abort entirely
-  const investFailed = creds.hasInvest && (dualResult.errors.invest || !dualResult.invest?.positionsFetched);
-  const isaFailed = creds.hasIsa && (dualResult.errors.isa || !dualResult.isa?.positionsFetched);
+  const investFailed = !investCreds || !!dualResult.errors.invest || !dualResult.invest?.positionsFetched;
+  const duplicateAccountKey = !!(investCreds && isaCreds && investCreds.apiKey === isaCreds.apiKey);
+  const isaFailed = duplicateAccountKey || !isaCreds || !!dualResult.errors.isa || !dualResult.isa?.positionsFetched;
 
   if (investFailed && isaFailed) {
     result.errors.push('T212 position fetch failed for all accounts — no positions auto-closed');
@@ -490,8 +494,7 @@ export async function syncClosedPositions(userId: string = 'default-user', optio
   const combinedPositions = dualClient.getCombinedPositions(dualResult);
 
   // SAFETY: If T212 returns 0 positions across all accounts, suspect API error
-  if (combinedPositions.length === 0) {
-    if (openPositions.length === 0) return result;
+  if (combinedPositions.length === 0 && openPositions.length > 0) {
     result.errors.push('T212 returned 0 positions — possible API error. No positions auto-closed.');
     return result;
   }
@@ -523,7 +526,7 @@ export async function syncClosedPositions(userId: string = 'default-user', optio
   const priceMap = new Map<string, number>();
   for (const pos of combinedPositions) {
     // fullTicker is the raw T212 ticker (AME_US_EQ). Use it for matching.
-    t212TickerMap.set(pos.fullTicker, {
+    t212TickerMap.set(`${pos.accountType}:${pos.fullTicker}`, {
       currentPrice: pos.currentPrice,
       fullTicker: pos.fullTicker,
     });
@@ -535,46 +538,30 @@ export async function syncClosedPositions(userId: string = 'default-user', optio
   updateT212PriceCache(priceMap);
 
   // Also build a set of just the T212 full tickers for quick lookups
-  const t212OpenTickers = new Set(combinedPositions.map(p => p.fullTicker));
+  const t212OpenTickers = new Set(combinedPositions.map(p => `${p.accountType}:${p.fullTicker}`));
 
-  const hasMissingTrackedPosition = openPositions.some((pos) => {
+  const hasMissingTrackedPosition = positions.some((pos) => {
     const t212Ticker = pos.t212Ticker || pos.stock.t212Ticker;
-    return Boolean(t212Ticker && !t212OpenTickers.has(t212Ticker));
+    return Boolean(t212Ticker && !t212OpenTickers.has(`${pos.accountType || 'invest'}:${t212Ticker}`));
   });
 
   // Fetch order history once only when needed. Routine midday syncs where all
   // tracked positions are still open should not burn T212 history quota.
-  let orderHistory: T212HistoricalOrder[] = [];
+  const accountHistory: Record<string, T212HistoricalOrder[]> = { invest: [], isa: [] };
   if (shouldFetchOrderHistoryForSync({ hasMissingTrackedPosition, detectUntrackedSales: detectUntrackedSalesEnabled })) {
-    try {
-      const primaryClient = investCreds
-        ? new Trading212Client(investCreds.apiKey, investCreds.apiSecret, investCreds.environment)
-        : isaCreds
-          ? new Trading212Client(isaCreds.apiKey, isaCreds.apiSecret, isaCreds.environment)
-          : null;
-
-      if (primaryClient) {
-        orderHistory = await primaryClient.getOrderHistory(50, { maxPages: 1 });
+    for (const [account, credentials] of [['invest', investCreds], ['isa', isaCreds]] as const) {
+      if (!credentials || (account === 'invest' ? investFailed : isaFailed)) continue;
+      try {
+        const client = new Trading212Client(credentials.apiKey, credentials.apiSecret, credentials.environment);
+        accountHistory[account] = await client.getOrderHistory(50, { maxPages: 1 });
+      } catch (err) {
+        result.errors.push(`${account}: order history fetch failed: ${(err as Error).message}`);
       }
-
-      // If ISA also exists and is separate, fetch its history too
-      if (investCreds && isaCreds) {
-        try {
-          const isaClient = new Trading212Client(isaCreds.apiKey, isaCreds.apiSecret, isaCreds.environment);
-          const isaOrders = await isaClient.getOrderHistory(50, { maxPages: 1 });
-          orderHistory = [...orderHistory, ...isaOrders];
-        } catch {
-          // ISA order history optional — invest orders are primary
-        }
-      }
-    } catch (err) {
-      // Order history unavailable — we'll fall back to estimated prices
-      result.errors.push(`Order history fetch failed: ${(err as Error).message}`);
     }
   }
 
   // 3. For each OPEN position in HybridTurtle, check T212 status
-  for (const pos of openPositions) {
+  for (const pos of positions) {
     // Resolve T212 ticker: Position.t212Ticker > Stock.t212Ticker
     const t212Ticker = pos.t212Ticker || pos.stock.t212Ticker;
 
@@ -584,9 +571,10 @@ export async function syncClosedPositions(userId: string = 'default-user', optio
       continue;
     }
 
-    if (t212OpenTickers.has(t212Ticker)) {
+    const accountTicker = `${pos.accountType || 'invest'}:${t212Ticker}`;
+    if (t212OpenTickers.has(accountTicker)) {
       // Position still open in T212 — update currentPrice from live data
-      const t212Data = t212TickerMap.get(t212Ticker);
+      const t212Data = t212TickerMap.get(accountTicker);
       if (t212Data && t212Data.currentPrice > 0) {
         result.updated++;
       }
@@ -596,7 +584,13 @@ export async function syncClosedPositions(userId: string = 'default-user', optio
     // Position was closed in T212 — only close if the account we depend on
     // actually returned data. If the account that owns this position failed
     // to fetch, skip it rather than incorrectly closing.
-    const posAcct = pos.accountType || 'invest';
+    const posAcct = pos.accountType;
+    if (!posAcct || !['invest', 'isa'].includes(posAcct) || (pos.status === 'CLOSED'
+      && (!pos.exitDate || pos.closedBy !== `PENDING_BROKER:${user.t212Environment}`))) {
+      result.skipped++;
+      result.errors.push(`${pos.stock.ticker}: accounting skipped - account or environment provenance unavailable`);
+      continue;
+    }
     if (posAcct === 'invest' && investFailed) {
       result.skipped++;
       result.errors.push(`${pos.stock.ticker}: skipped — Invest account fetch failed`);
@@ -611,6 +605,7 @@ export async function syncClosedPositions(userId: string = 'default-user', optio
     // Confirmed closed — build closure candidate
     const candidate: ClosureCandidate = {
       positionId: pos.id,
+      recordedClosureDate: pos.status === 'CLOSED' ? pos.exitDate : null,
       ticker: pos.stock.ticker,
       stockName: pos.stock.name || pos.stock.ticker,
       t212Ticker,
@@ -630,8 +625,10 @@ export async function syncClosedPositions(userId: string = 'default-user', optio
     };
 
     try {
-      await closePosition(candidate, orderHistory);
-      result.closed++;
+      const pendingReason = await closePosition(candidate, accountHistory[posAcct], user.t212Environment);
+      if (pos.status === 'OPEN') result.closed++;
+      else if (!pendingReason) result.updated++;
+      if (pendingReason) result.errors.push(`${pos.stock.ticker}: closure accounting pending - ${pendingReason}`);
     } catch (err) {
       result.errors.push(`${pos.stock.ticker}: close failed — ${(err as Error).message}`);
     }
@@ -639,7 +636,7 @@ export async function syncClosedPositions(userId: string = 'default-user', optio
 
   // 4. Detect untracked T212 sales — sells in order history that don't match any DB position
   if (detectUntrackedSalesEnabled) {
-    await detectUntrackedSales(orderHistory, openPositions, userId, result);
+    await detectUntrackedSales([...accountHistory.invest, ...accountHistory.isa], openPositions, userId, result);
   }
 
   return result;
@@ -732,55 +729,51 @@ async function detectUntrackedSales(
 
 async function closePosition(
   candidate: ClosureCandidate,
-  orderHistory: T212HistoricalOrder[]
-): Promise<void> {
+  orderHistory: T212HistoricalOrder[],
+  environment: string
+): Promise<string | null> {
   const now = new Date();
+  const closureWhere = {
+    id: candidate.positionId,
+    userId: candidate.userId,
+    accountType: candidate.accountType,
+    shares: candidate.shares,
+    entryPrice: candidate.entryPrice,
+    entryDate: candidate.entryDate,
+    ...(candidate.recordedClosureDate
+      ? { status: 'CLOSED', exitReason: PENDING_BROKER_RECONCILIATION,
+        closedBy: `PENDING_BROKER:${environment}`, exitDate: candidate.recordedClosureDate }
+      : { status: 'OPEN' }),
+  };
 
   // 1. Determine exit price from order history
-  const { exitPrice, confidence, matchedOrder } = determineExitPrice(candidate, orderHistory);
+  const evidence = reconcileClosureEvidence(candidate, orderHistory, candidate.recordedClosureDate ?? now);
+  if (!evidence.ok) {
+    await prisma.position.update({ where: closureWhere, data: {
+      status: 'CLOSED', exitDate: candidate.recordedClosureDate ?? now,
+      exitReason: PENDING_BROKER_RECONCILIATION, closedBy: `PENDING_BROKER:${environment}`,
+      exitPrice: null, exitProfitR: null, realisedPnlR: null, realisedPnlGbp: null,
+    } });
+    await sendAlert({
+      type: 'BROKER_SYNC_FAILURE', priority: 'WARNING',
+      title: `Closure accounting pending - ${candidate.ticker}`,
+      message: `${candidate.ticker} is absent from its broker account. The holding is closed locally, but exit price and P&L remain unknown: ${evidence.reason}. Review account-scoped fill history.`,
+      data: { positionId: candidate.positionId, accountType: candidate.accountType, reason: evidence.reason },
+      notificationDedupeKey: `closure-accounting:${candidate.positionId}`,
+      notificationThrottleMs: 24 * 60 * 60_000,
+      telegramDedupeKey: `closure-accounting:${candidate.positionId}`,
+      telegramThrottleMs: 24 * 60 * 60_000,
+    });
+    return evidence.reason;
+  }
+  const { exitPrice, order: matchedOrder } = evidence;
+  const confidence = 'CONFIRMED' as const;
 
   // 2. Determine exit reason
   const exitReason = determineExitReason(exitPrice, candidate.currentStop, matchedOrder);
 
-  // 3. Calculate P&L — prefer T212's own walletImpact if available
-  let realisedPnlGbp: number;
-  let fxRateUsed: number | null = null;
-  let netValueGbp: number | null = null;
-  let realisedPnlT212: number | null = null;
-
-  if (matchedOrder?.fills && matchedOrder.fills.length > 0) {
-    // Use T212's real P&L data from fills
-    let totalPnl = 0;
-    let totalNetValue = 0;
-    let hasPnl = false;
-    for (const fill of matchedOrder.fills) {
-      if (fill.walletImpact) {
-        if (fill.walletImpact.realisedProfitLoss != null) {
-          totalPnl += fill.walletImpact.realisedProfitLoss;
-          hasPnl = true;
-        }
-        if (fill.walletImpact.netValue != null) {
-          totalNetValue += fill.walletImpact.netValue;
-        }
-        if (fill.walletImpact.fxRate != null) {
-          fxRateUsed = fill.walletImpact.fxRate;
-        }
-      }
-    }
-    if (hasPnl) {
-      realisedPnlT212 = totalPnl;
-      realisedPnlGbp = totalPnl;
-      netValueGbp = totalNetValue > 0 ? totalNetValue : null;
-    } else {
-      // Fills present but no walletImpact — fallback to manual calc
-      const fxRate = await getCloseFxRateSafe(candidate);
-      realisedPnlGbp = (exitPrice - candidate.entryPrice) * candidate.shares * fxRate;
-    }
-  } else {
-    // No fills data — use manual calculation
-    const fxRate = await getCloseFxRateSafe(candidate);
-    realisedPnlGbp = (exitPrice - candidate.entryPrice) * candidate.shares * fxRate;
-  }
+  const { pnlGbp: realisedPnlGbp, fxRate: fxRateUsed, netValueGbp } = evidence;
+  const realisedPnlT212 = realisedPnlGbp;
 
   const initialR = candidate.initial_R ?? candidate.initialRisk;
   const realisedPnlR = initialR > 0
@@ -788,17 +781,17 @@ async function closePosition(
     : null;
 
   // 4. Calculate holding days
-  const daysHeld = Math.floor((now.getTime() - candidate.entryDate.getTime()) / 86400000);
+  const daysHeld = Math.floor((evidence.exitDate.getTime() - candidate.entryDate.getTime()) / 86400000);
 
   // 5. Atomic update: position + trade log in a single transaction
   await prisma.$transaction(async (tx) => {
     // Update position
     await tx.position.update({
-      where: { id: candidate.positionId },
+      where: closureWhere,
       data: {
         status: 'CLOSED',
         exitPrice,
-        exitDate: now,
+        exitDate: evidence.exitDate,
         exitReason,
         exitProfitR: realisedPnlR,
         realisedPnlGbp,
@@ -810,8 +803,7 @@ async function closePosition(
     // Create trade log entry with T212-specific fields
     const tradeType = exitReason === 'STOP_HIT' ? 'STOP_HIT' : 'EXIT';
     const fillDate = matchedOrder?.dateExecuted ? new Date(matchedOrder.dateExecuted) : null;
-    try {
-      await tx.tradeLog.create({
+    await tx.tradeLog.create({
         data: {
           userId: candidate.userId,
           positionId: candidate.positionId,
@@ -840,15 +832,7 @@ async function closePosition(
           realisedPnlT212,
           initiatedFrom: matchedOrder?.initiatedFrom ?? null,
         },
-      });
-    } catch (logError) {
-      const prismaCode = (logError as { code?: string })?.code;
-      if (prismaCode === 'P2002') {
-        // Duplicate trade log — skip silently
-      } else {
-        console.warn(`TradeLog create failed for auto-close of ${candidate.ticker}:`, logError);
-      }
-    }
+    });
   });
 
   // 6. Log EV record (non-blocking, outside transaction)
@@ -858,74 +842,20 @@ async function closePosition(
     select: { id: true, regime: true, ncsScore: true },
   });
 
-  logEVRecord({
+  if (realisedPnlR != null) logEVRecord({
     tradeId: entryLog?.id ?? candidate.positionId,
     regime: entryLog?.regime,
     atrAtEntry: candidate.atr_at_entry,
     cluster: candidate.stockCluster,
     sleeve: candidate.stockSleeve,
     entryNCS: entryLog?.ncsScore ?? null,
-    rMultiple: realisedPnlR ?? 0,
-    closedAt: now,
+    rMultiple: realisedPnlR,
+    closedAt: evidence.exitDate,
   }).catch(() => { /* already logged inside logEVRecord */ });
 
   // 7. Send notifications
   await sendClosureNotifications(candidate, exitPrice, exitReason, realisedPnlGbp, realisedPnlR, daysHeld, confidence);
-}
-
-// ── Exit Price Determination ─────────────────────────────────────────
-
-function determineExitPrice(
-  candidate: ClosureCandidate,
-  orderHistory: T212HistoricalOrder[]
-): { exitPrice: number; confidence: 'CONFIRMED' | 'ESTIMATED' | 'UNKNOWN'; matchedOrder: T212HistoricalOrder | null } {
-  // Look for the most recent SELL order matching this T212 ticker
-  const sellOrders = orderHistory
-    .filter(o =>
-      o.ticker === candidate.t212Ticker &&
-      (o.type === 'SELL' || o.side === 'SELL') &&
-      o.status === 'FILLED' &&
-      o.filledQuantity > 0
-    )
-    .sort((a, b) => {
-      // Most recent first
-      const dateA = a.dateExecuted ? new Date(a.dateExecuted).getTime() : 0;
-      const dateB = b.dateExecuted ? new Date(b.dateExecuted).getTime() : 0;
-      return dateB - dateA;
-    });
-
-  if (sellOrders.length > 0) {
-    const order = sellOrders[0];
-
-    // Prefer per-fill price if available
-    if (order.fills && order.fills.length > 0) {
-      let totalValue = 0;
-      let totalQty = 0;
-      for (const fill of order.fills) {
-        totalValue += fill.price * fill.quantity;
-        totalQty += fill.quantity;
-      }
-      if (totalQty > 0) {
-        return { exitPrice: totalValue / totalQty, confidence: 'CONFIRMED', matchedOrder: order };
-      }
-    }
-
-    // Fallback: filledValue / filledQuantity
-    const fillPrice = order.filledQuantity > 0
-      ? order.filledValue / order.filledQuantity
-      : 0;
-    if (fillPrice > 0) {
-      return { exitPrice: fillPrice, confidence: 'CONFIRMED', matchedOrder: order };
-    }
-  }
-
-  // Fallback: use the last live price we have for this position
-  // (not ideal but better than nothing)
-  if (candidate.entryPrice > 0) {
-    return { exitPrice: candidate.entryPrice, confidence: 'UNKNOWN', matchedOrder: null };
-  }
-
-  return { exitPrice: 0, confidence: 'UNKNOWN', matchedOrder: null };
+  return null;
 }
 
 // ── Exit Reason Determination ────────────────────────────────────────
@@ -964,79 +894,6 @@ function determineExitReason(
   return 'UNKNOWN';
 }
 
-// ── FX Rate Helper ───────────────────────────────────────────────────
-
-async function getCloseFxRate(ticker: string, stockCurrency: string | null): Promise<number> {
-  const isUK = ticker.endsWith('.L') || /^[A-Z]{2,5}l$/.test(ticker);
-  const currency = (stockCurrency || 'USD').toUpperCase();
-
-  if (isUK || currency === 'GBX' || currency === 'GBp') {
-    return 0.01; // Pence to pounds
-  }
-  if (currency === 'GBP') {
-    return 1;
-  }
-  return getFXRate(currency, 'GBP');
-}
-/**
- * F-4: Closure-safe FX lookup. Never throws — guarantees the closure transaction
- * can complete so the DB stays in sync with T212 even when Yahoo FX is down.
- *
- * Fallback chain on getFXRate failure:
- *   1. Read the entry TradeLog's `fxRateAtFill` for this position. Slightly
- *      stale (weeks/months old) but reflects a real rate this position used.
- *   2. Hardcoded recent-baseline rate for the currency. Last-resort so the
- *      closure doesn't fail; P&L will be approximate. Alerts CRITICAL so the
- *      operator reviews realisedPnlGbp before relying on it.
- */
-async function getCloseFxRateSafe(candidate: ClosureCandidate): Promise<number> {
-  try {
-    return await getCloseFxRate(candidate.ticker, candidate.stockCurrency);
-  } catch (err) {
-    const liveErrMsg = err instanceof Error ? err.message : String(err);
-    const currency = (candidate.stockCurrency || 'USD').toUpperCase();
-
-    // Tier 1: reuse the entry-side FX rate from this position's ENTRY tradelog.
-    const entryLog = await prisma.tradeLog.findFirst({
-      where: { positionId: candidate.positionId, tradeType: 'ENTRY' },
-      select: { fxRateAtFill: true },
-      orderBy: { createdAt: 'asc' },
-    }).catch(() => null);
-
-    if (entryLog?.fxRateAtFill != null && entryLog.fxRateAtFill > 0) {
-      await sendAlert({
-        type: 'BROKER_SYNC_FAILURE',
-        title: `FX fallback (entry rate) used closing ${candidate.ticker}`,
-        message: `Live FX (${currency}→GBP) failed: ${liveErrMsg}. Reused entry-time rate ${entryLog.fxRateAtFill.toFixed(4)} for ${candidate.ticker}. realisedPnlGbp may be off by intervening FX drift.`,
-        priority: 'WARNING',
-        data: { ticker: candidate.ticker, positionId: candidate.positionId, currency, fxRate: entryLog.fxRateAtFill, source: 'entryTradeLog' },
-        notificationDedupeKey: `fx-fallback:${candidate.positionId}`,
-      }).catch(() => {});
-      return entryLog.fxRateAtFill;
-    }
-
-    // Tier 2: hardcoded baseline. Last resort — alert CRITICAL.
-    // Rates as of 2026 calibration; intentionally approximate.
-    const BASELINE: Record<string, number> = {
-      USD: 0.79,
-      EUR: 0.85,
-      CAD: 0.58,
-      AUD: 0.52,
-      CHF: 0.89,
-      JPY: 0.0053,
-    };
-    const fallback = BASELINE[currency] ?? 1;
-    await sendAlert({
-      type: 'BROKER_SYNC_FAILURE',
-      title: `⚠️ FX BASELINE FALLBACK used closing ${candidate.ticker}`,
-      message: `Live FX (${currency}→GBP) failed: ${liveErrMsg}. No entry-tradelog rate available. Used hardcoded baseline ${fallback} for ${candidate.ticker}. **Verify realisedPnlGbp manually — closure proceeded so DB stays in sync with T212.**`,
-      priority: 'CRITICAL',
-      data: { ticker: candidate.ticker, positionId: candidate.positionId, currency, fxRate: fallback, source: 'baseline' },
-      notificationDedupeKey: `fx-baseline:${candidate.positionId}`,
-    }).catch(() => {});
-    return fallback;
-  }
-}
 // ── Notifications ────────────────────────────────────────────────────
 
 async function sendClosureNotifications(

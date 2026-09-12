@@ -1,4 +1,7 @@
-# Sacred File Change Log
+---
+title: Sacred File Change Log
+description: Audit history for changes to risk-sensitive trading code.
+---
 
 Per `CLAUDE.md`, edits to risk-sensitive files must be logged here for cross-session audit.
 
@@ -28,6 +31,14 @@ Each entry uses this shape (newest at top of the History section):
 ```
 
 ## History
+
+### 2026-09-12 - pending - Capture exact entry attribution and execution evidence
+
+- File(s): `src/cron/auto-trade.ts`; supporting scan persistence, candidate linkage, execution analytics and watchdog tests.
+- Why: Persist the actual decision scan and committed entry identity, and distinguish observed fill-price sources from planned-entry fallbacks. Record reference-price request timing without presenting it as exchange timing or an executable quote.
+- Behaviour preserved: Regime confirmation, weekday gating, technical filters, fresh-price anti-chase, all six risk gates, floor sizing, account routing, broker payloads, fill acceptance and recovery, stop thresholds and retries remain unchanged. Attribution/logging failures do not undo fills or prevent protection. The additional awaited evidence writes can add latency; no performance improvement is claimed.
+- Tests: Automated attribution, live revalidation and stop-retry suites passed within the 283-test operational run on September 12. Exact recovery and connected SQLite evidence tests also passed; strict types and scoped lint passed. No live order was placed during verification.
+- Author: GitHub Copilot, under the user's implementation and commit/push authorization. See the [work log](WORK_LOG.md) and [simulation report](../reports/trading-simulation-2026-09-12.md) for scope and remaining evidence requirements.
 
 ### 2026-08-06 - pending - Canonicalize historical OHLC and instrument currency data
 

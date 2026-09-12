@@ -1,5 +1,13 @@
-import { describe, it, expect } from 'vitest';
-import { applyExecutionCostScenario, buildDailyOutcomeSeries, buildSummary, classifyBacktestValidity, resolveHistoricalFxToGbp, selectTradesByPositionLimit, simulateCashConstrainedPortfolio, simulateStopLadder } from './runner';
+import { describe, it, expect, vi } from 'vitest';
+const history = vi.hoisted(() => ({ snapshots: vi.fn(), rows: vi.fn(), stocks: vi.fn(), instruments: vi.fn() }));
+vi.mock('../../data/src/prisma', () => ({
+  prisma: {
+    snapshot: { findMany: history.snapshots }, snapshotTicker: { findMany: history.rows },
+    stock: { findMany: history.stocks }, instrument: { findMany: history.instruments },
+  },
+  round: (value: number, precision = 4) => Number(value.toFixed(precision)),
+}));
+import { applyExecutionCostScenario, buildDailyOutcomeSeries, buildSummary, classifyBacktestValidity, resolveHistoricalFxToGbp, runBacktest, selectTradesByPositionLimit, simulateCashConstrainedPortfolio, simulateStopLadder } from './runner';
 import type { BacktestTrade } from './types';
 
 function makeTrade(overrides: Partial<BacktestTrade> = {}): BacktestTrade {
@@ -36,6 +44,44 @@ function makeTrade(overrides: Partial<BacktestTrade> = {}): BacktestTrade {
 
 describe('simulateStopLadder', () => {
   const makeSnap = (date: string, close: number, atr14 = 2) => ({ date, close, atr14 });
+
+  it('ignores stops and closes after the selected time exit', () => {
+    const result = simulateStopLadder(100, 90, [
+      makeSnap('2026-04-20', 110),
+      makeSnap('2026-04-21', 80),
+    ], '2026-04-20');
+    expect(result).toMatchObject({ hit: false, hitR: null, maxFavR: 1, maxAdvR: 0 });
+  });
+
+  it('still applies a stop on the time-exit session', () => {
+    expect(simulateStopLadder(100, 90, [
+      { date: '2026-04-20', open: 80, low: 75, close: 110, atr14: 2 },
+    ], '2026-04-20').hitR).toBe(-2);
+  });
+
+  it('fills an opening gap below the initial stop at the open, not the stop', () => {
+    const result = simulateStopLadder(100, 90, [
+      { date: '2026-04-01', open: 80, low: 75, close: 120, atr14: 2 },
+    ]);
+    expect(result.hitR).toBe(-2);
+    expect(result.maxFavR).toBe(0);
+    expect(result.maxAdvR).toBe(-2);
+  });
+
+  it('applies gaps to raised stops without using the exit-day recovery', () => {
+    const result = simulateStopLadder(100, 90, [
+      { date: '2026-04-01', open: 101, low: 100, close: 116, atr14: 2 },
+      { date: '2026-04-02', open: 95, low: 94, close: 140, atr14: 2 },
+    ]);
+    expect(result.hitR).toBe(-0.5);
+    expect(result.maxFavR).toBe(1.6);
+  });
+
+  it('keeps a stop-price fill when the session opens above the stop', () => {
+    expect(simulateStopLadder(100, 90, [
+      { date: '2026-04-01', open: 99, low: 89, close: 105, atr14: 2 },
+    ]).hitR).toBe(-1);
+  });
 
   it('returns no hit when price stays above stop', () => {
     const result = simulateStopLadder(100, 90, [
@@ -143,6 +189,38 @@ describe('simulateStopLadder', () => {
   });
 });
 
+describe('runBacktest outcome boundaries', () => {
+  it.each([false, true])('uses session opens and stops at the time exit (earlyGap=%s)', async earlyGap => {
+    const signalDate = new Date('2026-05-01T22:00:00Z');
+    history.snapshots.mockResolvedValue([{ id: 'synthetic-scan', createdAt: signalDate }]);
+    history.rows.mockResolvedValue([{
+      snapshotId: 'synthetic-scan', createdAt: signalDate, ticker: 'SYNTHETIC', currency: 'GBP',
+      close: 100, entryTrigger: 99, stopLevel: 90, atr14: 2, marketRegime: 'BULLISH',
+    }]);
+    history.stocks.mockResolvedValue([]);
+    const bar = (date: string, open: number, low: number, close: number) => ({
+      date: new Date(date), open, low, high: Math.max(open, close) + 2, close, volume: 1000,
+    });
+    history.instruments.mockReset();
+    history.instruments.mockResolvedValueOnce([{
+      symbol: 'SYNTHETIC', currency: 'GBP', dailyBars: [
+        bar('2026-05-02T13:30:00Z', earlyGap ? 80 : 100, earlyGap ? 75 : 99, 105),
+        bar('2026-05-21T13:30:00Z', 105, 100, 110),
+        bar('2026-05-22T13:30:00Z', 50, 45, 60),
+      ],
+    }]).mockResolvedValueOnce([]);
+    const result = await runBacktest({ startDate: signalDate, endDate: signalDate });
+    expect(result.trades).toHaveLength(1);
+    expect(result.trades[0]).toMatchObject({
+      realizedR: earlyGap ? -2 : 1,
+      exitReason: earlyGap ? 'STOP_HIT' : 'TIME_EXIT_20D',
+      exitDate: earlyGap ? '2026-05-02T13:30:00.000Z' : '2026-05-21T13:30:00.000Z',
+      maxFavorableR: earlyGap ? 0 : 1,
+      cashReservationStatus: 'FUNDED',
+    });
+  });
+});
+
 describe('buildDailyOutcomeSeries', () => {
   it('uses only bars after the signal and derives ATR from OHLC history', () => {
     const bars = Array.from({ length: 16 }, (_, index) => ({
@@ -163,6 +241,7 @@ describe('buildDailyOutcomeSeries', () => {
     expect(result).toHaveLength(1);
     expect(result[0]).toMatchObject({
       date: '2026-03-16T13:30:00.000Z',
+      open: 115,
       close: 116,
       low: 114,
       atr14: 3,

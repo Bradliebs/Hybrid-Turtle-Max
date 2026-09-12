@@ -44,12 +44,14 @@
  */
 
 import 'dotenv/config';
+import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import prisma from '@/lib/prisma';
 import { runFullScan, runTechnicalFilters } from '@/lib/scan-engine';
 import { persistScanSnapshot } from '@/lib/persist-scan-snapshot';
+import { linkTradeToOutcome } from '@/lib/candidate-outcome';
 import { calculatePositionSize } from '@/lib/position-sizer';
 import { validateRiskGates } from '@/lib/risk-gates';
 import { Trading212Client, Trading212Error, type T212PendingOrder } from '@/lib/trading212';
@@ -497,6 +499,44 @@ async function getAccountTypeForStock(userId: string, stockId: string): Promise<
 
 // ── Single Trade Execution (buy + stop + DB position) ────────
 
+export interface EntryReferenceEvidence {
+  version: 1;
+  decisionId: string;
+  userId: string;
+  scanId: string | null;
+  session: string;
+  ticker: string;
+  source: 'GET_BATCH_PRICES';
+  priceBasis: 'UNVERIFIED';
+  executableQuote: false;
+  providerQuoteTime: null;
+  bid: null;
+  ask: null;
+  fetchStartedAt: string;
+  fetchCompletedAt: string;
+  fetchError: string | null;
+  evaluatedAt: string;
+  scanPrice: number;
+  entryTrigger: number;
+  plannedStop: number;
+  referencePrice: number | null;
+  action: 'KEEP' | 'SKIP';
+  reason: string | null;
+}
+
+export async function fetchEntryReferencePrices(tickers: string[]) {
+  const fetchStartedAt = new Date().toISOString();
+  let prices: Record<string, number> = {};
+  let fetchError: string | null = null;
+  try {
+    prices = await getBatchPrices(tickers, /* forceRefresh */ true);
+  } catch (error) {
+    fetchError = error instanceof Error ? error.message : String(error);
+    console.warn(`    [LIVE REVALIDATION] Batch fetch failed: ${fetchError}`);
+  }
+  return { prices, fetchStartedAt, fetchCompletedAt: new Date().toISOString(), fetchError };
+}
+
 interface TradeResult {
   ticker: string;
   success: boolean;
@@ -509,7 +549,7 @@ interface TradeResult {
   critical?: boolean;
 }
 
-async function executeTrade(
+export async function executeTrade(
   userId: string,
   candidate: {
     stockId: string;
@@ -523,6 +563,8 @@ async function executeTrade(
     rankScore: number;
     atr?: number;
     adx?: number;
+    scanId?: string | null;
+    entryReference?: EntryReferenceEvidence;
   },
   tradeLog?: ReturnType<typeof createCronLogger>
 ): Promise<TradeResult> {
@@ -560,11 +602,15 @@ async function executeTrade(
   }
 
   let buyOrder: T212PendingOrder;
+  const submissionStartedAt = new Date().toISOString();
+  const buyRequestEvidence = JSON.stringify({ quantity: shares, ticker: t212Ticker,
+    userId, scanId: candidate.scanId ?? null, submissionStartedAt,
+    entryReference: candidate.entryReference ?? null });
   try {
     buyOrder = await client.placeMarketOrder({ quantity: shares, ticker: t212Ticker });
     await logExecution({
       ticker, phase: 'BUY_PLACED', orderId: String(buyOrder.id),
-      requestBody: JSON.stringify({ quantity: shares, ticker: t212Ticker }),
+      requestBody: buyRequestEvidence,
       responseStatus: 200, responseBody: JSON.stringify(buyOrder),
       quantity: shares, accountType,
     });
@@ -572,7 +618,7 @@ async function executeTrade(
   } catch (err) {
     const msg = err instanceof Trading212Error ? `T212 ${err.statusCode}: ${err.message}` : (err as Error).message;
     await logExecution({
-      ticker, phase: 'BUY_FAILED', requestBody: JSON.stringify({ quantity: shares, ticker: t212Ticker }),
+      ticker, phase: 'BUY_FAILED', requestBody: buyRequestEvidence,
       responseStatus: err instanceof Trading212Error ? err.statusCode : null, accountType, error: msg,
     });
     return { ticker, success: false, stopPlaced: false, error: msg };
@@ -582,6 +628,8 @@ async function executeTrade(
   let filledQuantity = 0;
   let filledPrice = 0;
   let filled = false;
+  let fillPriceSource: 'ORDER_VALUE_OVER_QUANTITY' | 'PLANNED_ENTRY_FALLBACK' | 'HISTORY_HELPER' | 'TIMEOUT_RECOVERY' | null = null;
+  let fillObservedAt: string | null = null;
 
   for (let attempt = 1; attempt <= MAX_POLLS; attempt++) {
     await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
@@ -590,6 +638,8 @@ async function executeTrade(
       if (order.filledQuantity > 0 && order.filledQuantity >= shares * 0.99) {
         filledQuantity = order.filledQuantity;
         filledPrice = order.filledValue > 0 ? order.filledValue / order.filledQuantity : entryPrice;
+        fillPriceSource = order.filledValue > 0 ? 'ORDER_VALUE_OVER_QUANTITY' : 'PLANNED_ENTRY_FALLBACK';
+        fillObservedAt = new Date().toISOString();
         filled = true;
         break;
       }
@@ -602,6 +652,8 @@ async function executeTrade(
           if (fill) {
             filledQuantity = fill.filledQuantity;
             filledPrice = fill.filledPrice;
+            fillPriceSource = 'HISTORY_HELPER';
+            fillObservedAt = new Date().toISOString();
             filled = true;
             break;
           }
@@ -615,6 +667,8 @@ async function executeTrade(
     if (recovery.status === 'FILLED') {
       filledQuantity = recovery.filledQuantity;
       filledPrice = recovery.filledPrice;
+      fillPriceSource = 'TIMEOUT_RECOVERY';
+      fillObservedAt = new Date().toISOString();
       filled = true;
       await logExecution({
         ticker, phase: 'BUY_FILL_RECOVERED', orderId: String(buyOrder.id),
@@ -795,6 +849,7 @@ async function executeTrade(
 
   // ── Phase D: Create DB Position (direct Prisma — no dashboard needed) ──
   let positionId: string | undefined;
+  let entryTradeLogId: string | undefined;
   try {
     const initialRisk = filledPrice - actualStopPrice;
     const regime = await getMarketRegime();
@@ -854,13 +909,13 @@ async function executeTrade(
           // row, producing duplicates in the OPEN positions list.
           t212Ticker: t212Ticker,
           entryTrigger: candidate.entryPrice,
-          notes: `Auto-trade: T212 order ${buyOrder.id} | Session ${getUKTimeString()}`,
+          notes: `Auto-trade: T212 order ${buyOrder.id} | Session ${getUKTimeString()} | Decision scan: ${candidate.scanId ?? 'unavailable'}`,
         },
       });
 
       // Trade log (best-effort inside transaction)
       try {
-        await tx.tradeLog.create({
+        const entryTradeLog = await tx.tradeLog.create({
           data: {
             userId,
             positionId: pos.id,
@@ -883,6 +938,7 @@ async function executeTrade(
             fillTime: new Date(),
           },
         });
+        entryTradeLogId = entryTradeLog.id;
       } catch (logErr) {
         console.warn('TradeLog create failed (non-blocking)', logErr);
       }
@@ -893,9 +949,27 @@ async function executeTrade(
     positionId = position.id;
     console.log(`    ✓ Position saved (ID: ${positionId.slice(0, 8)}...)`);
 
+    const linked = candidate.scanId && entryTradeLogId
+      ? await linkTradeToOutcome(candidate.scanId, ticker, entryTradeLogId, filledPrice)
+      : false;
+    if (!linked) {
+      await logExecution({ ticker, phase: 'ATTRIBUTION_PENDING', accountType,
+        orderId: String(buyOrder.id),
+        requestBody: JSON.stringify({ positionId, tradeLogId: entryTradeLogId, scanId: candidate.scanId }),
+        error: 'Exact scan-to-entry linkage unavailable; do not infer historical attribution',
+      });
+    }
+
     await logExecution({
       ticker, phase: 'COMPLETE', orderId: String(buyOrder.id),
-      requestBody: JSON.stringify({ positionId }), responseStatus: 201,
+      requestBody: JSON.stringify({ positionId, tradeLogId: entryTradeLogId, scanId: candidate.scanId, candidateLinked: !!linked }), responseStatus: 201,
+      responseBody: JSON.stringify({ fillEvidence: {
+        version: 1, userId, decisionId: candidate.entryReference?.decisionId ?? null,
+        source: fillPriceSource, observedAt: fillObservedAt, brokerExecutionTime: null,
+        usedPrice: Number.isFinite(filledPrice) ? filledPrice : null,
+        usedQuantity: Number.isFinite(filledQuantity) ? filledQuantity : null,
+        priceBasis: 'UNVERIFIED',
+      } }),
       quantity: filledQuantity, accountType, stopPrice: actualStopPrice,
     });
   } catch (err) {
@@ -1328,6 +1402,19 @@ async function runAutoTrade(session: Session) {
   // Sort by rank (highest first)
   readyCandidates.sort((a, b) => b.rankScore - a.rankScore);
 
+  let executionScanId: string | null = null;
+  if (session !== 'scan' && readyCandidates.length > 0) {
+    try {
+      const persisted = await persistScanSnapshot({ userId, scanResult,
+        modelLayerEnabled: false, executionCandidates: gradedCandidates,
+        executionScoresByTicker: scoresByTicker });
+      executionScanId = persisted.scanId;
+      if (!executionScanId) console.warn('[Execution attribution] Scan snapshot unavailable');
+    } catch (error) {
+      console.warn('[Execution attribution] Scan snapshot failed:', error);
+    }
+  }
+
   // Live-price revalidation (audit 2026-05-28): scans can be hours old by
   // execution time. Re-fetch live prices for the ready slate and drop any
   // candidate whose price has slipped back below entryTrigger since the scan,
@@ -1341,18 +1428,17 @@ async function runAutoTrade(session: Session) {
   // bypass the cache and fetch a guaranteed-fresh quote here. The extra Yahoo
   // calls are bounded by the ready-slate size (typically a handful).
   const liveRevalidationSkipped: Array<{ ticker: string; reason: string }> = [];
+  const entryReferences = new Map<string, EntryReferenceEvidence>();
   if (session !== 'scan' && readyCandidates.length > 0) {
     const tickers = readyCandidates.map(c => c.ticker);
-    const [livePrices, refreshedTechnicals] = await Promise.all([
-      getBatchPrices(tickers, /* forceRefresh */ true).catch((err) => {
-        console.warn(`    [LIVE REVALIDATION] Batch fetch failed: ${(err as Error).message}`);
-        return {} as Record<string, number>;
-      }),
+    const [referenceBatch, refreshedTechnicals] = await Promise.all([
+      fetchEntryReferencePrices(tickers),
       Promise.all(readyCandidates.map(async candidate => [
         candidate.ticker,
         await getTechnicalData(candidate.ticker, true).catch(() => null),
       ] as const)).then(entries => new Map(entries)),
     ]);
+    const livePrices = referenceBatch.prices;
     for (let i = readyCandidates.length - 1; i >= 0; i--) {
       const c = readyCandidates[i];
       const refreshed = refreshedTechnicals.get(c.ticker) ?? null;
@@ -1366,6 +1452,18 @@ async function runAutoTrade(session: Session) {
         )
         : priceDecision;
       const decision = priceDecision.action === 'SKIP' ? priceDecision : technicalDecision;
+      const entryReference: EntryReferenceEvidence = {
+        version: 1, decisionId: randomUUID(), userId, scanId: executionScanId, session, ticker: c.ticker,
+        source: 'GET_BATCH_PRICES', priceBasis: 'UNVERIFIED', executableQuote: false,
+        providerQuoteTime: null, bid: null, ask: null,
+        fetchStartedAt: referenceBatch.fetchStartedAt, fetchCompletedAt: referenceBatch.fetchCompletedAt,
+        fetchError: referenceBatch.fetchError, evaluatedAt: new Date().toISOString(),
+        scanPrice: c.price, entryTrigger: c.entryTrigger, plannedStop: c.stopPrice,
+        referencePrice: Number.isFinite(livePrices[c.ticker]) && livePrices[c.ticker] > 0
+          ? livePrices[c.ticker] : null,
+        action: decision.action, reason: decision.action === 'SKIP' ? decision.reason : null,
+      };
+      entryReferences.set(c.ticker, entryReference);
       if (decision.action === 'SKIP') {
         liveRevalidationSkipped.push({ ticker: c.ticker, reason: decision.reason });
         readyCandidates.splice(i, 1);
@@ -1382,10 +1480,14 @@ async function runAutoTrade(session: Session) {
             atr: refreshed?.atr ?? null,
             technicals: refreshed,
             session,
+            entryReference,
           }),
           accountType: 'N/A',
           error: decision.reason,
         });
+      } else {
+        await logExecution({ ticker: c.ticker, phase: 'LIVE_REVAL_KEEP', accountType: 'N/A',
+          requestBody: JSON.stringify({ entryReference }) });
       }
     }
     if (liveRevalidationSkipped.length > 0) {
@@ -1670,6 +1772,8 @@ async function runAutoTrade(session: Session) {
 
     const result = await executeTrade(userId, {
       stockId: stock.id,
+      scanId: executionScanId,
+      entryReference: entryReferences.get(candidate.ticker),
       ticker: candidate.ticker,
       t212Ticker: stock.t212Ticker,
       entryPrice: candidate.entryTrigger,

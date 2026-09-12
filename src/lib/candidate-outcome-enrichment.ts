@@ -6,11 +6,18 @@
  * Last modified: 2026-03-06
  * Notes: Enriches CandidateOutcome rows with forward price returns, MFE/MAE,
  *        and R-threshold crossings. Only processes rows that are old enough to
- *        have forward data (≥ 5 trading days) and not yet enriched.
+ *        have forward data, restricted to the prospective cohort below.
  *        Calls Yahoo/EODHD for price data — respects rate limits via getDailyPrices.
  */
 import prisma from './prisma';
 import { getDailyPrices } from './market-data';
+
+export const ENRICHMENT_COHORT_START = new Date('2026-09-11T00:00:00Z');
+const ENRICHMENT_CURSOR_KEY = 'candidate-outcome-enrichment.cursor.v1';
+
+const positiveFinite = (value: number) => Number.isFinite(value) && value > 0;
+const sameValue = (left: number, right: number) =>
+  Math.abs(left - right) <= Math.max(1, Math.abs(left), Math.abs(right)) * 1e-6;
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -19,6 +26,9 @@ interface PriceBar {
   close: number;
   high: number;
   low: number;
+  rawClose?: number;
+  adjustedClose?: number;
+  fetchedAt?: number;
 }
 
 interface EnrichmentResult {
@@ -50,7 +60,7 @@ export function computeForwardMetrics(
   stopPrice: number,
   forwardBars: PriceBar[]
 ): EnrichmentResult {
-  if (forwardBars.length === 0 || scanPrice <= 0) {
+  if (forwardBars.length === 0 || !positiveFinite(scanPrice)) {
     return {
       fwdReturn5d: null, fwdReturn10d: null, fwdReturn20d: null,
       mfeR: null, maeR: null,
@@ -71,7 +81,7 @@ export function computeForwardMetrics(
 
   // R-based metrics require valid entry/stop
   const rPerShare = entryTrigger - stopPrice;
-  if (rPerShare <= 0) {
+  if (!positiveFinite(entryTrigger) || !positiveFinite(stopPrice) || !positiveFinite(rPerShare)) {
     return {
       fwdReturn5d, fwdReturn10d, fwdReturn20d,
       mfeR: null, maeR: null,
@@ -122,12 +132,79 @@ export function computeForwardMetrics(
 
 // ── Batch enrichment ────────────────────────────────────────────────
 
+export function prepareEnrichmentWindow(
+  scanDate: Date,
+  scanPrice: number,
+  providerBars: PriceBar[],
+  asOf: Date
+): { bars: PriceBar[]; reason: string | null } {
+  const reject = (reason: string) => ({ bars: [], reason });
+  if (!Number.isFinite(scanDate.getTime()) || !Number.isFinite(asOf.getTime())
+    || scanDate >= asOf || !positiveFinite(scanPrice)) return reject('INVALID_SCAN');
+  const scanDay = scanDate.toISOString().slice(0, 10);
+  const today = asOf.toISOString().slice(0, 10);
+  for (const bar of providerBars) {
+    const timestamp = Date.parse(bar.date);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(bar.date) || !Number.isFinite(timestamp)
+      || new Date(timestamp).toISOString().slice(0, 10) !== bar.date) return reject('INVALID_BAR_DATE');
+  }
+  const sorted = [...providerBars].sort((left, right) => left.date.localeCompare(right.date));
+  const anchors = sorted.filter(bar => bar.date <= scanDay);
+  const anchor = anchors.at(-1);
+  if (!anchor || Date.parse(scanDay) - Date.parse(anchor.date) > 3 * 86400000) {
+    return reject('MISSING_SCAN_ANCHOR');
+  }
+  if (anchors.filter(bar => bar.date === anchor.date).length !== 1) return reject('DUPLICATE_ANCHOR');
+  const observedComplete = (bar: PriceBar) => bar.fetchedAt !== undefined && Number.isFinite(bar.fetchedAt)
+    && bar.fetchedAt >= Date.parse(bar.date) + 86400000 && bar.fetchedAt <= asOf.getTime();
+  if (!observedComplete(anchor)) return reject('UNPROVEN_ANCHOR_FINALIZATION');
+  if ([0, 6].includes(new Date(anchor.date).getUTCDay())) return reject('NON_SESSION_ANCHOR');
+  if (anchor.date === scanDay && scanDate.getUTCHours() < 22) return reject('SCAN_BEFORE_POST_CLOSE_CUTOFF');
+  if (!positiveFinite(anchor.close) || !sameValue(anchor.close, scanPrice)) return reject('SCAN_BASELINE_MISMATCH');
+  if (anchor.rawClose === undefined || anchor.adjustedClose === undefined
+    || !positiveFinite(anchor.rawClose) || !positiveFinite(anchor.adjustedClose)
+    || !sameValue(anchor.close, anchor.adjustedClose)) return reject('MISSING_PRICE_BASIS');
+  const adjustmentFactor = anchor.adjustedClose / anchor.rawClose;
+  if (!positiveFinite(adjustmentFactor)) return reject('INVALID_PRICE_BASIS');
+  if (![anchor.high, anchor.low].every(positiveFinite)
+    || anchor.high < anchor.rawClose || anchor.low > anchor.rawClose) return reject('INVALID_ANCHOR_BAR');
+  const nextWeekday = (day: string) => {
+    const date = new Date(`${day}T00:00:00Z`);
+    do { date.setUTCDate(date.getUTCDate() + 1); } while ([0, 6].includes(date.getUTCDay()));
+    return date.toISOString().slice(0, 10);
+  };
+  if (anchor.date < scanDay && nextWeekday(anchor.date) <= scanDay) return reject('UNPROVEN_ANCHOR_GAP');
+  const candidates = sorted.filter(bar => bar.date > scanDay && bar.date < today);
+  const bars: PriceBar[] = [];
+  let expected = nextWeekday(scanDay);
+  for (const bar of candidates) {
+    if (bars.length === 20) break;
+    if (bar.date !== expected) return { bars, reason: 'MISSING_OR_NON_SESSION_BAR' };
+    if (candidates.filter(other => other.date === bar.date).length !== 1) {
+      return { bars, reason: 'DUPLICATE_SESSION' };
+    }
+    if (!observedComplete(bar)) return { bars, reason: 'UNPROVEN_BAR_FINALIZATION' };
+    if (bar.rawClose === undefined || bar.adjustedClose === undefined
+      || !positiveFinite(bar.rawClose) || !positiveFinite(bar.adjustedClose)
+      || !sameValue(bar.close, bar.adjustedClose)) return { bars, reason: 'MISSING_PRICE_BASIS' };
+    const factor = bar.adjustedClose / bar.rawClose;
+    if (!positiveFinite(factor) || Math.abs(factor / adjustmentFactor - 1) > 1e-6) {
+      return { bars, reason: 'ADJUSTMENT_FACTOR_CHANGED' };
+    }
+    if (![bar.close, bar.high, bar.low].every(positiveFinite)
+      || bar.low > bar.rawClose || bar.high < bar.rawClose) return { bars, reason: 'INVALID_PRICE_BAR' };
+    bars.push({ ...bar, high: bar.high * adjustmentFactor, low: bar.low * adjustmentFactor });
+    expected = nextWeekday(bar.date);
+  }
+  return { bars, reason: null };
+}
+
 /**
  * Enrich CandidateOutcome rows with forward price data.
  *
  * Only processes rows where:
- * - enrichedAt is null (not yet enriched)
- * - scanDate is old enough to have forward data (≥ minDaysOld trading days)
+ * - scanDate is in the prospective cohort and at least minDaysOld calendar days old
+ * - one or more return horizons remain missing
  *
  * @param minDaysOld - minimum calendar days since scan to attempt enrichment (default: 8 — gives ~5 trading days)
  * @param maxRows - maximum rows to process per batch (default: 100 — rate-limit friendly)
@@ -137,24 +214,49 @@ export async function enrichCandidateOutcomes(
   minDaysOld = 8,
   maxRows = 100
 ): Promise<{ enriched: number; skipped: number; errors: number }> {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - minDaysOld);
+  if (!Number.isInteger(minDaysOld) || minDaysOld < 0 || !Number.isInteger(maxRows) || maxRows < 1) {
+    throw new Error('Enrichment requires nonnegative integer minDaysOld and positive integer maxRows');
+  }
+  const asOf = new Date();
+  const cutoff = new Date(asOf.getTime() - minDaysOld * 86400000);
 
-  const rows = await prisma.candidateOutcome.findMany({
-    where: {
-      enrichedAt: null,
-      scanDate: { lte: cutoff },
-    },
-    orderBy: { scanDate: 'asc' },
-    take: maxRows,
-    select: {
-      id: true,
-      ticker: true,
-      scanDate: true,
-      price: true,
-      entryTrigger: true,
-      stopPrice: true,
-    },
+  const rows = await prisma.$transaction(async (transaction) => {
+    const cursor = await transaction.appSetting.findUnique({
+      where: { key: ENRICHMENT_CURSOR_KEY },
+      select: { value: true },
+    });
+    const eligibility = {
+      scanDate: { gte: ENRICHMENT_COHORT_START, lte: cutoff },
+      OR: [{ fwdReturn5d: null }, { fwdReturn10d: null }, { fwdReturn20d: null }],
+    };
+    const selectPage = (afterId?: string) => transaction.candidateOutcome.findMany({
+      where: { ...eligibility, ...(afterId ? { id: { gt: afterId } } : {}) },
+      orderBy: { id: 'asc' },
+      take: maxRows,
+      select: {
+        id: true,
+        ticker: true,
+        scanDate: true,
+        price: true,
+        entryTrigger: true,
+        stopPrice: true,
+        enrichedAt: true,
+        fwdReturn5d: true,
+        fwdReturn10d: true,
+        fwdReturn20d: true,
+      },
+    });
+    let page = await selectPage(cursor?.value);
+    if (page.length === 0 && cursor?.value) page = await selectPage();
+    if (page.length > 0) {
+      const value = page[page.length - 1].id;
+      await transaction.appSetting.upsert({
+        where: { key: ENRICHMENT_CURSOR_KEY },
+        create: { key: ENRICHMENT_CURSOR_KEY, value },
+        update: { value },
+      });
+    }
+    return page;
   });
 
   let enriched = 0;
@@ -179,6 +281,9 @@ export async function enrichCandidateOutcomes(
         close: b.close,
         high: b.high,
         low: b.low,
+        rawClose: b.rawClose,
+        adjustedClose: b.adjustedClose,
+        fetchedAt: b.fetchedAt,
       }));
     } catch (e) {
       console.warn(`[CandidateOutcome] Failed to fetch prices for ${ticker}:`, e);
@@ -191,10 +296,15 @@ export async function enrichCandidateOutcomes(
       continue;
     }
 
+    const observedAt = new Date();
     for (const row of tickerRows) {
-      // Find bars after the scan date
-      const scanDateStr = row.scanDate.toISOString().split('T')[0];
-      const forwardBars = bars.filter((b) => b.date > scanDateStr);
+      if (row.scanDate < ENRICHMENT_COHORT_START || row.scanDate > cutoff) {
+        skipped++;
+        continue;
+      }
+      const window = prepareEnrichmentWindow(row.scanDate, row.price, bars, observedAt);
+      const forwardBars = window.bars;
+      if (window.reason) console.warn(`[CandidateOutcome] ${row.id}: ${window.reason}`);
 
       if (forwardBars.length < 5) {
         skipped++;
@@ -207,24 +317,51 @@ export async function enrichCandidateOutcomes(
         row.stopPrice,
         forwardBars
       );
+      if (Object.values(metrics).some(value => typeof value === 'number' && !Number.isFinite(value))) {
+        console.warn(`[CandidateOutcome] ${row.id}: NONFINITE_METRICS`);
+        skipped++;
+        continue;
+      }
+
+      const returns = ['fwdReturn5d', 'fwdReturn10d', 'fwdReturn20d'] as const;
+      if (returns.some(key => row[key] !== null
+        && (metrics[key] === null || !sameValue(row[key], metrics[key])))) {
+        console.warn(`[CandidateOutcome] ${row.id}: PRIOR_HORIZON_MISMATCH`);
+        skipped++;
+        continue;
+      }
+      const missingReturns: Partial<EnrichmentResult> = {};
+      for (const key of returns) {
+        if (row[key] === null && metrics[key] !== null) missingReturns[key] = metrics[key];
+      }
+      if (Object.keys(missingReturns).length === 0) {
+        skipped++;
+        continue;
+      }
 
       try {
-        await prisma.candidateOutcome.update({
-          where: { id: row.id },
+        const updated = await prisma.candidateOutcome.updateMany({
+          where: {
+            id: row.id, scanDate: row.scanDate, price: row.price,
+            entryTrigger: row.entryTrigger, stopPrice: row.stopPrice,
+            enrichedAt: row.enrichedAt,
+            fwdReturn5d: row.fwdReturn5d, fwdReturn10d: row.fwdReturn10d, fwdReturn20d: row.fwdReturn20d,
+          },
           data: {
-            fwdReturn5d: metrics.fwdReturn5d,
-            fwdReturn10d: metrics.fwdReturn10d,
-            fwdReturn20d: metrics.fwdReturn20d,
-            mfeR: metrics.mfeR,
-            maeR: metrics.maeR,
-            reached1R: metrics.reached1R,
-            reached2R: metrics.reached2R,
-            reached3R: metrics.reached3R,
-            stopHit: metrics.stopHit,
-            enrichedAt: new Date(),
+            ...missingReturns,
+            ...(forwardBars.length >= 20 ? {
+              mfeR: metrics.mfeR, maeR: metrics.maeR,
+              reached1R: metrics.reached1R, reached2R: metrics.reached2R,
+              reached3R: metrics.reached3R, stopHit: metrics.stopHit,
+            } : {}),
+            enrichedAt: observedAt,
           },
         });
-        enriched++;
+        if (updated.count === 1) enriched++;
+        else {
+          console.warn(`[CandidateOutcome] ${row.id}: CONCURRENT_CHANGE`);
+          skipped++;
+        }
       } catch (e) {
         console.error(`[CandidateOutcome] Enrichment update failed for ${ticker}:`, e);
         errors++;

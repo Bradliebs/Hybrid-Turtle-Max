@@ -1097,6 +1097,9 @@ export interface ScoreBreakdownRecord {
 }
 
 /** Execution drag — model vs. actual for one trade */
+export type ExecutionFillEvidenceStatus = 'LEGACY_UNVERIFIED' | 'INVALID_EVIDENCE'
+  | 'PLANNED_ENTRY_FALLBACK' | 'ORDER_VALUE_OVER_QUANTITY' | 'HISTORY_HELPER' | 'TIMEOUT_RECOVERY';
+
 export interface ExecutionDragRecord {
   tradeLogId: string;
   ticker: string;
@@ -1104,9 +1107,11 @@ export interface ExecutionDragRecord {
   // Entry drag
   modelEntry: number;
   actualEntry: number | null;
+  fillEvidenceStatus: ExecutionFillEvidenceStatus;
   entrySlippagePct: number | null;
+  entryGapR: number | null;
   // Stop drag (planned initial vs what was actually set)
-  modelStop: number;
+  modelStop: number | null;
   actualStop: number | null;
   // R-multiple drag
   modelR: number | null;
@@ -1118,15 +1123,23 @@ export interface ExecutionDragRecord {
 
 /** Aggregated execution drag stats */
 export interface ExecutionDragSummary {
+  measurement: 'PLANNED_TRIGGER_TO_FILL';
+  eligibleEntryLogs: number;
   totalTrades: number;
   withFills: number;
-  avgEntrySlippagePct: number;
-  medianEntrySlippagePct: number;
-  p90EntrySlippagePct: number;
-  avgRDrag: number;
-  medianRDrag: number;
-  avgDaysToFill: number;
-  totalSlippageCostGbp: number;
+  fillEvidenceCounts: Record<ExecutionFillEvidenceStatus, number>;
+  withEntryGapPct: number;
+  withEntryGapR: number;
+  distinctMeasuredEntryDays: number;
+  avgEntrySlippagePct: number | null;
+  medianEntrySlippagePct: number | null;
+  p90EntrySlippagePct: number | null;
+  avgEntryGapR: number | null;
+  avgRDrag: number | null;
+  medianRDrag: number | null;
+  avgDaysToFill: number | null;
+  totalSlippageCostGbp: number | null;
+  limitations: string[];
 }
 
 /** Capital allocation ranking — one entry per recommended position */

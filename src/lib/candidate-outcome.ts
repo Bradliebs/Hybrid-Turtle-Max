@@ -9,6 +9,7 @@
  *        Forward outcome enrichment runs as a separate batch after bars are available.
  */
 import type { ScanCandidate, CandidateOutcomeRecord, CandidateStage } from '@/types';
+import { z } from 'zod';
 import prisma from './prisma';
 
 export interface CandidateDataProvenance {
@@ -297,63 +298,98 @@ export async function linkTradeToOutcome(
   scanId: string,
   ticker: string,
   tradeLogId: string,
-  actualFill?: number
+  actualFill?: number,
+  recovery?: { positionId: string; onlyUnlinked: boolean },
 ): Promise<boolean> {
   try {
-    await prisma.candidateOutcome.update({
-      where: { scanId_ticker: { scanId, ticker } },
-      data: {
-        tradePlaced: true,
-        tradeLogId,
-        actualFill: actualFill ?? null,
-      },
+    return await prisma.$transaction(async (tx) => {
+      const trade = await tx.tradeLog.findUnique({ where: { id: tradeLogId },
+        select: { ticker: true, tradeType: true, decision: true, positionId: true,
+          userId: true, tradeDate: true, actualFill: true } });
+      const scan = await tx.scan.findUnique({ where: { id: scanId },
+        select: { userId: true, runDate: true } });
+      if (!trade || !scan || trade.ticker !== ticker || trade.tradeType !== 'ENTRY'
+        || trade.decision !== 'TAKEN' || !trade.positionId || trade.userId !== scan.userId
+        || (recovery != null && trade.positionId !== recovery.positionId)
+        || scan.runDate > trade.tradeDate || trade.actualFill == null
+        || !Number.isFinite(trade.actualFill) || trade.actualFill <= 0
+        || (actualFill != null && actualFill !== trade.actualFill)) return false;
+      const existing = await tx.candidateOutcome.findFirst({
+        where: { tradeLogId, NOT: { scanId, ticker } }, select: { id: true },
+      });
+      if (existing) return false;
+      const linked = await tx.candidateOutcome.updateMany({
+        where: { scanId, ticker, scanDate: { lte: trade.tradeDate },
+          ...(recovery?.onlyUnlinked
+            ? { tradeLogId: null, tradePlaced: false }
+            : { OR: [{ tradeLogId: null, tradePlaced: false }, { tradeLogId }] }) },
+        data: { tradePlaced: true, tradeLogId, actualFill: trade.actualFill },
+      });
+      return linked.count === 1;
     });
-    return true;
-  } catch {
-    return false; // row may not exist if scan predated this feature
+  } catch (error) {
+    console.warn('[CandidateOutcome] Exact trade linkage failed:', error);
+    if (recovery) throw error;
+    return false;
   }
 }
 
-/**
- * Batch-link closed trades to their CandidateOutcome rows.
- * Matches by ticker + scanDate within ±2 days of trade date.
- */
+const completionLinkSchema = z.object({
+  scanId: z.string().trim().min(1),
+  tradeLogId: z.string().trim().min(1),
+  positionId: z.string().trim().min(1),
+});
+
+/** Recover candidate links only from explicit execution completion identities. */
 export async function backfillTradeLinks(): Promise<number> {
-  const trades = await prisma.tradeLog.findMany({
-    where: {
-      decision: { in: ['EXECUTED', 'BUY'] },
-    },
+  const completions = await prisma.executionLog.findMany({
+    where: { phase: 'COMPLETE' },
     select: {
-      id: true,
       ticker: true,
-      tradeDate: true,
-      actualFill: true,
+      orderId: true,
+      accountType: true,
+      requestBody: true,
     },
   });
+  const evidenceByTrade = new Map<string, Array<{
+    ticker: string;
+    link: z.infer<typeof completionLinkSchema> | null;
+  }>>();
+  for (const completion of completions) {
+    let body: unknown;
+    try {
+      body = JSON.parse(completion.requestBody ?? 'null');
+    } catch {
+      console.warn('[CandidateOutcome] Unreadable completion identity; not linked.');
+      continue;
+    }
+    const identity = z.object({ tradeLogId: z.string().trim().min(1) }).safeParse(body);
+    if (!identity.success) continue;
+    const parsed = completionLinkSchema.safeParse(body);
+    const usable = parsed.success && !!completion.orderId?.trim()
+      && ['invest', 'isa'].includes(completion.accountType);
+    const records = evidenceByTrade.get(identity.data.tradeLogId) ?? [];
+    records.push({ ticker: completion.ticker, link: usable ? parsed.data : null });
+    evidenceByTrade.set(identity.data.tradeLogId, records);
+  }
+
+  const candidateClaims = new Map<string, number>();
+  for (const records of evidenceByTrade.values()) {
+    for (const { ticker, link } of records) {
+      if (!link) continue;
+      const key = JSON.stringify([link.scanId, ticker]);
+      candidateClaims.set(key, (candidateClaims.get(key) ?? 0) + 1);
+    }
+  }
 
   let linked = 0;
-  for (const trade of trades) {
-    const startDate = new Date(trade.tradeDate);
-    startDate.setDate(startDate.getDate() - 2);
-    const endDate = new Date(trade.tradeDate);
-    endDate.setDate(endDate.getDate() + 2);
-
-    try {
-      const result = await prisma.candidateOutcome.updateMany({
-        where: {
-          ticker: trade.ticker,
-          scanDate: { gte: startDate, lte: endDate },
-          tradePlaced: false,
-        },
-        data: {
-          tradePlaced: true,
-          tradeLogId: trade.id,
-          actualFill: trade.actualFill,
-        },
-      });
-      linked += result.count;
-    } catch {
-      // Non-critical
+  for (const records of evidenceByTrade.values()) {
+    if (records.length !== 1 || !records[0].link) continue;
+    const { ticker, link } = records[0];
+    if (candidateClaims.get(JSON.stringify([link.scanId, ticker])) !== 1) continue;
+    if (await linkTradeToOutcome(link.scanId, ticker, link.tradeLogId, undefined,
+      { positionId: link.positionId, onlyUnlinked: true })) {
+      linked++;
     }
   }
   return linked;
