@@ -10,7 +10,7 @@
  */
 
 import prisma from '@/lib/prisma';
-import { sendThrottledTelegramAlert } from '@/lib/telegram';
+import { escapeHtml, sendThrottledTelegramAlert } from '@/lib/telegram';
 import { ALERT_CATEGORY, buildAlertKey } from '@/lib/alert-categories';
 import { createCronLogger } from '@/lib/cron-logger';
 import { spawn, execFile } from 'child_process';
@@ -24,7 +24,7 @@ import {
   MAX_CONSECUTIVE_RESTART_FAILURES,
 } from './watchdog-restart-budget';
 import { getUKDayOfWeek, getUKHour } from '@/lib/uk-time';
-import { checkSchedulerKills, checkZeroTradesOnBullishDay, checkNightlyHeartbeatStatus, type AuditFinding } from './watchdog-checks';
+import { checkSchedulerFindings, parseSchedulerAuditOutput, checkNightlyNotification, checkZeroTradesOnBullishDay, checkNightlyHeartbeatStatus, type AuditFinding } from './watchdog-checks';
 
 const log = createCronLogger('watchdog');
 const NIGHTLY_STALE_HOURS = 26;
@@ -36,26 +36,23 @@ export async function countBuyAttemptsSince(since: Date): Promise<number> {
 }
 
 /**
- * Run the scheduler audit script and parse its findings. Returns [] when the
- * audit is unavailable (non-Windows, missing script, or unexpected error).
- * The audit script writes one finding per line to stdout in the form
- * `[scheduler-audit] SEVERITY: TaskName REASON - detail`.
+ * Read structured audit findings; malformed or unavailable output rejects.
  */
 async function fetchAuditFindings(): Promise<AuditFinding[]> {
   if (process.platform !== 'win32') return [];
   const auditScript = path.resolve(__dirname, '..', '..', 'scripts', 'audit-scheduled-tasks.mjs');
-  return new Promise((resolve) => {
-    execFile('node', [auditScript], { timeout: 30_000 }, (_err, stdout) => {
-      // Audit exits 1 on any ERROR finding; that's expected here, not a failure.
-      const findings: AuditFinding[] = [];
-      const lineRegex = /^\[scheduler-audit\]\s+(ERROR|WARNING):\s+(\S+)\s+([A-Z_]+)\s+-\s+(.+)$/;
-      for (const line of stdout.split(/\r?\n/)) {
-        const match = lineRegex.exec(line.trim());
-        if (match) {
-          findings.push({ severity: match[1], taskName: match[2], reason: match[3], detail: match[4] });
+  return new Promise((resolve, reject) => {
+    execFile('node', [auditScript, '--json'], { timeout: 30_000 }, (error, stdout) => {
+      try {
+        const findings = parseSchedulerAuditOutput(stdout);
+        if (error && (error.code !== 1 || !findings.some((finding) => finding.severity === 'ERROR'))) {
+          reject(new Error('Scheduler audit did not complete successfully'));
+          return;
         }
+        resolve(findings);
+      } catch (parseError) {
+        reject(parseError);
       }
-      resolve(findings);
     });
   });
 }
@@ -88,6 +85,7 @@ async function runWatchdog(): Promise<void> {
     // PARTIAL/FAILED run or a stuck RUNNING state. Surface those outcomes so a
     // degraded nightly is not silent for up to 26h (audit 2026-05-29, R1).
     alerts.push(...checkNightlyHeartbeatStatus(latestNightly.status));
+    alerts.push(...checkNightlyNotification(latestNightly.details));
   }
 
   // Check midday sync on weekdays (Mon-Fri = 1-5)
@@ -211,9 +209,10 @@ async function runWatchdog(): Promise<void> {
   // every auto-trade session at PT10M before any buy was placed.
   try {
     const findings = await fetchAuditFindings();
-    alerts.push(...checkSchedulerKills(findings));
+    alerts.push(...checkSchedulerFindings(findings));
   } catch (err) {
     log.warn('Scheduler audit check failed', { error: (err as Error).message });
+    alerts.push('WATCHDOG: Scheduler audit could not be completed; task health is unknown. Inspect the watchdog logs.');
   }
 
   // Check 5: BULLISH regime + valid A-grade candidates + zero buy attempts
@@ -275,7 +274,7 @@ async function runWatchdog(): Promise<void> {
 
   const sent = await sendThrottledTelegramAlert(
     {
-      text: message,
+      text: escapeHtml(message),
       parseMode: 'HTML',
     },
     dedupeKey

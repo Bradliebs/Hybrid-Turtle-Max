@@ -1,5 +1,44 @@
 import { describe, expect, it } from 'vitest';
 import { checkSchedulerKills, checkZeroTradesOnBullishDay, checkNightlyHeartbeatStatus, type AuditFinding } from './watchdog-checks';
+import { checkSchedulerFindings, checkNightlyNotification, parseSchedulerAuditOutput } from './watchdog-checks';
+
+describe('structured scheduler evidence', () => {
+  it.each(['HybridTurtle Nightly', 'HybridTurtle Midday Sync', 'HybridTurtle-Trade-US'])(
+    'preserves the full task name %s', (taskName) => {
+      const finding = { severity: 'ERROR', taskName, reason: 'SCHEDULER_TERMINATED_LAST_RUN', detail: 'timeout' };
+      const parsed = parseSchedulerAuditOutput(JSON.stringify([finding]));
+      expect(parsed).toEqual([finding]);
+      expect(checkSchedulerFindings(parsed)[0]).toContain(taskName);
+    },
+  );
+
+  it.each(['', 'not json', '{}', '[{"severity":"OK"}]'])('rejects invalid output %s', (output) => {
+    expect(() => parseSchedulerAuditOutput(output)).toThrow();
+  });
+
+  it('accepts an explicitly clean result', () => {
+    expect(checkSchedulerFindings(parseSchedulerAuditOutput('[]'))).toEqual([]);
+  });
+
+  it('surfaces schedule drift as well as kills', () => {
+    expect(checkSchedulerFindings([{ severity: 'ERROR', taskName: 'HybridTurtle Watchdog',
+      reason: 'WATCHDOG_SCHEDULE_DRIFT', detail: 'missing afternoon checks' }])[0]).toContain('missing afternoon checks');
+  });
+});
+
+describe('nightly notification evidence', () => {
+  it('alerts on failed delivery even when core processing succeeded', () => {
+    expect(checkNightlyNotification('{"telegramSent":false,"hadFailure":false}')[0]).toContain('not delivered');
+  });
+
+  it.each([null, '{}', '{"telegramSent":true}'])('accepts success or legacy absent evidence %s', (details) => {
+    expect(checkNightlyNotification(details)).toEqual([]);
+  });
+
+  it.each(['bad json', '{"telegramSent":"false"}'])('reports corrupt evidence %s', (details) => {
+    expect(checkNightlyNotification(details)[0]).toContain('cannot be verified');
+  });
+});
 
 describe('checkSchedulerKills', () => {
   it('returns empty array when no SCHEDULER_TERMINATED findings present', () => {

@@ -938,3 +938,45 @@ the pending-approval status above. Reproduce the old lifecycle report or repair
 rehearsal using this pre-repair backup, not the corrected live database.
 Dashboard browser rendering remains a manual check. No commit/push, live
 strategy change, broker request or automation change occurred in this step.
+
+## 2026-09-13 automation repair pending administrator application
+
+Read-only inspection found all 17 expected tasks present, but the watchdog ran
+only at 10:05, all tasks had wake disabled and 15 used interactive-only logon.
+Two recent nightly runs completed core work without delivering their summary;
+the latest log showed Telegram rejecting unescaped HTML. The watchdog's text
+audit parser also dropped task names containing spaces.
+
+Escaped nightly summary fields and comparisons, made delivery failure visible
+in step results, and added a separate watchdog notification check without
+changing core trading-health semantics. Scheduler findings now use validated
+JSON, and runtime inspection checks unattended settings and afternoon watchdog
+coverage. Invalid audit output is reported as unknown health.
+
+Added a preview-first PowerShell repair with original XML backups, stale-state
+checks, post-registration verification and attempted rollback. It preserves
+owners, actions, trading schedules and limits. Register-all now includes the
+heartbeat, corrects the relevant time-limit defaults and ends with the repair.
+The XML fixture and scheduler tests passed (74 tests), live preview passed for
+17 tasks, and live read-only inspection correctly found the remaining drift.
+Typecheck and scoped lint passed. No live task definition was changed.
+
+Administrator application remains blocked in this non-elevated session. Follow
+[the scheduler repair procedure](SCHEDULER-AUDIT.md#unattended-operation-repair),
+then verify the audit, signed-out/sleep recovery and the next nightly delivery.
+No trading job was manually run, no broker action or strategy change was made,
+and no commit or push was requested for this repair.
+
+## 2026-09-13 live scheduler verification and publication approval
+
+After the user performed the administrator step and reported a clean audit,
+an independent `node scripts/audit-scheduled-tasks.mjs --json` returned `[]`
+with exit code 0. The prior administrator blocker is resolved: all 17 tasks
+pass the configured checks, including unattended settings and watchdog timing.
+The combined automation regression suite passed 114 tests; typecheck, scoped
+lint and PowerShell syntax checks also passed.
+
+The user authorized committing and pushing the automation repair. Publication
+excludes the unrelated ready-to-buy changes, VRP telemetry, reference PDF and
+private task/database backups. Signed-out execution, wake from sleep and the
+next nightly Telegram delivery remain operational checks, not verified outcomes.

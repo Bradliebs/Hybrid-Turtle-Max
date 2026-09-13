@@ -31,6 +31,7 @@ import { runHealthCheck } from '@/lib/health-check';
 import { generateStopRecommendations, generateTrailingStopRecommendations, updateStopLoss } from '@/lib/stop-manager';
 import { decideStopCommit } from '@/lib/nightly-stop-apply';
 import { sendNightlySummary } from '@/lib/telegram';
+import { deliverNightlyNotification } from './nightly-notification';
 import type { NightlyPositionDetail, NightlyStopChange, NightlyReadyCandidate, NightlyTriggerMetCandidate, NightlyLaggardAlert, NightlyClimaxAlert, NightlySwapAlert, NightlyWhipsawAlert, NightlyBreadthAlert, NightlyMomentumAlert, NightlyPyramidAlert, NightlyGapRiskAlert, NightlyBreakoutFailureAlert, NightlyAcceleratorAlert } from '@/lib/telegram';
 import { getBatchQuotes, normalizeBatchPricesToGBP, getDailyPrices, calculateADX, calculateATR, calculateMA, preCacheHistoricalData, getDataFreshness, getMarketRegime } from '@/lib/market-data';
 import { fetchWithFallback, toPriceRecord } from '@/lib/data-provider';
@@ -2420,9 +2421,7 @@ async function runNightlyProcess() {
       }
     } catch { /* advisory — don't block telegram */ }
 
-    let telegramSent = false;
-    try {
-      telegramSent = await sendNightlySummary({
+    const telegramSent = await deliverNightlyNotification(() => sendNightlySummary({
       date: new Date().toISOString().split('T')[0],
       healthStatus: healthReport.overall,
       regime: snapshotSync.synced ? 'SYNCED' : 'UNKNOWN',
@@ -2458,12 +2457,11 @@ async function runNightlyProcess() {
       breakoutFailures: breakoutFailureAlerts,
       acceleratorAlerts,
       priceAccuracy,
+    }), (message) => {
+      markStepFailed(message);
+      log.error(message);
     });
-    } catch (error) {
-      // Telegram is optional infrastructure — failure must not degrade heartbeat
-      console.error('  [8] Telegram send failed:', (error as Error).message);
-    }
-    console.log(`        Telegram: ${telegramSent ? 'SENT' : 'NOT SENT (check credentials)'}`);
+    console.log(`        Telegram: ${telegramSent ? 'SENT' : 'NOT SENT (check delivery logs)'}`);
 
     // Step 9: Write heartbeat
     console.log('  [9/9] Writing heartbeat...');

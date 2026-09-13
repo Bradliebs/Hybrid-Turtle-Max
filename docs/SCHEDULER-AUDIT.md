@@ -2,7 +2,7 @@
 title: HybridTurtle Scheduler Audit
 description: How to run the scheduler audit and repair common Windows Task Scheduler findings
 author: HybridTurtle
-ms.date: 2026-04-30
+ms.date: 2026-09-13
 ms.topic: troubleshooting
 keywords:
   - scheduler
@@ -20,7 +20,8 @@ briefings, ticker audits, and the daily research-refresh enrichment. The
 scheduler audit checks that those tasks still point at this repository, that
 each expected task has a register script, that the most recent nightly database
 backup is fresher than the 48 h pre-execution gate, and that retired legacy
-tasks are not active.
+tasks are not active. Runtime inspection additionally requires PowerShell 7
+(`pwsh`) and checks unattended logon, wake/catch-up settings and watchdog timing.
 
 Run the audit after installer changes, machine moves, task repairs, or any
 unexpected missed automation window.
@@ -49,12 +50,58 @@ npm run tasks:register-all
 
 ## Finding Severity
 
-Errors mean a load-bearing task is missing or points at the wrong target. Fix
-errors before trusting scheduled automation.
+Errors include missing or misdirected tasks, failed runtime inspection and
+watchdog timing that leaves afternoon checks unreachable. Fix errors before
+trusting scheduled automation.
 
-Warnings mean the system is still operational, but there is drift to clean up.
+Warnings require investigation; they do not prove unattended operation works.
 Common warning examples include disabled retired tasks, old non-zero task
-results, or disabled tasks that are intentionally offline.
+results, interactive-only logon and disabled wake settings.
+
+## Unattended Operation Repair
+
+Preview the existing 17 task definitions without making changes:
+
+```powershell
+pwsh -NoProfile -File scripts/Repair-AutomationTasks.ps1
+```
+
+Then open an administrator PowerShell at the repository root and apply:
+
+```powershell
+pwsh -NoProfile -File scripts/Repair-AutomationTasks.ps1 -Apply
+npm run tasks:audit
+```
+
+The helper never elevates itself or manually starts jobs. It preserves task
+owners, actions, trading schedules and execution limits; enables S4U logon,
+wake and catch-up; and sets the watchdog to daily 10:05, 13:05, 16:05, 19:05
+and 22:05. Restoring normal scheduling can allow jobs, including trades, to run.
+Apply requires every task to be Ready and rejects changed definitions.
+
+All original XML is saved under a unique, Git-ignored
+`prisma/backups/automation-tasks-*` directory before any registration. An apply
+failure attempts reverse-order restoration. Read rollback errors carefully;
+the backup XML remains available for manual restoration. Successful application
+writes a receipt and verifies the resulting definitions, not actual execution.
+
+S4U requires local access to the repository, credentials and database. The helper
+rejects mapped/network drives and EFS-encrypted `.env` or database files.
+Authenticated network shares and EFS need a separately configured account.
+Wake also depends on firmware and Windows power policy; it cannot start a
+powered-off machine. Confirm subsequent scheduled runs while signed out and
+after sleep, and confirm the next nightly summary arrives in Telegram.
+
+The register-all workflow applies the same repair at its end. After running an
+individual legacy registration helper, rerun the preview and audit because that
+helper may restore older settings.
+
+For structured consumers, `node scripts/audit-scheduled-tasks.mjs --json` emits
+an array of findings. The watchdog treats invalid output or an inspection
+failure as unknown task health, not a clean audit. A nightly heartbeat with
+`details.telegramSent: false` produces a separate notification warning even
+when core processing succeeded. Notification failure marks the delivery step
+failed without changing the core trading-health gate.
 
 ## Accepted Task Results
 

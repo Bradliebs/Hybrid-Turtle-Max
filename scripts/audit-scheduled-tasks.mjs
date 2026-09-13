@@ -10,6 +10,7 @@ import { execFileSync } from 'child_process';
 import { existsSync, readdirSync, readFileSync, statSync } from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { z } from 'zod';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -263,6 +264,55 @@ export function auditTimeLimits(options = {}) {
   return findings;
 }
 
+export const WATCHDOG_TIMES = ['10:05', '13:05', '16:05', '19:05', '22:05'];
+
+export function auditAutomationRuntime(options = {}) {
+  if (options.states === undefined && process.platform !== 'win32') return [];
+  const findings = [];
+  let states;
+  try {
+    const raw = options.states ?? JSON.parse(execFileSync('pwsh', [
+      '-NoProfile', '-NonInteractive', '-File', path.join(ROOT, 'scripts', 'Get-AutomationTaskState.ps1'),
+    ], { encoding: 'utf8', timeout: 20_000 }));
+    states = z.array(z.object({
+      name: z.string(), logonType: z.string(), wakeToRun: z.boolean(), startWhenAvailable: z.boolean(),
+      triggers: z.array(z.object({
+        type: z.string(), enabled: z.boolean(), startBoundary: z.string(), endBoundary: z.string(),
+        daysInterval: z.string(), interval: z.string(), duration: z.string(), randomDelay: z.string(),
+      })),
+    })).parse(raw);
+  } catch {
+    return [{ severity: 'ERROR', taskName: 'scheduler', reason: 'RUNTIME_INSPECTION_FAILED',
+      detail: 'Could not read task triggers and unattended settings. Check PowerShell 7 and scheduler access.' }];
+  }
+  for (const expected of options.expectedTasks ?? EXPECTED_TASKS) {
+    const state = states.find((candidate) => candidate.name === expected.name);
+    if (!state) {
+      findings.push({ severity: 'ERROR', taskName: expected.name, reason: 'RUNTIME_TASK_MISSING', detail: 'Task absent from runtime inspection.' });
+      continue;
+    }
+    if (!['S4U', 'Password', 'ServiceAccount'].includes(state.logonType) || !state.wakeToRun || !state.startWhenAvailable) {
+      findings.push({ severity: 'WARNING', taskName: state.name, reason: 'UNATTENDED_SETTINGS_DRIFT',
+        detail: `Logon=${state.logonType}, WakeToRun=${state.wakeToRun}, StartWhenAvailable=${state.startWhenAvailable}. Preview scripts/Repair-AutomationTasks.ps1; apply from an administrator PowerShell.` });
+    }
+    if (state.name === 'HybridTurtle Watchdog') {
+      const nowMs = options.nowMs ?? Date.now();
+      const daily = state.triggers.filter((trigger) => trigger.enabled && trigger.type === 'CalendarTrigger'
+        && trigger.daysInterval === '1' && !trigger.endBoundary && ['', 'PT0S'].includes(trigger.randomDelay)
+        && Number.isFinite(Date.parse(trigger.startBoundary)) && Date.parse(trigger.startBoundary) <= nowMs);
+      const explicitTimes = new Set(daily.filter((trigger) => !trigger.interval)
+        .map((trigger) => trigger.startBoundary.slice(11, 16)));
+      const repeated = daily.some((trigger) => trigger.startBoundary.slice(11, 16) === '10:05'
+        && trigger.interval === 'PT3H' && trigger.duration === 'PT12H');
+      if (!repeated && !WATCHDOG_TIMES.every((time) => explicitTimes.has(time))) {
+        findings.push({ severity: 'ERROR', taskName: state.name, reason: 'WATCHDOG_SCHEDULE_DRIFT',
+          detail: 'Expected daily checks at 10:05, 13:05, 16:05, 19:05 and 22:05. Run scripts/Repair-AutomationTasks.ps1 -Apply from an administrator PowerShell.' });
+      }
+    }
+  }
+  return findings;
+}
+
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
@@ -366,9 +416,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
   const findings = [
     ...runSchedulerAudit(),
     ...auditTimeLimits(),
+    ...auditAutomationRuntime(),
     ...auditRegisterScripts(),
     ...auditDatabaseBackup(),
   ];
-  logFindings(findings);
+  if (process.argv.includes('--json')) console.log(JSON.stringify(findings));
+  else logFindings(findings);
   process.exit(findings.some((finding) => finding.severity === 'ERROR') ? 1 : 0);
 }

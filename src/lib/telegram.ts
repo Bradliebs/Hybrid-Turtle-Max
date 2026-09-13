@@ -21,7 +21,7 @@ interface TelegramMessage {
 /**
  * Escape HTML special characters for Telegram parse_mode=HTML
  */
-function escapeHtml(text: string): string {
+export function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -432,7 +432,7 @@ export async function sendNightlySummary(summary: {
         const pnlEmoji = p.pnl >= 0 ? '🟩' : '🟥';
         const sym = currencySymbol(p.currency);
         const rLabel = p.rMultiple >= 0 ? `+${p.rMultiple.toFixed(1)}R` : `${p.rMultiple.toFixed(1)}R`;
-        return `  ${pnlEmoji} <b>${p.ticker}</b>  ${sym}${p.currentPrice.toFixed(2)}  ${rLabel}  ${p.pnl >= 0 ? '+' : ''}${p.pnlPercent.toFixed(1)}%  Stop: ${sym}${p.currentStop.toFixed(2)} [${p.protectionLevel}]`;
+        return `  ${pnlEmoji} <b>${escapeHtml(p.ticker)}</b>  ${sym}${p.currentPrice.toFixed(2)}  ${rLabel}  ${p.pnl >= 0 ? '+' : ''}${p.pnlPercent.toFixed(1)}%  Stop: ${sym}${p.currentStop.toFixed(2)} [${escapeHtml(p.protectionLevel)}]`;
       }).join('\n')
     : '  No open positions';
 
@@ -447,7 +447,7 @@ export async function sendNightlySummary(summary: {
 
   // ── Alerts ──
   const alertsText = summary.alerts.length > 0
-    ? summary.alerts.map((a) => `  ⚠️ ${a}`).join('\n')
+    ? summary.alerts.map((a) => `  ⚠️ ${escapeHtml(a)}`).join('\n')
     : '  ✅ No alerts';
 
   // ── Ready to buy lines (only trigger-met candidates) ──
@@ -456,7 +456,7 @@ export async function sendNightlySummary(summary: {
   const readyLines = readyToBuyAtEntry.length > 0
     ? readyToBuyAtEntry.map((r) => {
         const sym = currencySymbol(r.currency);
-        return `  🎯 <b>${r.ticker}</b> (${r.sleeve})  ${sym}${r.close.toFixed(2)}
+        return `  🎯 <b>${escapeHtml(r.ticker)}</b> (${escapeHtml(r.sleeve)})  ${sym}${r.close.toFixed(2)}
        Entry: ${sym}${r.entryTrigger.toFixed(2)}  Stop: ${sym}${r.stopLevel.toFixed(2)}  Dist: ${r.distancePct.toFixed(1)}%  ADX: ${r.adx14.toFixed(0)}`;
       }).join('\n')
     : '  No candidates at entry';
@@ -466,8 +466,8 @@ export async function sendNightlySummary(summary: {
   const triggerMetLines = triggerMetList.length > 0
     ? triggerMetList.map((t) => {
         const sym = currencySymbol(t.currency);
-        return `  🚨 <b>${t.ticker}</b> (${t.sleeve})  ${sym}${t.close.toFixed(2)} ≥ trigger ${sym}${t.entryTrigger.toFixed(2)}
-       Stop: ${sym}${t.stopLevel.toFixed(2)}  ADX: ${t.adx14.toFixed(0)}  → CONFIRM VOLUME & BUY`;
+        return `  🚨 <b>${escapeHtml(t.ticker)}</b> (${escapeHtml(t.sleeve)})  ${sym}${t.close.toFixed(2)} ≥ trigger ${sym}${t.entryTrigger.toFixed(2)}
+             Stop: ${sym}${t.stopLevel.toFixed(2)}  ADX: ${t.adx14.toFixed(0)}  → CONFIRM VOLUME &amp; BUY`;
       }).join('\n')
     : '';
 
@@ -480,7 +480,7 @@ export async function sendNightlySummary(summary: {
         const sizingLine = p.addShares > 0
           ? `\n       → ${p.addShares.toFixed(2)} shares (risk £${p.addRiskAmount.toFixed(2)} — ${scalePct} of base)`
           : '';
-        return `  📐 <b>${p.ticker}</b>  Add #${p.addNumber}  ${sym}${p.currentPrice.toFixed(2)} ≥ trigger ${p.triggerPrice ? sym + p.triggerPrice.toFixed(2) : 'R-based'}  (${p.rMultiple >= 0 ? '+' : ''}${p.rMultiple.toFixed(1)}R)${sizingLine}`;
+        return `  📐 <b>${escapeHtml(p.ticker)}</b>  Add #${p.addNumber}  ${sym}${p.currentPrice.toFixed(2)} ≥ trigger ${p.triggerPrice ? sym + p.triggerPrice.toFixed(2) : 'R-based'}  (${p.rMultiple >= 0 ? '+' : ''}${p.rMultiple.toFixed(1)}R)${sizingLine}`;
       }).join('\n')
     : '';
 
@@ -509,7 +509,7 @@ export async function sendNightlySummary(summary: {
   const climaxList = summary.climaxAlerts || [];
   const climaxLines = climaxList.length > 0
     ? climaxList.map((c) => {
-        return `  🔥 <b>${c.ticker}</b>  +${c.priceAboveMa20Pct.toFixed(1)}% above MA20  Vol ${c.volumeRatio.toFixed(1)}×  → ${c.action}`;
+        return `  🔥 <b>${escapeHtml(c.ticker)}</b>  +${c.priceAboveMa20Pct.toFixed(1)}% above MA20  Vol ${c.volumeRatio.toFixed(1)}×  → ${escapeHtml(c.action)}`;
       }).join('\n')
     : '';
 
@@ -523,14 +523,14 @@ export async function sendNightlySummary(summary: {
   const whipsawList = summary.whipsawAlerts || [];
   const whipsawLines = whipsawList.length > 0
     ? whipsawList.map((w) => {
-        return `  🚫 <b>${w.ticker}</b>  ${w.stopsInLast30Days}× stopped out — re-entry blocked`;
+        return `  🚫 <b>${escapeHtml(w.ticker)}</b>  ${w.stopsInLast30Days}× stopped out — re-entry blocked`;
       }).join('\n')
     : '';
 
   const breadth = summary.breadthAlert;
   const breadthLine = breadth
     ? breadth.isRestricted
-      ? `  🔻 Breadth: ${breadth.breadthPct.toFixed(0)}% (< 40%) — max positions reduced to ${breadth.maxPositionsOverride}`
+      ? `  🔻 Breadth: ${breadth.breadthPct.toFixed(0)}% (&lt; 40%) — max positions reduced to ${breadth.maxPositionsOverride}`
       : `  ✅ Breadth: ${breadth.breadthPct.toFixed(0)}% — normal limits`
     : '';
 
@@ -578,13 +578,13 @@ export async function sendNightlySummary(summary: {
 
   const text = `
 <b>🐢 HybridTurtle Nightly Report</b>
-<b>Date:</b> ${summary.date}
+<b>Date:</b> ${escapeHtml(summary.date)}
 
-${healthEmoji} <b>Health:</b> ${summary.healthStatus}
+${healthEmoji} <b>Health:</b> ${escapeHtml(summary.healthStatus)}
 
 <b>━━━ Portfolio ━━━</b>
   💰 Equity: £${summary.equity.toFixed(2)}
-  ${totalPnlEmoji} Unrealised P&L: ${totalPnl >= 0 ? '+' : ''}£${totalPnl.toFixed(2)} (${totalPnlPercent >= 0 ? '+' : ''}${totalPnlPercent.toFixed(1)}%)
+  ${totalPnlEmoji} Unrealised P&amp;L: ${totalPnl >= 0 ? '+' : ''}£${totalPnl.toFixed(2)} (${totalPnlPercent >= 0 ? '+' : ''}${totalPnlPercent.toFixed(1)}%)
   ⚡ Open Risk: ${summary.openRiskPercent.toFixed(1)}% of equity
 
 <b>━━━ Positions (${summary.openPositions}) ━━━</b>

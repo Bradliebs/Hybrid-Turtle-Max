@@ -12,11 +12,42 @@
  *        introduces no new state.
  */
 
+import { z } from 'zod';
+
 export interface AuditFinding {
   severity: string;
   taskName: string;
   reason: string;
   detail: string;
+}
+
+export function parseSchedulerAuditOutput(output: string): AuditFinding[] {
+  return z.array(z.object({
+    severity: z.enum(['ERROR', 'WARNING']),
+    taskName: z.string().min(1),
+    reason: z.string().min(1),
+    detail: z.string(),
+  })).parse(JSON.parse(output));
+}
+
+export function checkNightlyNotification(details: string | null): string[] {
+  if (!details) return [];
+  try {
+    const parsed = z.object({ telegramSent: z.boolean().optional() }).parse(JSON.parse(details));
+    return parsed.telegramSent === false
+      ? ['WATCHDOG: The latest nightly Telegram summary was not delivered. Core processing may have succeeded; inspect nightly.log for delivery errors.']
+      : [];
+  } catch {
+    return ['WATCHDOG: Nightly heartbeat details are invalid; notification delivery cannot be verified.'];
+  }
+}
+
+export function checkSchedulerFindings(findings: readonly AuditFinding[]): string[] {
+  return [
+    ...checkSchedulerKills(findings),
+    ...findings.filter((finding) => finding.reason !== 'SCHEDULER_TERMINATED_LAST_RUN')
+      .map((finding) => `WATCHDOG: ${finding.severity}: ${finding.taskName} ${finding.reason} - ${finding.detail}`),
+  ];
 }
 
 /**

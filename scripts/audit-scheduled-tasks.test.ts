@@ -10,7 +10,49 @@ vi.mock('fs', async () => {
   };
 });
 
-const { auditScheduledTasks, parseCsvLine, parseSchtasksCsv, auditRegisterScripts, auditDatabaseBackup, auditTimeLimits, EXPECTED_TASKS } = await import('./audit-scheduled-tasks.mjs');
+const { auditScheduledTasks, parseCsvLine, parseSchtasksCsv, auditRegisterScripts, auditDatabaseBackup, auditTimeLimits, auditAutomationRuntime, WATCHDOG_TIMES, EXPECTED_TASKS } = await import('./audit-scheduled-tasks.mjs');
+
+describe('runtime automation coverage', () => {
+  const expectedTasks = [{ name: 'HybridTurtle Watchdog' }];
+  const daily = (time: string) => ({ type: 'CalendarTrigger', enabled: true,
+    startBoundary: `2026-01-01T${time}:00`, endBoundary: '', daysInterval: '1', interval: '', duration: '', randomDelay: '' });
+  const state = () => ({ name: expectedTasks[0].name, logonType: 'S4U', wakeToRun: true,
+    startWhenAvailable: true, triggers: WATCHDOG_TIMES.map(daily) });
+  const audit = (states: unknown) => auditAutomationRuntime({ states, expectedTasks, nowMs: Date.parse('2026-09-13T00:00:00Z') });
+
+  it('accepts five daily checks and unattended settings', () => {
+    expect(audit([state()])).toEqual([]);
+  });
+
+  it('detects the observed morning-only watchdog even if task exits successfully', () => {
+    expect(audit([{ ...state(), triggers: [daily('10:05')] }])).toContainEqual(
+      expect.objectContaining({ reason: 'WATCHDOG_SCHEDULE_DRIFT', severity: 'ERROR' }));
+  });
+
+  it('accepts the existing registration script repetition', () => {
+    expect(audit([{ ...state(), triggers: [{ ...daily('10:05'), interval: 'PT3H', duration: 'PT12H' }] }])).toEqual([]);
+  });
+
+  it.each([
+    { enabled: false }, { daysInterval: '2' }, { endBoundary: '2026-01-02T00:00:00' },
+    { startBoundary: '2099-01-01T22:05:00' }, { randomDelay: 'PT2H' },
+  ])('rejects incomplete or unavailable coverage %j', (change) => {
+    const current = state();
+    current.triggers[4] = { ...current.triggers[4], ...change };
+    expect(audit([current])).toContainEqual(expect.objectContaining({ reason: 'WATCHDOG_SCHEDULE_DRIFT' }));
+  });
+
+  it.each([{ logonType: 'InteractiveToken' }, { wakeToRun: false }, { startWhenAvailable: false }])(
+    'reports unattended drift %j', (change) => {
+      expect(audit([{ ...state(), ...change }])).toContainEqual(expect.objectContaining({ reason: 'UNATTENDED_SETTINGS_DRIFT' }));
+    },
+  );
+
+  it('does not treat missing or corrupt runtime evidence as healthy', () => {
+    expect(audit([])[0].reason).toBe('RUNTIME_TASK_MISSING');
+    expect(audit({})[0].reason).toBe('RUNTIME_INSPECTION_FAILED');
+  });
+});
 
 describe('audit-scheduled-tasks.mjs', () => {
   it('parses schtasks CSV rows with quoted commands', () => {

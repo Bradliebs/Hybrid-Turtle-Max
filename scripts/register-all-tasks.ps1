@@ -26,6 +26,9 @@ if (-not $isAdmin) {
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 Set-Location $repoRoot
+if (-not (Get-Command pwsh -ErrorAction SilentlyContinue)) {
+  throw 'PowerShell 7 (pwsh) is required for unattended task verification and repair.'
+}
 
 # Per-task ExecutionTimeLimit overrides. Tasks not listed default to PT10M.
 # Auto-trade tasks scan the full ~1149-ticker universe end-to-end (Yahoo
@@ -45,6 +48,9 @@ $script:TaskTimeLimits = @{
   'HybridTurtle-Trade-USC'   = 'PT30M'
   'HybridTurtle Nightly'     = 'PT45M'
   'HybridTurtle Midday Sync' = 'PT15M'
+  'HybridTurtle-HourlyStatus' = 'PT5M'
+  'HybridTurtle-ResearchRefresh' = 'PT20M'
+  'HybridTurtle-TelegramHeartbeat' = 'PT5M'
 }
 
 function Set-TaskResilient($TaskName) {
@@ -85,7 +91,8 @@ $registerScripts = @(
   @{ Label = 'Watchdog';       Path = Join-Path $repoRoot 'register-watchdog-task.bat';         Args = @() },
   @{ Label = 'Midday Sync';    Path = Join-Path $repoRoot 'register-midday-sync.ps1';           Args = @('-FromBat') },
   @{ Label = 'Auto-Trade';     Path = Join-Path $repoRoot 'register-auto-trade.bat';            Args = @('--yes') },
-  @{ Label = 'Weekly + Daily'; Path = Join-Path $PSScriptRoot 'register-weekly-tasks.ps1';      Args = @() }
+  @{ Label = 'Weekly + Daily'; Path = Join-Path $PSScriptRoot 'register-weekly-tasks.ps1';      Args = @() },
+  @{ Label = 'Telegram Heartbeat'; Path = Join-Path $PSScriptRoot 'register-telegram-heartbeat.ps1'; Args = @('-FromBat') }
 )
 
 $results = @()
@@ -136,12 +143,17 @@ $taskNames = @(
   'HybridTurtle-USBriefing',
   'HybridTurtle-WeeklyDigest',
   'HybridTurtle-TickerAudit',
-  'HybridTurtle-ResearchRefresh'
+  'HybridTurtle-ResearchRefresh',
+  'HybridTurtle-TelegramHeartbeat'
 )
 
 Write-Host ">> Applying task resilience settings" -ForegroundColor Cyan
 foreach ($taskName in $taskNames) {
   Set-TaskResilient $taskName
+}
+& pwsh -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'Repair-AutomationTasks.ps1') -Apply
+if ($LASTEXITCODE -ne 0) {
+  throw 'Unattended task repair failed. Inspect the repair output and any XML backup before retrying.'
 }
 Write-Host ""
 
